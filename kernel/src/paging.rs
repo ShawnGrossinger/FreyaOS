@@ -11,14 +11,23 @@
 //!   and faults (escalating to #DF on its IST stack, see gdt.rs) instead of
 //!   silently overwriting whatever lies below 0x70000.
 //!
-//! Mapping all usable RAM comes next; the frame allocator already hands out
-//! frames above 8 MiB that nothing maps yet.
+//! Second, once the frame allocator is up, `map_physical_memory()` maps all
+//! RAM a second time at `PHYS_MAP_BASE` in the higher half (the "physical
+//! map"): physical address P is reachable at virtual PHYS_MAP_BASE + P.
+//! This is how the kernel touches any frame, whatever its address, without
+//! growing the identity map. User space will own the lower half later, so
+//! the identity map is the temporary part of this design; the physical map
+//! is the permanent one. Physical-map pages are no-execute when the CPU
+//! supports it: it exists for data, never code.
 //!
-//! Everything here relies on the identity map: the tables are statics whose
-//! addresses are physical addresses. That stops being true the day the
-//! kernel moves to a higher-half address.
+//! The 8 MiB identity map relies on statics whose addresses are physical
+//! addresses. That stops being true the day the kernel moves to a
+//! higher-half address.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::boot::E820Entry;
 
 // ---------------------------------------------------------------------------
 // Layout
@@ -52,6 +61,10 @@ const IDENTITY_MAP_BYTES: u64 = 8 * 1024 * 1024;
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const HUGE: u64 = 1 << 7;
+const NO_EXECUTE: u64 = 1 << 63; // only legal once EFER.NXE = 1
+
+/// Bits 51:12 of an entry: the physical address it points to.
+const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 const ENTRIES: usize = 512;
 
@@ -116,4 +129,282 @@ pub fn init() -> u64 {
 /// True if `addr` falls inside the kernel stack's guard page.
 pub fn is_stack_guard(addr: u64) -> bool {
     (STACK_GUARD_PAGE..KERNEL_STACK_BOTTOM).contains(&addr)
+}
+
+// ===========================================================================
+// Physical map (higher half)
+// ===========================================================================
+
+/// Start of the physical map: the first address of the upper canonical half.
+/// PML4 index 256; physical address P lives at PHYS_MAP_BASE + P.
+pub const PHYS_MAP_BASE: u64 = 0xFFFF_8000_0000_0000;
+
+/// One PML4 entry covers 512 GiB, which is all the physical map uses.
+const PHYS_MAP_MAX: u64 = 512 * 1024 * 1024 * 1024;
+
+static PHYS_MAP_READY: AtomicBool = AtomicBool::new(false);
+
+/// Kernel-virtual address for a physical address.
+///
+/// Before the physical map exists only the identity map is available, so
+/// this returns `phys` unchanged and refuses anything above 8 MiB. The only
+/// callers in that window are the allocator zeroing the frames that become
+/// the physical map's own tables, and the allocator hands out lowest frames
+/// first, so they are always low.
+pub fn phys_to_virt(phys: u64) -> *mut u8 {
+    if PHYS_MAP_READY.load(Ordering::Acquire) {
+        (PHYS_MAP_BASE + phys) as *mut u8
+    } else if phys < IDENTITY_MAP_BYTES {
+        phys as *mut u8
+    } else {
+        crate::serial_write_str(b"[paging] FATAL: phys_to_virt(");
+        crate::serial_write_hex(phys);
+        crate::serial_write_str(b") before the physical map exists\n");
+        crate::halt();
+    }
+}
+
+/// What map_physical_memory() did, for the boot log.
+pub struct PhysMapStats {
+    pub bytes_mapped: u64,
+    pub huge_pages: u64,
+    pub table_frames: u64,
+    pub highest_addr: u64,
+    pub nx: bool,
+}
+
+/// Map every RAM-like E820 region (usable, ACPI reclaimable, ACPI NVS) at
+/// PHYS_MAP_BASE + phys using 2 MiB pages, then switch phys_to_virt() over
+/// to it. Region edges are rounded out to 2 MiB, so a few reserved bytes
+/// sharing a 2 MiB page with RAM get mapped too; firmware's memory-type
+/// ranges (MTRRs) keep device memory uncached regardless.
+///
+/// Page-table frames come from the frame allocator (already zeroed).
+///
+/// # Safety
+/// Call once, after init_frame_allocator(), with the map stage2 collected.
+pub unsafe fn map_physical_memory(e820: &[E820Entry]) -> PhysMapStats {
+    let nx = enable_no_execute();
+    let leaf_flags = PRESENT | WRITABLE | HUGE | if nx { NO_EXECUTE } else { 0 };
+
+    let mut stats = PhysMapStats {
+        bytes_mapped: 0,
+        huge_pages: 0,
+        table_frames: 0,
+        highest_addr: 0,
+        nx,
+    };
+
+    // PML4[256] -> one PDPT covering the whole physical map.
+    let pml4 = &raw mut PML4;
+    let pdpt_phys = alloc_table(&mut stats);
+    let pml4_index = ((PHYS_MAP_BASE >> 39) & 0x1FF) as usize;
+    (*pml4).0[pml4_index] = pdpt_phys | PRESENT | WRITABLE;
+    let pdpt = pdpt_phys as *mut u64; // identity view: table frames are < 8 MiB
+
+    for entry in e820.iter() {
+        // Copy out of the packed struct before using the fields.
+        let (base, length, kind) = (entry.base, entry.length, entry.region_type);
+        if length == 0 || !matches!(kind, 1 | 3 | 4) {
+            continue;
+        }
+
+        let start = base & !(HUGE_PAGE_SIZE - 1);
+        let end = (base + length + HUGE_PAGE_SIZE - 1) & !(HUGE_PAGE_SIZE - 1);
+        let end = end.min(PHYS_MAP_MAX);
+
+        let mut phys = start;
+        while phys < end {
+            // One PD per GiB of physical address space, created on demand.
+            let pdpt_index = ((phys >> 30) & 0x1FF) as usize;
+            let pd = if *pdpt.add(pdpt_index) & PRESENT == 0 {
+                let pd_phys = alloc_table(&mut stats);
+                *pdpt.add(pdpt_index) = pd_phys | PRESENT | WRITABLE;
+                pd_phys as *mut u64
+            } else {
+                (*pdpt.add(pdpt_index) & ADDR_MASK) as *mut u64
+            };
+
+            let pd_index = ((phys >> 21) & 0x1FF) as usize;
+            if *pd.add(pd_index) & PRESENT == 0 {
+                *pd.add(pd_index) = phys | leaf_flags;
+                stats.huge_pages += 1;
+                stats.bytes_mapped += HUGE_PAGE_SIZE;
+            }
+
+            phys += HUGE_PAGE_SIZE;
+        }
+
+        stats.highest_addr = stats.highest_addr.max(end);
+    }
+
+    // Reload CR3 to start from a clean TLB. Strictly, only previously
+    // non-present entries changed, which the TLB doesn't cache, but this is
+    // cheap and removes the question.
+    let cr3: u64;
+    asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+    asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+
+    PHYS_MAP_READY.store(true, Ordering::Release);
+    stats
+}
+
+/// Take a zeroed frame from the allocator for use as a page table. Runs
+/// before the physical map is ready, so the frame must be identity-mapped
+/// (phys_to_virt enforces that while zeroing it).
+unsafe fn alloc_table(stats: &mut PhysMapStats) -> u64 {
+    match crate::alloc_frame() {
+        Some(phys) => {
+            stats.table_frames += 1;
+            phys as u64
+        }
+        None => {
+            crate::serial_write_str(b"[paging] FATAL: out of frames for page tables\n");
+            crate::halt();
+        }
+    }
+}
+
+/// Turn on EFER.NXE if the CPU supports no-execute (CPUID 0x80000001,
+/// EDX bit 20). Until NXE is set, bit 63 in a paging entry is reserved and
+/// setting it causes a reserved-bit page fault.
+fn enable_no_execute() -> bool {
+    const IA32_EFER: u32 = 0xC000_0080;
+    const EFER_NXE: u64 = 1 << 11;
+
+    let (max_ext, _) = cpuid(0x8000_0000);
+    if max_ext < 0x8000_0001 {
+        return false;
+    }
+    let (_, edx) = cpuid(0x8000_0001);
+    if edx & (1 << 20) == 0 {
+        return false;
+    }
+
+    unsafe {
+        let (lo, hi): (u32, u32);
+        asm!("rdmsr", in("ecx") IA32_EFER, out("eax") lo, out("edx") hi,
+             options(nomem, nostack, preserves_flags));
+        let efer = ((hi as u64) << 32 | lo as u64) | EFER_NXE;
+        asm!("wrmsr", in("ecx") IA32_EFER, in("eax") efer as u32, in("edx") (efer >> 32) as u32,
+             options(nostack, preserves_flags));
+    }
+    true
+}
+
+/// CPUID leaf -> (eax, edx). rbx is reserved by LLVM, so it is saved and
+/// restored around the instruction by hand.
+fn cpuid(leaf: u32) -> (u32, u32) {
+    let (eax, edx): (u32, u32);
+    unsafe {
+        asm!(
+            "mov {tmp}, rbx",
+            "cpuid",
+            "mov rbx, {tmp}",
+            tmp = out(reg) _,
+            inout("eax") leaf => eax,
+            inout("ecx") 0u32 => _,
+            out("edx") edx,
+            options(nostack, preserves_flags),
+        );
+    }
+    (eax, edx)
+}
+
+// ===========================================================================
+// Self-test
+// ===========================================================================
+
+/// Exercise the physical map end to end. Prints one line per check.
+///
+/// 1. Alias: a byte written through the physical map is visible through the
+///    identity map at the same physical address.
+/// 2. Allocator: keep allocating until a frame above 8 MiB comes back. Each
+///    must arrive zeroed. Before this change, zeroing that frame faulted.
+///    The frames are chained through their own first 8 bytes, then freed.
+/// 3. Top of RAM: the last usable frame reads back what was written.
+///
+/// # Safety
+/// Call after map_physical_memory(). Temporarily allocates ~4.5 MiB.
+pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
+    use crate::{serial_write_hex as hex, serial_write_str as s, serial_write_u64 as dec};
+
+    let mut ok = true;
+
+    // --- 1. alias ---
+    let alias_ok = match crate::alloc_frame() {
+        Some(frame) => {
+            let frame = frame as u64;
+            phys_to_virt(frame).write_volatile(0x5A);
+            let seen = (frame as *const u8).read_volatile(); // identity view
+            crate::free_frame(frame as usize);
+            seen == 0x5A
+        }
+        None => false,
+    };
+    s(b"[paging] self-test alias (physmap write, identity read): ");
+    s(if alias_ok { b"PASS\n" } else { b"FAIL\n" });
+    ok &= alias_ok;
+
+    // --- 2. allocate past the old 8 MiB limit ---
+    let mut chain: u64 = 0; // physical address of the last frame, 0 = end
+    let mut count: u64 = 0;
+    let mut all_zeroed = true;
+    let mut high_frame: u64 = 0;
+    while let Some(frame) = crate::alloc_frame() {
+        let frame = frame as u64;
+        let words = phys_to_virt(frame) as *mut u64;
+        for i in 0..(PAGE_SIZE as usize / 8) {
+            if words.add(i).read_volatile() != 0 {
+                all_zeroed = false;
+            }
+        }
+        words.write_volatile(chain); // link to the previous frame
+        chain = frame;
+        count += 1;
+        if frame >= IDENTITY_MAP_BYTES {
+            high_frame = frame;
+            break;
+        }
+    }
+    while chain != 0 {
+        let next = (phys_to_virt(chain) as *const u64).read_volatile();
+        crate::free_frame(chain as usize);
+        chain = next;
+    }
+    let alloc_ok = high_frame != 0 && all_zeroed;
+    s(b"[paging] self-test allocator: ");
+    dec(count);
+    s(b" frames, first above 8 MiB at ");
+    hex(high_frame);
+    s(if all_zeroed { b", all zeroed" } else { b", NOT ZEROED" });
+    s(if alloc_ok { b": PASS\n" } else { b": FAIL\n" });
+    ok &= alloc_ok;
+
+    // --- 3. last usable frame ---
+    let mut top: u64 = 0;
+    for entry in e820.iter() {
+        let (base, length, kind) = (entry.base, entry.length, entry.region_type);
+        if kind == 1 && length >= PAGE_SIZE {
+            top = top.max((base + length) & !(PAGE_SIZE - 1));
+        }
+    }
+    let top_ok = if top >= PAGE_SIZE && top <= PHYS_MAP_MAX {
+        let last = top - PAGE_SIZE;
+        let p = phys_to_virt(last) as *mut u64;
+        let saved = p.read_volatile();
+        p.write_volatile(0xF4E7_A05F_4E7A_05F4);
+        let seen = p.read_volatile();
+        p.write_volatile(saved);
+        s(b"[paging] self-test top of RAM: frame ");
+        hex(last);
+        seen == 0xF4E7_A05F_4E7A_05F4
+    } else {
+        s(b"[paging] self-test top of RAM: no usable region found");
+        false
+    };
+    s(if top_ok { b": PASS\n" } else { b": FAIL\n" });
+    ok &= top_ok;
+
+    ok
 }

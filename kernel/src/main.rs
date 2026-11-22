@@ -67,6 +67,10 @@ fn serial_write_byte(b: u8) {
     }
 }
 
+// Out of line on purpose: these are called from dozens of places, and
+// letting the compiler inline the UART polling loop at each one multiplied
+// the kernel's code size.
+#[inline(never)]
 fn serial_write_str(s: &[u8]) {
 
     for &b in s {
@@ -81,6 +85,7 @@ fn serial_write_str(s: &[u8]) {
 }
 
 /// Write a u64 as decimal to serial.
+#[inline(never)]
 fn serial_write_u64(mut n: u64) {
 
     if n == 0 {
@@ -103,6 +108,7 @@ fn serial_write_u64(mut n: u64) {
 }
 
 /// Write a u64 as hex (0xXXXXXXXXXXXXXXXX) to serial
+#[inline(never)]
 fn serial_write_hex(n: u64) {
     serial_write_str(b"0x");
 
@@ -176,6 +182,7 @@ unsafe fn bitmap_is_free(frame: usize) -> bool {
 /// This is the Raw -> Sanitized transition from the FreyaOS memory model.
 /// Typed allocation (Sanitized -> Typed) will be added with the capability
 /// system.
+#[inline(never)]
 pub unsafe fn alloc_frame() -> Option<usize> {
 
     for i in 0..TOTAL_FRAMES {
@@ -186,13 +193,26 @@ pub unsafe fn alloc_frame() -> Option<usize> {
             let phys = i * PAGE_SIZE;
             // Sanitize: zero the frame before handing it out.
             // This is the required Raw -> Sanitized invariant.
-            let ptr = phys as *mut u8;
+            // Through the physical map, so any frame works, not just
+            // those under the 8 MiB identity map.
+            let ptr = paging::phys_to_virt(phys as u64);
 
             core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
             return Some(phys);
         }
     }
     None
+}
+
+/// Return a frame to the allocator (Sanitized/Typed -> Raw). It is zeroed
+/// again on its next allocation, not here.
+///
+/// # Safety
+/// The caller must own `phys` (it came from alloc_frame) and must not use
+/// it afterwards. The bitmap can't tell a returned frame from a reserved
+/// one, so freeing a frame you don't own corrupts the allocator.
+pub unsafe fn free_frame(phys: usize) {
+    bitmap_set_free(phys / PAGE_SIZE);
 }
 
 /// Initialise the frame allocator from an E820 map.
@@ -357,7 +377,8 @@ pub extern "C" fn rust_start() -> ! {
     serial_write_hex(paging::STACK_GUARD_PAGE);
     serial_write_str(b"\n");
 
-    if idt::selftest_breakpoint() {
+    let selftest_ok = idt::selftest_breakpoint();
+    if selftest_ok {
         serial_write_str(b"[idt] int3 self-test: PASS (handler returned, registers intact)\n");
     } else {
         serial_write_str(b"[idt] int3 self-test: FAIL\n");
@@ -398,8 +419,31 @@ pub extern "C" fn rust_start() -> ! {
     // --- Initialize the physical frame allocator ---
     unsafe { init_frame_allocator(e820); }
 
+    // --- Physical map: all RAM at PHYS_MAP_BASE + phys (higher half) ---
+    // From here on, phys_to_virt() works for any frame, and alloc_frame()
+    // zeroes frames through it.
+    let pm = unsafe { paging::map_physical_memory(e820) };
+    serial_write_str(b"[paging] physical map at ");
+    serial_write_hex(paging::PHYS_MAP_BASE);
+    serial_write_str(b": ");
+    serial_write_u64(pm.bytes_mapped / (1024 * 1024));
+    serial_write_str(b" MiB in ");
+    serial_write_u64(pm.huge_pages);
+    serial_write_str(b" x 2 MiB pages, ");
+    serial_write_u64(pm.table_frames);
+    serial_write_str(b" table frames, up to ");
+    serial_write_hex(pm.highest_addr);
+    serial_write_str(if pm.nx { b", no-execute\n" } else { b", NX unsupported\n" });
+
+    let physmap_ok = unsafe { paging::selftest(e820) };
+
+    // Fault demo for the physical map (halts): jump to the kernel's own
+    // code through its physical-map alias. NX makes that an instruction-
+    // fetch page fault even though the bytes are valid code.
+    // unsafe { let f: extern "C" fn() = core::mem::transmute(paging::phys_to_virt(0x10_0000)); f(); }
+
     // --- Smoke-test: allocate a frame and verify it is zeroed ---
-    match unsafe { alloc_frame() } {
+    let sanitize_ok = match unsafe { alloc_frame() } {
 
         Some(phys) => {
 
@@ -409,8 +453,8 @@ pub extern "C" fn rust_start() -> ! {
 
             // Verify zeroed (Sanitized invariant check).
             let slice = unsafe {
-                
-                core::slice::from_raw_parts(phys as *const u8, PAGE_SIZE)
+
+                core::slice::from_raw_parts(paging::phys_to_virt(phys as u64), PAGE_SIZE)
             };
 
             let all_zero = slice.iter().all(|&b| b == 0);
@@ -419,28 +463,53 @@ pub extern "C" fn rust_start() -> ! {
 
                 serial_write_str(b"[kernel] sanitize check: PASS\n");
             } else {
-                
+
                 serial_write_str(b"[kernel] sanitize check: FAIL - frame not zeroed!\n");
             }
+            all_zero
         }
 
         None => {
                 serial_write_str(b"[kernel] FATAL: alloc_frame returned None\n");
+                false
         }
-    }
+    };
 
     // --- VGA status display (screen was cleared at entry) ---
-    vga_print(0, b"FreyaOS kernel:  OK", 0x0A);
-    vga_print(1, b"Segments + TSS:  OK", 0x0A);
-    vga_print(2, b"Exception table: OK", 0x0A);
-    vga_print(3, b"Page tables:     OK", 0x0A);
-    vga_print(4, b"Memory map:      OK", 0x0A);
-    vga_print(5, b"Frame allocator: OK", 0x0A);
-    vga_print(6, b"Sanitise check:  OK", 0x0A);
-    vga_print(7, b"--- FreyaOS foundation ready ---", 0x0F);
+    // Steps with no result value either succeed or end in an exception
+    // report, so reaching this point means they passed.
+    vga_status(0, b"FreyaOS kernel:  ", true);
+    vga_status(1, b"Segments + TSS:  ", true);
+    vga_status(2, b"Exception table: ", selftest_ok);
+    vga_status(3, b"Page tables:     ", true);
+    vga_status(4, b"Memory map:      ", true);
+    vga_status(5, b"Frame allocator: ", true);
+    vga_status(6, b"Physical map:    ", physmap_ok);
+    vga_status(7, b"Sanitise check:  ", sanitize_ok);
 
-    serial_write_str(b"[kernel] init complete - halting\n");
+    if selftest_ok && physmap_ok && sanitize_ok {
+        vga_print(8, b"--- FreyaOS foundation ready ---", 0x0F);
+        serial_write_str(b"[kernel] init complete - halting\n");
+    } else {
+        vga_print(8, b"--- SELF-TEST FAILURE: see serial log ---", 0x0C);
+        serial_write_str(b"[kernel] init complete WITH FAILURES - halting\n");
+    }
     halt();
+}
+
+/// One status row: label followed by OK (green) or FAIL (red).
+fn vga_status(row: usize, label: &[u8], ok: bool) {
+    let (word, attr): (&[u8], u8) = if ok { (b"OK", 0x0A) } else { (b"FAIL", 0x0C) };
+
+    let mut line = [b' '; 80];
+    let mut len = 0;
+    for &b in label.iter().chain(word.iter()) {
+        if len < line.len() {
+            line[len] = b;
+            len += 1;
+        }
+    }
+    vga_print(row, &line[..len.min(line.len())], attr);
 }
 
 /// Demo only: recurse until the kernel stack runs into its guard page.

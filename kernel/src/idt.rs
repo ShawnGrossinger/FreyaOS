@@ -292,23 +292,9 @@ fn exception_name(vector: u64) -> &'static [u8] {
         .unwrap_or(b"Unknown")
 }
 
-// One out-of-line copy of each serial call. Without #[inline(never)] the
-// compiler inlines the whole UART polling loop at every one of the ~60
-// print calls below, which tripled the kernel's .text size.
-#[inline(never)]
-fn s(bytes: &[u8]) {
-    crate::serial_write_str(bytes);
-}
-
-#[inline(never)]
-fn hex(n: u64) {
-    crate::serial_write_hex(n);
-}
-
-#[inline(never)]
-fn dec(n: u64) {
-    crate::serial_write_u64(n);
-}
+// The serial functions are #[inline(never)] in main.rs, so each call below
+// is a plain call rather than a copy of the UART polling loop.
+use crate::{serial_write_hex as hex, serial_write_str as s, serial_write_u64 as dec};
 
 fn report_serial(f: &InterruptFrame, cr2: u64) {
     s(b"\n[EXCEPTION] vector ");
