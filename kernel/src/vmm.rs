@@ -6,13 +6,28 @@
 //! allocated from pmm on demand and reclaimed when they empty out.
 //!
 //! An `AddressSpace` is one 4-level hierarchy, named by its root (PML4)
-//! frame. Today the kernel's is the only one. Per-process address spaces
-//! will be the same type with a different root, and an address space is a
-//! natural thing for a capability to name.
+//! frame. There is the kernel's, and one per user process (new_user). A
+//! user address space shares the kernel's half with every other address
+//! space and owns its user half:
 //!
-//! Mapping does not transfer ownership. `unmap` hands back the physical
-//! address and the caller decides what happens to that frame; nothing here
-//! frees a frame it didn't allocate itself (page tables).
+//!   - PML4 entries 256-511 are copies of the kernel's, pointing at the
+//!     same PDPTs. Those PDPTs are never freed (see unmap), so a change
+//!     the kernel makes inside them shows up everywhere at once. A NEW
+//!     kernel PML4 entry would not, so creating one while any user address
+//!     space exists halts (see map_locked). Every kernel region in use
+//!     (physical map, dynamic region, heap, task stacks) has its entry
+//!     before the first process starts.
+//!   - PML4 entry 0 points at the process's own PDPT, whose entry 0 is a
+//!     copy of the kernel's: the low 1 GiB, including the identity-mapped
+//!     kernel image and stack, is the same in every address space and
+//!     kernel-only (no U/S bit), because the kernel still runs there.
+//!   - User space is [USER_BASE, USER_END): everything else in the lower
+//!     half. Only pages with a USER_* preset go there, and only there.
+//!
+//! Mapping does not transfer ownership in the kernel's address space:
+//! `unmap` hands back the physical address and the caller decides what
+//! happens to that frame. A user address space is different: it owns the
+//! frames mapped into it, and destroy() frees them with it.
 //!
 //! Virtual layout (kernel's view):
 //!
@@ -31,7 +46,7 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::paging::{self, ADDR_MASK, HUGE, NO_EXECUTE, PRESENT, WRITABLE};
+use crate::paging::{self, ADDR_MASK, HUGE, NO_EXECUTE, PRESENT, USER, WRITABLE};
 use crate::pmm::{self, PAGE_SIZE};
 
 /// Start of the kernel's dynamic mapping region.
@@ -40,6 +55,28 @@ pub const KERNEL_DYNAMIC_BASE: u64 = 0xFFFF_C000_0000_0000;
 /// Device registers are mapped here, 256 GiB into the dynamic region, well
 /// clear of the pages the self-tests use.
 pub const DEVICE_WINDOW_BASE: u64 = KERNEL_DYNAMIC_BASE + 0x40_0000_0000;
+
+/// User space: from 1 GiB (below is the kernel's shared identity map) to
+/// the last page below the canonical hole, which is left out on purpose:
+/// a `syscall` in the very last bytes of user space would make SYSRET
+/// return to a non-canonical address, which faults in ring 0 on Intel CPUs
+/// with the user's stack pointer already loaded (CVE-2012-0217).
+pub const USER_BASE: u64 = 0x0000_0000_4000_0000;
+pub const USER_END: u64 = 0x0000_7FFF_FFFF_F000;
+
+/// True if [virt, virt + len) lies inside user space (no wrap-around).
+pub fn is_user_range(virt: u64, len: u64) -> bool {
+    virt >= USER_BASE && virt < USER_END && len <= USER_END - virt
+}
+
+/// User address spaces that exist. While any do, the kernel must not create
+/// a new kernel-half PML4 entry: their copies of the kernel half would never
+/// see it.
+static USER_SPACES: AtomicU64 = AtomicU64::new(0);
+
+pub fn user_spaces() -> u64 {
+    USER_SPACES.load(Ordering::Relaxed)
+}
 
 const ENTRIES: usize = 512;
 const WRITE_THROUGH: u64 = 1 << 3; // PWT
@@ -64,6 +101,14 @@ impl PageFlags {
     /// Read + write, no execute, uncached. For device registers, which
     /// must see every access in order and never be served from cache.
     pub const MMIO: PageFlags = PageFlags(WRITABLE | NO_EXECUTE | CACHE_DISABLE | WRITE_THROUGH);
+    /// Ring 3: read + execute. For a program's code.
+    pub const USER_CODE: PageFlags = PageFlags(USER);
+    /// Ring 3: read + write, no execute. Data and stacks.
+    pub const USER_DATA: PageFlags = PageFlags(USER | WRITABLE | NO_EXECUTE);
+
+    fn is_user(self) -> bool {
+        self.0 & USER != 0
+    }
 
     /// The bits that go into the leaf entry. NO_EXECUTE is only legal once
     /// EFER.NXE is on; without NX support the page is executable (and the
@@ -98,6 +143,9 @@ pub enum MapError {
     HugePageInTheWay,
     /// No frame left for an intermediate page table.
     OutOfMemory,
+    /// A user page outside user space or in the kernel's address space, or
+    /// a kernel page inside user space.
+    WrongRegion,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -108,6 +156,9 @@ pub enum UnmapError {
     /// The address is inside a 2 MiB or 1 GiB page; only 4 KiB pages can be
     /// unmapped one at a time.
     HugePage,
+    /// Outside user space, through a user address space (the kernel half
+    /// is shared and only changes through the kernel's address space).
+    WrongRegion,
 }
 
 impl MapError {
@@ -118,6 +169,7 @@ impl MapError {
             MapError::AlreadyMapped => b"already mapped",
             MapError::HugePageInTheWay => b"huge page in the way",
             MapError::OutOfMemory => b"out of memory",
+            MapError::WrongRegion => b"wrong region",
         }
     }
 }
@@ -129,6 +181,7 @@ impl UnmapError {
             UnmapError::NonCanonical => b"non-canonical",
             UnmapError::NotMapped => b"not mapped",
             UnmapError::HugePage => b"huge page",
+            UnmapError::WrongRegion => b"wrong region",
         }
     }
 }
@@ -167,6 +220,28 @@ fn read_cr3() -> u64 {
     cr3
 }
 
+/// The root of the address space the CPU is using.
+pub fn active_root() -> u64 {
+    read_cr3() & ADDR_MASK
+}
+
+/// Switch to another address space (flushes every non-global TLB entry).
+///
+/// # Safety
+/// `root` must be a complete hierarchy that maps the running code, its
+/// stack and the kernel half: one from AddressSpace::kernel() or new_user().
+pub unsafe fn switch_to(root: u64) {
+    asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+}
+
+fn fatal(msg: &[u8], value: u64) -> ! {
+    crate::serial_write_str(b"[vmm] FATAL: ");
+    crate::serial_write_str(msg);
+    crate::serial_write_hex(value);
+    crate::serial_write_str(b"\n");
+    crate::halt();
+}
+
 // ===========================================================================
 // AddressSpace
 // ===========================================================================
@@ -179,6 +254,119 @@ impl AddressSpace {
     /// The kernel's address space (the one paging::init() switched to).
     pub fn kernel() -> AddressSpace {
         AddressSpace { root: paging::kernel_root() }
+    }
+
+    /// The address space whose PML4 is at `root`.
+    ///
+    /// # Safety
+    /// `root` must have come from root() of a live address space.
+    pub unsafe fn from_root(root: u64) -> AddressSpace {
+        AddressSpace { root }
+    }
+
+    pub fn root(&self) -> u64 {
+        self.root
+    }
+
+    fn is_kernel(&self) -> bool {
+        self.root == paging::kernel_root()
+    }
+
+    /// A new, empty user address space: the kernel half and the low 1 GiB
+    /// shared with the kernel's (see the top of this file), nothing in user
+    /// space yet. Costs two frames (its PML4 and its lower-half PDPT).
+    pub fn new_user() -> Result<AddressSpace, MapError> {
+        crate::cpu::without_interrupts(|| unsafe {
+            let pml4 = pmm::alloc_frame().ok_or(MapError::OutOfMemory)? as u64;
+            let Some(pdpt) = pmm::alloc_frame() else {
+                pmm::free_frame(pml4 as usize);
+                return Err(MapError::OutOfMemory);
+            };
+            let pdpt = pdpt as u64;
+            let kernel = table(paging::kernel_root());
+            let (new_pml4, new_pdpt) = (table(pml4), table(pdpt));
+            for i in 256..ENTRIES {
+                *new_pml4.add(i) = *kernel.add(i);
+            }
+            // Low 1 GiB: the kernel's own entry, so U/S stays clear.
+            let kernel_pdpt = *kernel & ADDR_MASK;
+            *new_pdpt = *table(kernel_pdpt);
+            // U/S set here so user pages further down can be reached; the
+            // copied entry above still keeps the low 1 GiB kernel-only.
+            *new_pml4 = pdpt | PRESENT | WRITABLE | USER;
+            USER_SPACES.fetch_add(1, Ordering::Relaxed);
+            Ok(AddressSpace { root: pml4 })
+        })
+    }
+
+    /// Free every user page, every table of the user half and the PML4.
+    /// Leaves the shared parts alone: the kernel half and the low 1 GiB.
+    ///
+    /// # Safety
+    /// Must be a user address space that no task will use again. It must
+    /// not be the active one (halts if it is).
+    pub unsafe fn destroy(self) {
+        if self.is_kernel() || self.root == active_root() {
+            fatal(b"destroy of the kernel's or the active address space, root ", self.root);
+        }
+        crate::cpu::without_interrupts(|| {
+            let pml4 = table(self.root);
+            for i in 0..256 {
+                let e4 = *pml4.add(i);
+                if e4 & PRESENT == 0 {
+                    continue;
+                }
+                let pdpt = e4 & ADDR_MASK;
+                for j in 0..ENTRIES {
+                    let e3 = *table(pdpt).add(j);
+                    if (i == 0 && j == 0) || e3 & PRESENT == 0 {
+                        continue; // the shared low 1 GiB, or nothing
+                    }
+                    let pd = e3 & ADDR_MASK;
+                    for k in 0..ENTRIES {
+                        let e2 = *table(pd).add(k);
+                        if e2 & PRESENT == 0 {
+                            continue;
+                        }
+                        let pt = e2 & ADDR_MASK;
+                        for l in 0..ENTRIES {
+                            let e1 = *table(pt).add(l);
+                            if e1 & PRESENT != 0 {
+                                pmm::free_frame((e1 & ADDR_MASK) as usize);
+                            }
+                        }
+                        pmm::free_frame(pt as usize);
+                    }
+                    pmm::free_frame(pd as usize);
+                }
+                pmm::free_frame(pdpt as usize);
+            }
+            pmm::free_frame(self.root as usize);
+            USER_SPACES.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+
+    /// The frame behind user address `virt`, if ring 3 could read it (or
+    /// write it, with `write`): present, U/S at every level, and writable
+    /// if asked. This is how the kernel checks a pointer a process hands it.
+    pub fn user_page(&self, virt: u64, write: bool) -> Option<u64> {
+        if !is_user_range(virt, 1) {
+            return None;
+        }
+        unsafe {
+            let mut table_phys = self.root;
+            for level in [4u32, 3, 2, 1] {
+                let entry = *table(table_phys).add(index(virt, level));
+                if entry & (PRESENT | USER) != PRESENT | USER
+                    || (write && entry & WRITABLE == 0)
+                    || (level < 4 && level > 1 && entry & HUGE != 0)
+                {
+                    return None;
+                }
+                table_phys = entry & ADDR_MASK;
+            }
+            Some(table_phys)
+        }
     }
 
     /// True if the CPU is using this hierarchy right now. TLB entries only
@@ -206,21 +394,39 @@ impl AddressSpace {
         if !is_canonical(virt) {
             return Err(MapError::NonCanonical);
         }
+        // User pages only in user space of a user address space; nothing
+        // else in user space; nothing outside it through a user address
+        // space (the kernel half is shared: change it via the kernel's).
+        let in_user_space = is_user_range(virt, PAGE_SIZE);
+        if flags.is_user() != in_user_space || (flags.is_user() && self.is_kernel())
+            || (!self.is_kernel() && !in_user_space)
+        {
+            return Err(MapError::WrongRegion);
+        }
 
         // Walk PML4 -> PDPT -> PD, creating any missing table on the way.
+        // Intermediate entries are permissive; the leaf decides. For a user
+        // page they also need U/S, or ring 3 can't get past them.
+        let table_bits = PRESENT | WRITABLE | if flags.is_user() { USER } else { 0 };
         let mut table_phys = self.root;
         for level in [4u32, 3, 2] {
             let entry = table(table_phys).add(index(virt, level));
 
             if *entry & PRESENT == 0 {
+                if level == 4 && index(virt, 4) >= 256 && user_spaces() > 0 {
+                    // User address spaces copied the kernel's PML4 entries
+                    // when they were made, and would never see this one.
+                    fatal(b"new kernel-half PML4 entry after user address spaces copied the kernel half, address ", virt);
+                }
                 let new = match pmm::alloc_frame() {
                     Some(frame) => frame as u64, // already zeroed
                     None => return Err(MapError::OutOfMemory),
                 };
-                // Intermediate entries are permissive; the leaf decides.
-                *entry = new | PRESENT | WRITABLE;
+                *entry = new | table_bits;
             } else if level < 4 && *entry & HUGE != 0 {
                 return Err(MapError::HugePageInTheWay);
+            } else {
+                *entry |= table_bits & USER;
             }
 
             table_phys = *entry & ADDR_MASK;
@@ -258,6 +464,9 @@ impl AddressSpace {
         }
         if !is_canonical(virt) {
             return Err(UnmapError::NonCanonical);
+        }
+        if !self.is_kernel() && !is_user_range(virt, PAGE_SIZE) {
+            return Err(UnmapError::WrongRegion);
         }
 
         // Walk down, remembering the entry that points at each table so an
@@ -519,6 +728,52 @@ pub unsafe fn selftest() -> bool {
         ks.unmap(vga_cell_va) == Ok(0xB8000) && seen == 0x0F00 | b'F' as u16 && uncached
     };
     check(&mut ok, b"MMIO mapping of the VGA buffer is uncached and aliases it", mmio_ok);
+
+    // --- User address spaces ---
+    // Where user pages may go: only user space, only in a user address
+    // space; and nothing but user pages there.
+    let before = pmm::free_frames();
+    let regions_ok = match (AddressSpace::new_user(), pmm::alloc_frame()) {
+        (Ok(mut us), Some(frame)) => {
+            let frame = frame as u64;
+            let refused = ks.map(USER_BASE, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
+                && us.map(KERNEL_DYNAMIC_BASE, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
+                && us.map(0x10_0000, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
+                && us.map(USER_END, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
+                && us.map(USER_BASE, frame, PageFlags::KERNEL_DATA) == Err(MapError::WrongRegion)
+                && us.unmap(KERNEL_DYNAMIC_BASE) == Err(UnmapError::WrongRegion);
+            let accepted = us.map(USER_BASE, frame, PageFlags::USER_CODE).is_ok()
+                && us.user_page(USER_BASE, false) == Some(frame)
+                && us.user_page(USER_BASE, true).is_none(); // code is read-only
+            // The kernel half and the low 1 GiB are there, the low 1 GiB
+            // without U/S; destroy gives back the page, every table and the
+            // PML4.
+            let pdpt = *table(us.root) & ADDR_MASK;
+            let shared = us.translate(paging::PHYS_MAP_BASE + frame) == Some(frame)
+                && us.translate(0x10_0000) == Some(0x10_0000)
+                && *table(pdpt) & PRESENT != 0
+                && *table(pdpt) & USER == 0;
+            let spaces = user_spaces();
+            us.destroy();
+            refused && accepted && shared && spaces == 1
+        }
+        (Ok(us), None) => {
+            us.destroy();
+            false
+        }
+        (Err(_), frame) => {
+            if let Some(f) = frame {
+                pmm::free_frame(f);
+            }
+            false
+        }
+    };
+    check(&mut ok, b"user pages only in user space, only in a user address space; kernel pages never there", regions_ok);
+    check(
+        &mut ok,
+        b"user address space shares the kernel half, keeps the low 1 GiB kernel-only, gives every frame back",
+        regions_ok && pmm::free_frames() == before && user_spaces() == 0,
+    );
 
     s(b"[vmm] dynamic region at ");
     hex(KERNEL_DYNAMIC_BASE);

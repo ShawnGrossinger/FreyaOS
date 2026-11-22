@@ -62,6 +62,9 @@ pub const IDENTITY_MAP_BYTES: u64 = 8 * 1024 * 1024;
 // pub(crate): vmm.rs builds entries with the same bits.
 pub(crate) const PRESENT: u64 = 1 << 0;
 pub(crate) const WRITABLE: u64 = 1 << 1;
+/// U/S: ring 3 may use the page. Only counts if every level on the walk
+/// has it set, so a single clear bit anywhere keeps a whole subtree kernel-only.
+pub(crate) const USER: u64 = 1 << 2;
 pub(crate) const HUGE: u64 = 1 << 7;
 pub(crate) const NO_EXECUTE: u64 = 1 << 63; // only legal once EFER.NXE = 1
 

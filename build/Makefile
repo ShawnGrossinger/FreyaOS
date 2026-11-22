@@ -42,7 +42,8 @@ $(OUTDIR):
 
 KERNEL_SRCS := $(shell find $(KERNDIR)/src -name '*.rs') \
 			   $(KERNDIR)/entry.asm $(KERNDIR)/kernel.ld $(KERNDIR)/build.rs \
-			   $(KERNDIR)/Cargo.toml $(KERNDIR)/x86_64-freya.json
+			   $(KERNDIR)/Cargo.toml $(KERNDIR)/x86_64-freya.json \
+			   $(wildcard ../user/*.asm ../user/*.inc)
 
 # Build-time fault demo: FREYA_DEMO=<name> make run  (names: see
 # run_requested_demo() in kernel/src/main.rs). The stamp file's name holds

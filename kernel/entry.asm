@@ -155,6 +155,18 @@ isr_common:
     sub rsp, 512
     fxsave [rsp]
 
+    ; From ring 3 (CS RPL = 3, InterruptFrame.cs is the 19th qword): the
+    ; saved state is the process's, and so are the live MXCSR and x87
+    ; control word. Give the kernel its own defaults, or a process could
+    ; unmask SSE exceptions or change rounding for kernel code (including
+    ; other tasks the scheduler switches to from here). fxrstor below
+    ; puts the process's back.
+    test qword [rsp + 512 + 18*8], 3
+    jz .from_kernel
+    fninit
+    ldmxcsr [rel mxcsr_default]
+.from_kernel:
+
     cld                         ; SysV requires DF=0 at function entry
     lea rdi, [rsp + 512]        ; arg0 = &InterruptFrame (points at saved r15)
     call interrupt_dispatch     ; returns for #BP and hardware interrupts
@@ -213,6 +225,146 @@ switch_context:
     pop rbx
     pop rbp
     ret
+
+; ---------------------------------------------------------------------------
+; syscall_entry — where the SYSCALL instruction lands (IA32_LSTAR).
+;
+; SYSCALL does very little: RCX = the user's RIP, R11 = the user's RFLAGS,
+; CS/SS = kernel selectors from IA32_STAR, RFLAGS &= ~IA32_FMASK (which
+; clears IF, so no interrupt can arrive until we say so). It does NOT
+; switch stacks: RSP is still the process's, and nothing here may touch
+; it. So first switch to the task's kernel stack (one CPU, interrupts off:
+; a scratch variable is enough), then save everything the process had.
+;
+; System-call ABI: number in RAX, arguments in RDI, RSI, RDX, R10, R8, R9,
+; result in RAX. RCX and R11 are destroyed (SYSCALL uses them); every
+; other register, and all x87/SSE state, comes back unchanged.
+;
+; Frame built on the kernel stack, mirrored by SyscallFrame in syscall.rs:
+;   user RSP, RFLAGS, RIP (3 qwords), the 15 GPRs (15 qwords): 144 bytes,
+;   a multiple of 16, so RSP is aligned for FXSAVE and the call.
+; ---------------------------------------------------------------------------
+extern syscall_dispatch
+
+global syscall_entry
+syscall_entry:
+    mov [rel syscall_user_rsp], rsp
+    mov rsp, [rel syscall_kernel_rsp]
+    push qword [rel syscall_user_rsp]
+    push r11                    ; user RFLAGS
+    push rcx                    ; user RIP
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    sub rsp, 512
+    fxsave [rsp]
+    fninit
+    ldmxcsr [rel mxcsr_default]
+    cld
+
+    lea rdi, [rsp + 512]        ; &SyscallFrame
+    sti                         ; system calls are preemptible
+    call syscall_dispatch       ; exit() and kills never come back
+    cli
+
+    fxrstor [rsp]
+    add rsp, 512
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    pop rcx                     ; user RIP
+    pop r11                     ; user RFLAGS (IF set: sysret re-enables)
+    pop rsp                     ; user RSP: nothing may touch the stack now
+    o64 sysret
+
+; ---------------------------------------------------------------------------
+; enter_user(rip [rdi], rsp [rsi], arg [rdx]) -> never returns
+;
+; A process's first entry into ring 3. iretq pops RIP, CS, RFLAGS, RSP, SS
+; from a frame we build: user code and stack selectors (RPL 3), interrupts
+; enabled in the process. Every register the process could read is cleared
+; first, so no kernel value leaks into it; the argument arrives in RDI.
+; ---------------------------------------------------------------------------
+global enter_user
+enter_user:
+    cli
+    fninit
+    ldmxcsr [rel mxcsr_default]
+    pxor xmm0, xmm0
+    pxor xmm1, xmm1
+    pxor xmm2, xmm2
+    pxor xmm3, xmm3
+    pxor xmm4, xmm4
+    pxor xmm5, xmm5
+    pxor xmm6, xmm6
+    pxor xmm7, xmm7
+    pxor xmm8, xmm8
+    pxor xmm9, xmm9
+    pxor xmm10, xmm10
+    pxor xmm11, xmm11
+    pxor xmm12, xmm12
+    pxor xmm13, xmm13
+    pxor xmm14, xmm14
+    pxor xmm15, xmm15
+
+    push qword 0x1B             ; SS: user data, RPL 3 (gdt.rs USER_DATA_SEL)
+    push rsi                    ; RSP
+    push qword 0x202            ; RFLAGS: IF, and the always-one bit 1
+    push qword 0x23             ; CS: user code, RPL 3 (gdt.rs USER_CODE_SEL)
+    push rdi                    ; RIP
+
+    mov rdi, rdx                ; the argument
+    xor eax, eax
+    xor ebx, ebx
+    xor ecx, ecx
+    xor edx, edx
+    xor esi, esi
+    xor ebp, ebp
+    xor r8d, r8d
+    xor r9d, r9d
+    xor r10d, r10d
+    xor r11d, r11d
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
+    iretq
+
+; The power-on MXCSR: every SSE exception masked, round to nearest.
+align 4
+mxcsr_default:
+    dd 0x1F80
+
+section .bss
+align 8
+global syscall_kernel_rsp
+syscall_kernel_rsp: resq 1      ; = TSS.RSP0, set by gdt::set_kernel_stack
+syscall_user_rsp:   resq 1      ; scratch while switching stacks
 
 ; ---------------------------------------------------------------------------
 ; isr_stub_table — addresses of the 32 stubs, read by idt.rs to fill gates.

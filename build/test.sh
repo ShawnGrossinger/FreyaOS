@@ -21,13 +21,16 @@ TIMEOUT=${TIMEOUT:-60}
 ROOT=out/test
 
 # name | FREYA_DEMO | RAM | patterns that must all appear, separated by ;;
+#      | optional extra QEMU arguments
 CASES=(
-  "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after"
+  "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!;;'probe' killed by vector 14 #PF"
   "boot-4G||4G|physical map at 0xffff800000000000: 4096 MiB;;init complete - boot thread done; scheduler and timer running"
   "ud2|ud2|128M|vector 6 #UD Invalid Opcode"
   "page_fault|page_fault|128M|vector 14 #PF Page Fault;;cr2=0x0000000010000000;;page not present, read"
   "stack_overflow|stack_overflow|128M|vector 8 #DF Double Fault;;KERNEL STACK OVERFLOW;;running task: 0 'boot'"
   "task_stack_overflow|task_stack_overflow|128M|vector 8 #DF Double Fault;;TASK STACK OVERFLOW \(task [0-9]+ 'overflow-demo';;running task: [0-9]+ 'overflow-demo'"
+  "smap|smap|128M|vector 14 #PF Page Fault;;cr2=0x0000000040000000;;protection violation, read, supervisor mode;;kernel touched user memory|-cpu max"
+  "smep|smep|128M|vector 14 #PF Page Fault;;cr2=0x0000000040000000;;protection violation, instruction fetch, supervisor mode;;kernel touched user memory|-cpu max"
   "nx|nx|128M|vector 14 #PF Page Fault;;protection violation, instruction fetch"
   "use_after_unmap|use_after_unmap|128M|vector 14 #PF Page Fault;;cr2=0xffffc00000100000;;page not present, read"
   "write_read_only|write_read_only|128M|vector 14 #PF Page Fault;;protection violation, write"
@@ -39,8 +42,9 @@ COMMON="self-tests: [0-9]+ passed, 0 failed"
 # A line on serial that means the kernel has stopped for good.
 TERMINAL='init complete|\[EXCEPTION\] halted|FATAL|PANIC'
 
-boot() { # boot <image> <ram> <serial log>
+boot() { # boot <image> <ram> <serial log> [extra QEMU arguments...]
   local img=$1 mem=$2 log=$3
+  shift 3
   local memargs=(-m "$mem")
   # Big guests: back RAM without reserving it up front (the guest only
   # touches a few MiB), so the host needn't have that much free.
@@ -50,7 +54,7 @@ boot() { # boot <image> <ram> <serial log>
   : > "$log"
   "$QEMU" -drive "format=raw,file=$img,if=ide,media=disk,index=0" "${memargs[@]}" \
           -display none -monitor none -serial "file:$log" -no-reboot \
-          -d int,cpu_reset -D "${log%/*}/qemu.log" </dev/null >/dev/null 2>&1 &
+          -d int,cpu_reset -D "${log%/*}/qemu.log" "$@" </dev/null >/dev/null 2>&1 &
   local pid=$! ticks=0
   while kill -0 "$pid" 2>/dev/null; do
     if grep -qE "$TERMINAL" "$log"; then sleep 0.5; break; fi   # let the report finish
@@ -80,7 +84,7 @@ pass=0; fail=0; results=()
 echo "FreyaOS test suite ($QEMU, timeout ${TIMEOUT}s per boot)"
 
 for entry in "${CASES[@]}"; do
-  IFS='|' read -r name demo mem patterns <<< "$entry"
+  IFS='|' read -r name demo mem patterns extra <<< "$entry"
   selected "$name" || continue
   dir="$ROOT/$name"; mkdir -p "$dir"
   printf '  %-19s building...' "$name"
@@ -92,10 +96,12 @@ for entry in "${CASES[@]}"; do
   fi
 
   printf '\r  %-19s booting... ' "$name"
-  boot "$dir/freya-os.img" "$mem" "$dir/serial.log"
+  # shellcheck disable=SC2086  # extra is a list of separate arguments
+  boot "$dir/freya-os.img" "$mem" "$dir/serial.log" $extra
 
   missing=()
-  IFS=';;' read -r -a wanted <<< "$patterns;;$COMMON"
+  # Split on ";;" exactly (IFS would split on every single ";").
+  mapfile -t wanted < <(printf '%s;;%s\n' "$patterns" "$COMMON" | sed 's/;;/\n/g')
   for p in "${wanted[@]}"; do
     [ -z "$p" ] && continue
     grep -qE -- "$p" "$dir/serial.log" || missing+=("$p")

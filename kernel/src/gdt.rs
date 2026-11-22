@@ -6,7 +6,9 @@
 //!
 //! In long mode the TSS no longer does hardware task switching. It holds
 //! stack pointers the CPU loads on its own:
-//!   - RSP0: the stack used when an interrupt arrives from ring 3 (later)
+//!   - RSP0: the stack the CPU switches to when an interrupt or exception
+//!     arrives from ring 3. The scheduler points it at the top of the
+//!     running task's kernel stack on every switch (set_kernel_stack).
 //!   - IST1-7: "Interrupt Stack Table" entries. A gate with a nonzero IST
 //!     index ALWAYS switches to that stack, whatever RSP was before.
 //!
@@ -28,9 +30,7 @@ use core::arch::asm;
 
 pub const KERNEL_CODE_SEL: u16 = 0x08;
 pub const KERNEL_DATA_SEL: u16 = 0x10;
-#[allow(dead_code)] // used once ring 3 exists
 pub const USER_DATA_SEL: u16 = 0x18 | 3; // RPL 3
-#[allow(dead_code)]
 pub const USER_CODE_SEL: u16 = 0x20 | 3;
 pub const TSS_SEL: u16 = 0x28;
 
@@ -212,6 +212,22 @@ fn tss_descriptor(base: u64) -> (u64, u64) {
     let high = base >> 32; // base 63:32
 
     (low, high)
+}
+
+/// The stack the CPU loads when an interrupt or exception arrives from ring
+/// 3, and the one syscall_entry switches to: the top of the running task's
+/// kernel stack. Called by the scheduler on every switch.
+pub fn set_kernel_stack(top: u64) {
+    unsafe {
+        // rsp[0] is at offset 4 in the packed TSS: write it unaligned.
+        (&raw mut (*(&raw mut TSS)).rsp[0]).write_unaligned(top);
+        *(&raw mut syscall_kernel_rsp) = top;
+    }
+}
+
+extern "C" {
+    /// entry.asm: the stack syscall_entry switches to (kept equal to RSP0).
+    static mut syscall_kernel_rsp: u64;
 }
 
 /// Read back CS and TR so the boot log shows what the CPU actually has.

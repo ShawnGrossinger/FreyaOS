@@ -15,8 +15,10 @@ mod idt;
 mod paging;
 mod pic;
 mod pmm;
+mod process;
 mod sched;
 mod selftest;
+mod syscall;
 mod vmm;
 
 use boot::read_e820_map;
@@ -362,6 +364,27 @@ pub extern "C" fn rust_start() -> ! {
         sched::selftest()
     };
 
+    // --- User mode: system calls on, then processes ---
+    let user_ok = if !sched::is_enabled() {
+        selftest::check(b"user", b"user mode not started: it needs the scheduler", false)
+    } else {
+        match syscall::init() {
+            Err(why) => selftest::check(b"user", why, false),
+            Ok(entry) => {
+                let (smep, smap) = cpu::enable_smep_smap();
+                serial_write_str(b"[user] system calls via SYSCALL at ");
+                serial_write_hex(entry);
+                serial_write_str(b"; user space ");
+                serial_write_hex(vmm::USER_BASE);
+                serial_write_str(b"-");
+                serial_write_hex(vmm::USER_END);
+                serial_write_str(if smep { b"; SMEP on" } else { b"; no SMEP on this CPU" });
+                serial_write_str(if smap { b", SMAP on\n" } else { b", no SMAP\n" });
+                process::selftest()
+            }
+        }
+    };
+
     // --- VGA status display (screen was cleared at entry) ---
     // Steps with no result value either succeed or end in an exception
     // report, so reaching this point means they passed.
@@ -377,25 +400,26 @@ pub extern "C" fn rust_start() -> ! {
     vga_status(9, b"Sanitise check:  ", sanitize_ok);
     vga_status(10, b"Timer interrupt: ", irq_ok);
     vga_status(11, b"Scheduler:       ", sched_ok);
+    vga_status(12, b"User mode:       ", user_ok);
 
     // --- One line that says whether everything is up ---
     let all_ok = selftest::summary();
     let (passed, failed) = selftest::counts();
-    vga_summary(12, passed, failed);
+    vga_summary(13, passed, failed);
 
     // Build-time fault demo, if one was requested (halts).
     run_requested_demo();
 
     // The uptime line is kept current by a task of its own.
-    if sched::is_enabled() && sched::spawn("clock", clock_task, 14).is_err() {
+    if sched::is_enabled() && sched::spawn("clock", clock_task, 15).is_err() {
         serial_write_str(b"[kernel] could not start the clock task\n");
     }
 
     if all_ok {
-        vga_print(13, b"--- FreyaOS foundation ready ---", 0x0F);
+        vga_print(14, b"--- FreyaOS foundation ready ---", 0x0F);
         serial_write_str(b"[kernel] init complete - boot thread done; scheduler and timer running\n");
     } else {
-        vga_print(13, b"--- SELF-TEST FAILURE: see serial log ---", 0x0C);
+        vga_print(14, b"--- SELF-TEST FAILURE: see serial log ---", 0x0C);
         serial_write_str(b"[kernel] init complete WITH FAILURES\n");
     }
 
@@ -506,6 +530,10 @@ fn run_requested_demo() {
             }
             // The same, on a task's 16 KiB stack instead of the boot stack
             "task_stack_overflow" => sched::demo_task_stack_overflow(),
+            // #PF: the kernel reads (SMAP) or runs (SMEP) a process's page.
+            // Needs a CPU that has them: QEMU -cpu max, or SMEP on the T430.
+            "smap" => process::demo_kernel_touches_user(false),
+            "smep" => process::demo_kernel_touches_user(true),
             // #PF, instruction fetch: kernel code through its no-execute
             // physical-map alias
             "nx" => {
@@ -522,7 +550,7 @@ fn run_requested_demo() {
             "panic" => panic!("FREYA_DEMO=panic"),
             _ => {
                 serial_write_str(b"[demo] unknown; known: ud2 page_fault stack_overflow \
-                                   task_stack_overflow nx use_after_unmap write_read_only heap_double_free panic\n");
+                                   task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free panic\n");
                 return;
             }
         }

@@ -31,6 +31,12 @@
 //! interrupt handler, and a task can't free the stack it is running on),
 //! then halts until the next interrupt.
 //!
+//! User processes (process.rs) are tasks too: a task with its own address
+//! space, which it enters ring 3 from. On every switch the scheduler loads
+//! the next task's address space (CR3) and points TSS.RSP0 and the system
+//! call stack at the top of its kernel stack, which is where the CPU lands
+//! when that task's ring-3 code is interrupted or makes a system call.
+//!
 //! All scheduler state is touched with interrupts disabled. On one CPU that
 //! is the whole locking story.
 
@@ -39,6 +45,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::cpu::without_interrupts;
 use crate::pmm::{self, PAGE_SIZE};
+use crate::process::{Cap, Caps, NO_CAPS};
 use crate::vmm::{AddressSpace, PageFlags};
 
 pub const MAX_TASKS: usize = 32;
@@ -61,10 +68,21 @@ enum State {
     Running,
     /// Waiting until apic::ticks() reaches this value.
     Sleeping(u64),
-    /// Waiting in join() for this task to finish.
-    Joining(TaskId),
+    /// Waiting in join() for this task to finish, or until this tick.
+    Joining(TaskId, u64),
     /// Returned or called exit(); its stack is freed by reap().
     Finished,
+}
+
+/// How a task ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ExitStatus {
+    /// Its function returned or it called exit; a process's exit code.
+    Code(u64),
+    /// A process killed by a CPU exception in ring 3 (the vector).
+    Fault(u8),
+    /// A process stopped by kill().
+    Killed,
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +99,14 @@ struct Task {
     slices: u64,
     /// True while its stack pages are mapped.
     has_stack: bool,
+    /// Root of its own address space; 0 for kernel tasks (kernel's).
+    space: u64,
+    /// What the process may do (process.rs). Kernel tasks have none.
+    caps: Caps,
+    /// Set when it finished.
+    status: ExitStatus,
+    /// kill() asked for it to stop; it does when next returning to ring 3.
+    kill: bool,
 }
 
 const EMPTY: Task = Task {
@@ -92,6 +118,10 @@ const EMPTY: Task = Task {
     irq_depth: 0,
     slices: 0,
     has_stack: false,
+    space: 0,
+    caps: NO_CAPS,
+    status: ExitStatus::Code(0),
+    kill: false,
 };
 
 static mut TASKS: [Task; MAX_TASKS] = [EMPTY; MAX_TASKS];
@@ -122,6 +152,15 @@ fn slot_base(id: TaskId) -> u64 {
 
 fn stack_bottom(id: TaskId) -> u64 {
     slot_base(id) + GUARD_SIZE
+}
+
+/// Where the CPU should land when task `id`'s ring-3 code is interrupted.
+fn kernel_stack_top(id: TaskId) -> u64 {
+    if id == 0 {
+        crate::paging::KERNEL_STACK_TOP // the boot thread is on the boot stack
+    } else {
+        stack_bottom(id) + STACK_SIZE
+    }
 }
 
 // ===========================================================================
@@ -165,6 +204,13 @@ pub enum SpawnError {
 /// once and runs when the scheduler next picks it. Task context only: it
 /// allocates frames and maps pages, which interrupt handlers must not do.
 pub fn spawn(name: &'static str, entry: fn(u64), arg: u64) -> Result<TaskId, SpawnError> {
+    spawn_in(name, entry, arg, 0, NO_CAPS)
+}
+
+/// spawn(), for a task that runs in address space `space` (0 = the
+/// kernel's) with capabilities `caps`. The task takes over the address
+/// space: reap() destroys it when the task is gone. process.rs uses this.
+pub fn spawn_in(name: &'static str, entry: fn(u64), arg: u64, space: u64, caps: Caps) -> Result<TaskId, SpawnError> {
     let id = without_interrupts(|| {
         let t = table();
         let id = (1..MAX_TASKS).find(|&i| t[i].state == State::Free)?;
@@ -219,9 +265,10 @@ pub fn spawn(name: &'static str, entry: fn(u64), arg: u64) -> Result<TaskId, Spa
             rsp: top - 8 * 8,
             entry: Some(entry),
             arg,
-            irq_depth: 0,
-            slices: 0,
             has_stack: true,
+            space,
+            caps,
+            ..EMPTY
         };
     });
     Ok(id)
@@ -256,12 +303,18 @@ extern "C" fn task_entry() -> ! {
 /// stack later. The boot thread (task 0) can exit too: its stack is the
 /// boot stack, which is never freed.
 pub fn exit() -> ! {
+    exit_with(ExitStatus::Code(0))
+}
+
+/// exit(), recording how the task ended for join() to report.
+pub fn exit_with(status: ExitStatus) -> ! {
     unsafe { asm!("cli", options(nomem, nostack)) };
     let me = current_id();
     let t = table();
     t[me].state = State::Finished;
+    t[me].status = status;
     for task in t.iter_mut() {
-        if task.state == State::Joining(me) {
+        if matches!(task.state, State::Joining(id, _) if id == me) {
             task.state = State::Ready;
         }
     }
@@ -270,10 +323,12 @@ pub fn exit() -> ! {
     crate::halt();
 }
 
-/// Free the stacks of finished tasks and return their slots. Task context
-/// only; the idle task calls it whenever it runs. Each task is reaped with
-/// interrupts off (a few microseconds), so nobody ever sees one half freed.
-/// Returns how many it reaped.
+/// Free the stacks (and, for a process, the address space) of finished
+/// tasks and return their slots. Task context only; the idle task calls it
+/// whenever it runs. Each task is reaped with interrupts off (a few
+/// microseconds), so nobody ever sees one half freed. The address space is
+/// never the active one: the finished task isn't running, and its address
+/// space was nobody else's. Returns how many it reaped.
 pub fn reap() -> usize {
     let mut reaped = 0;
     for id in 1..MAX_TASKS {
@@ -282,7 +337,12 @@ pub fn reap() -> usize {
             if id == current_id() || task.state != State::Finished || !task.has_stack {
                 return 0;
             }
-            unsafe { free_stack_pages(id, STACK_PAGES) };
+            unsafe {
+                free_stack_pages(id, STACK_PAGES);
+                if task.space != 0 {
+                    AddressSpace::from_root(task.space).destroy();
+                }
+            }
             table()[id] = EMPTY;
             1
         });
@@ -329,6 +389,13 @@ unsafe fn schedule() {
         // a new or yielding task resumes outside any handler.
         t[cur].irq_depth = crate::idt::irq_depth();
         crate::idt::set_irq_depth(t[next].irq_depth);
+
+        // Its address space, and the stack its ring-3 code lands on.
+        let space = if t[next].space == 0 { crate::paging::kernel_root() } else { t[next].space };
+        if crate::vmm::active_root() != space {
+            crate::vmm::switch_to(space);
+        }
+        crate::gdt::set_kernel_stack(kernel_stack_top(next));
         next
     };
 
@@ -346,7 +413,7 @@ pub fn on_tick() {
     }
     let now = crate::apic::ticks();
     for task in table().iter_mut() {
-        if let State::Sleeping(until) = task.state {
+        if let State::Sleeping(until) | State::Joining(_, until) = task.state {
             if now >= until {
                 task.state = State::Ready;
             }
@@ -372,19 +439,70 @@ pub fn sleep_ticks(ticks: u64) {
     });
 }
 
-/// Block until task `id` has finished; its exit() wakes us. Ids are reused
-/// once a finished task is reaped, so join a task you spawned, soon.
-pub fn join(id: TaskId) {
+/// Block until task `id` has finished (its exit() wakes us) and say how it
+/// ended. None if there is no such task (or it was already reaped). Ids
+/// are reused once a finished task is reaped, so join a task you spawned,
+/// soon: the idle task only reaps while nothing else is ready, and this
+/// task is ready from the moment its target exits.
+pub fn join(id: TaskId) -> Option<ExitStatus> {
+    join_timeout(id, u64::MAX)
+}
+
+/// join(), giving up after `ticks` timer ticks (None if it timed out).
+pub fn join_timeout(id: TaskId, ticks: u64) -> Option<ExitStatus> {
     without_interrupts(|| {
         let cur = current_id();
         if id >= MAX_TASKS || id == cur || cur == idle_id() {
-            return;
+            return None;
         }
-        while !matches!(table()[id].state, State::Finished | State::Free) {
-            table()[cur].state = State::Joining(id);
+        let deadline = crate::apic::ticks().saturating_add(ticks);
+        loop {
+            match table()[id].state {
+                State::Finished => return Some(table()[id].status),
+                State::Free => return None,
+                _ if crate::apic::ticks() >= deadline => return None,
+                _ => {}
+            }
+            table()[cur].state = State::Joining(id, deadline);
             unsafe { schedule() };
         }
-    });
+    })
+}
+
+/// Ask process `id` to stop. It does the next time it would return to ring
+/// 3 (from an interrupt or a system call). Kernel tasks can't be killed:
+/// they might be holding something. Returns false if `id` isn't a live
+/// process.
+pub fn kill(id: TaskId) -> bool {
+    without_interrupts(|| {
+        let task = &mut table()[id % MAX_TASKS];
+        let alive = !matches!(task.state, State::Free | State::Finished | State::Creating);
+        if id < MAX_TASKS && alive && task.space != 0 {
+            task.kill = true;
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// True if the current task has been asked to stop.
+pub fn kill_requested() -> bool {
+    without_interrupts(|| table()[current_id()].kill)
+}
+
+/// The current task's capability in slot `handle`, if it has one.
+pub fn current_cap(handle: u64) -> Cap {
+    without_interrupts(|| {
+        let caps = &table()[current_id()].caps;
+        caps.get(handle as usize).copied().unwrap_or(Cap::None)
+    })
+}
+
+/// The current task's address space root (the kernel's for kernel tasks).
+pub fn current_space() -> u64 {
+    let space = without_interrupts(|| table()[current_id()].space);
+    if space == 0 { crate::paging::kernel_root() } else { space }
 }
 
 // ===========================================================================
@@ -397,6 +515,11 @@ pub fn current() -> TaskId {
 
 pub fn name(id: TaskId) -> &'static str {
     without_interrupts(|| table()[id].name)
+}
+
+/// Times task `id` has been switched in.
+pub fn slices(id: TaskId) -> u64 {
+    without_interrupts(|| table()[id % MAX_TASKS].slices)
 }
 
 /// Times the current task has been switched in.
@@ -590,7 +713,7 @@ fn sleep_task(ticks: u64) {
 
 /// Frames in use by the heap, so a test can tell "stack frames leaked" from
 /// "the heap grew" (it never shrinks).
-fn free_frames_and_heap() -> u64 {
+pub fn free_frames_and_heap() -> u64 {
     pmm::free_frames() + crate::heap::stats().mapped / PAGE_SIZE
 }
 
@@ -758,7 +881,9 @@ pub fn selftest() -> bool {
 /// Demo: a task that recurses until it runs into its guard page.
 pub fn demo_task_stack_overflow() {
     match spawn("overflow-demo", |_| { crate::demo_stack_overflow(0); }, 0) {
-        Ok(id) => join(id),
+        Ok(id) => {
+            join(id);
+        }
         Err(_) => s(b"[demo] could not spawn the overflow task\n"),
     }
 }

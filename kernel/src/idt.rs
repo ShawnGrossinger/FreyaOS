@@ -6,6 +6,9 @@
 //!   - `init()`: points gates 0-31 at the asm stubs in entry.asm, loads IDTR
 //!   - `interrupt_dispatch()`: called by `isr_common` with the saved CPU state
 //!
+//! Exceptions from ring 3 (a user process) end that process, not the
+//! kernel: one report line, then sched::exit_with(Fault(vector)).
+//!
 //! Two more gates carry hardware interrupts from the local APIC: the timer
 //! (apic::TIMER_VECTOR, 0x30) and spurious interrupts (0xFF).
 //!
@@ -253,6 +256,9 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
     // Read CR2 first. It only means something for #PF, and anything later
     // in this function could in principle fault and overwrite it.
     let cr2 = read_cr2();
+    if from_user(frame) {
+        crate::cpu::assert_kernel_mxcsr(b"isr_common");
+    }
 
     match frame.vector {
         // #BP is a trap: RIP already points past the int3, so returning
@@ -271,6 +277,9 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
             IRQ_DEPTH.fetch_add(1, Ordering::Relaxed);
             crate::apic::on_timer();
             IRQ_DEPTH.fetch_sub(1, Ordering::Relaxed);
+            if from_user(frame) {
+                crate::process::on_return_to_user(); // a killed process stops here
+            }
         }
         v if v == crate::apic::SPURIOUS_VECTOR as u64 => {
             IRQ_DEPTH.fetch_add(1, Ordering::Relaxed);
@@ -278,14 +287,27 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
             IRQ_DEPTH.fetch_sub(1, Ordering::Relaxed);
         }
 
-        // Everything else is fatal for now. Returning from a fault would
-        // re-execute the faulting instruction forever.
+        // A CPU exception in ring 3 is the process's problem, not the
+        // kernel's: report it and end that process. Its kernel stack (where
+        // this frame is) is freed when it is reaped.
+        _ if from_user(frame) => {
+            report_user_fault(frame, cr2);
+            crate::sched::exit_with(crate::sched::ExitStatus::Fault(frame.vector as u8));
+        }
+
+        // Anything else is a kernel bug, and fatal. Returning from a fault
+        // would re-execute the faulting instruction forever.
         _ => {
             report_serial(frame, cr2);
             report_vga(frame, cr2);
             crate::halt();
         }
     }
+}
+
+/// The interrupted code was running in ring 3.
+fn from_user(frame: &InterruptFrame) -> bool {
+    frame.cs & 3 == 3
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +411,9 @@ fn report_serial(f: &InterruptFrame, cr2: u64) {
             s(b")\n");
         }
     }
+    if f.vector == 14 && !from_user(f) && crate::vmm::is_user_range(cr2, 1) {
+        s(b"  diagnosis: the kernel touched user memory directly (SMAP blocks data, SMEP code)\n");
+    }
     if crate::sched::is_enabled() {
         let id = crate::sched::current();
         s(b"  running task: ");
@@ -438,6 +463,33 @@ fn report_serial(f: &InterruptFrame, cr2: u64) {
     s(b"\n[EXCEPTION] halted\n");
 }
 
+/// One line for a process killed by an exception. No register dump: the
+/// kernel is fine, and the process's registers are its own business.
+fn report_user_fault(f: &InterruptFrame, cr2: u64) {
+    let id = crate::sched::current();
+    s(b"[user] task ");
+    dec(id as u64);
+    s(b" '");
+    s(crate::sched::name(id).as_bytes());
+    s(b"' killed by vector ");
+    dec(f.vector);
+    s(b" ");
+    s(exception_name(f.vector));
+    s(b" at rip=");
+    hex(f.rip);
+    if f.vector == 14 {
+        s(b" cr2=");
+        hex(cr2);
+        s(b" (");
+        decode_page_fault(f.error_code);
+        s(b")");
+    } else if matches!(f.vector, 10..=13) && f.error_code != 0 {
+        s(b": ");
+        decode_selector_error(f.error_code);
+    }
+    s(b"\n");
+}
+
 /// #PF error code: bit0 P, bit1 W/R, bit2 U/S, bit3 RSVD, bit4 I/D.
 fn decode_page_fault(err: u64) {
     if err & (1 << 3) != 0 {
@@ -467,7 +519,7 @@ fn decode_selector_error(err: u64) {
     if err & (1 << 1) != 0 {
         s(b"IDT vector ");
         dec(index);
-        s(b" (gate not present or invalid)");
+        s(b" (no usable gate, or one the interrupted code's ring may not use)");
     } else {
         s(if err & (1 << 2) != 0 { b"LDT selector " } else { b"GDT selector " });
         hex(index << 3);
@@ -494,6 +546,8 @@ fn report_vga(f: &InterruptFrame, cr2: u64) {
     let task_overflow = if matches!(f.vector, 8 | 14) { crate::sched::stack_guard_owner(cr2) } else { None };
     if matches!(f.vector, 8 | 14) && crate::paging::is_stack_guard(cr2) {
         line.str(b"KERNEL STACK OVERFLOW  CR2=").hex(cr2);
+    } else if f.vector == 14 && crate::vmm::is_user_range(cr2, 1) {
+        line.str(b"KERNEL TOUCHED USER MEMORY  CR2=").hex(cr2);
     } else if let Some(id) = task_overflow {
         line.str(b"TASK STACK OVERFLOW  task ").dec(id as u64).str(b"  CR2=").hex(cr2);
     } else if f.vector == 14 {

@@ -1,0 +1,207 @@
+//! syscall.rs — how ring 3 asks the kernel for something.
+//!
+//! A process executes `syscall` with a number in RAX and arguments in RDI,
+//! RSI, RDX (then R10, R8, R9). The CPU jumps to syscall_entry (entry.asm),
+//! which switches to the task's kernel stack, saves every register and the
+//! SSE state, and calls syscall_dispatch below. The result comes back in
+//! RAX; RCX and R11 are destroyed (SYSCALL uses them); nothing else changes.
+//!
+//! Zero Ambient Authority: a process can do nothing by default. Each system
+//! call that acts on the world names a capability (a slot in the process's
+//! capability table, see process.rs), and the kernel refuses if that slot
+//! doesn't hold the right one. Today there is one such call, write, and one
+//! kind of capability, the console. exit and yield act only on the caller.
+//!
+//! The kernel never trusts a pointer from a process. A buffer must lie in
+//! user space, and every page of it must be mapped for ring 3 in the
+//! caller's address space; the kernel then copies it through the physical
+//! map, never through the user address itself.
+
+use crate::process::Cap;
+use crate::sched::{self, ExitStatus};
+use crate::vmm::{self, AddressSpace};
+use core::sync::atomic::{AtomicU64, Ordering};
+
+pub const SYS_EXIT: u64 = 0; // exit(code) -> never returns
+pub const SYS_YIELD: u64 = 1; // yield() -> 0
+pub const SYS_WRITE: u64 = 2; // write(console cap, ptr, len) -> bytes written
+
+pub const ERR_BAD_SYSCALL: i64 = -1;
+pub const ERR_NO_CAPABILITY: i64 = -2;
+pub const ERR_BAD_ADDRESS: i64 = -3;
+
+/// Longest write in one call; longer ones are cut (the return value says
+/// how much was written).
+const MAX_WRITE: u64 = 256;
+
+const IA32_EFER: u32 = 0xC000_0080;
+const IA32_STAR: u32 = 0xC000_0081;
+const IA32_LSTAR: u32 = 0xC000_0082;
+const IA32_FMASK: u32 = 0xC000_0084;
+const EFER_SCE: u64 = 1 << 0;
+
+/// RFLAGS bits cleared on entry: IF (no interrupts until the stack is
+/// switched), TF (no single-stepping into the kernel), DF (the ABI wants it
+/// clear), AC, NT.
+const FMASK: u64 = (1 << 9) | (1 << 8) | (1 << 10) | (1 << 18) | (1 << 14);
+
+static CALLS: AtomicU64 = AtomicU64::new(0);
+static BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+extern "C" {
+    fn syscall_entry();
+}
+
+/// What syscall_entry saved, lowest address first (mirror of its pushes).
+#[repr(C)]
+pub struct SyscallFrame {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub rip: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<SyscallFrame>() == 18 * 8);
+
+// 64-bit SYSRET loads SS = STAR[63:48] + 8 and CS = STAR[63:48] + 16 (both
+// RPL 3), and init() sets STAR[63:48] = user data - 8. That only lands on
+// the right descriptors if user code sits right after user data.
+const _: () = assert!(
+    crate::gdt::USER_CODE_SEL == crate::gdt::USER_DATA_SEL + 8,
+    "SYSRET needs user code = user data + 8 in the GDT"
+);
+
+/// Turn SYSCALL on and point it at syscall_entry. Returns the entry address.
+pub fn init() -> Result<u64, &'static [u8]> {
+    // CPUID 0x8000_0001 EDX bit 11: SYSCALL/SYSRET in 64-bit mode.
+    if crate::cpu::cpuid(0x8000_0001).3 & (1 << 11) == 0 {
+        return Err(b"SYSCALL not supported by this CPU");
+    }
+    // STAR: bits 47:32 = kernel CS (SYSCALL loads CS from it and SS from it
+    // + 8); bits 63:48 = the base SYSRET adds to: SS = base + 8, CS = base
+    // + 16, both with RPL 3. gdt.rs orders its entries for exactly this.
+    let kernel = crate::gdt::KERNEL_CODE_SEL as u64;
+    let user_base = (crate::gdt::USER_DATA_SEL as u64 & !3) - 8;
+    let entry = syscall_entry as *const () as u64;
+    unsafe {
+        crate::cpu::wrmsr(IA32_STAR, user_base << 48 | kernel << 32);
+        crate::cpu::wrmsr(IA32_LSTAR, entry);
+        crate::cpu::wrmsr(IA32_FMASK, FMASK);
+        crate::cpu::wrmsr(IA32_EFER, crate::cpu::rdmsr(IA32_EFER) | EFER_SCE);
+    }
+    Ok(entry)
+}
+
+/// System calls made so far, and bytes processes have written.
+pub fn counts() -> (u64, u64) {
+    (CALLS.load(Ordering::Relaxed), BYTES_WRITTEN.load(Ordering::Relaxed))
+}
+
+/// Called by syscall_entry with interrupts on, on the task's kernel stack.
+#[no_mangle]
+extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
+    crate::cpu::assert_kernel_mxcsr(b"syscall_entry");
+    CALLS.fetch_add(1, Ordering::Relaxed);
+    let result = match f.rax {
+        SYS_EXIT => sched::exit_with(ExitStatus::Code(f.rdi)),
+        SYS_YIELD => {
+            sched::yield_now();
+            0
+        }
+        SYS_WRITE => sys_write(f.rdi, f.rsi, f.rdx),
+        _ => ERR_BAD_SYSCALL,
+    };
+    f.rax = result as u64;
+    // A kill takes effect on the way back to ring 3.
+    if sched::kill_requested() {
+        sched::exit_with(ExitStatus::Killed);
+    }
+}
+
+/// write(handle, ptr, len): print `len` bytes at `ptr` on the console, if
+/// capability slot `handle` holds the console capability.
+fn sys_write(handle: u64, ptr: u64, len: u64) -> i64 {
+    if sched::current_cap(handle) != Cap::Console {
+        return ERR_NO_CAPABILITY;
+    }
+    let len = len.min(MAX_WRITE);
+    if len == 0 {
+        return 0;
+    }
+    if !vmm::is_user_range(ptr, len) {
+        return ERR_BAD_ADDRESS;
+    }
+
+    // Copy it out page by page, checking each page is the caller's to read.
+    let space = unsafe { AddressSpace::from_root(sched::current_space()) };
+    let mut buf = [0u8; MAX_WRITE as usize];
+    let mut done = 0;
+    while done < len {
+        let va = ptr + done;
+        let Some(frame) = space.user_page(va & !0xFFF, false) else {
+            return ERR_BAD_ADDRESS;
+        };
+        let offset = va & 0xFFF;
+        let n = (0x1000 - offset).min(len - done);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                crate::paging::phys_to_virt(frame + offset),
+                buf.as_mut_ptr().add(done as usize),
+                n as usize,
+            );
+        }
+        done += n;
+    }
+
+    print_from_process(&buf, len as usize);
+    BYTES_WRITTEN.fetch_add(len, Ordering::Relaxed);
+    len as i64
+}
+
+/// Print a process's text, every line prefixed with who wrote it, so a
+/// process can't pass its output off as the kernel's (a test harness reads
+/// this log). Unprintable bytes become '.'. Interrupts are off so the text
+/// isn't interleaved with other output (fine at QEMU speeds and 256 bytes;
+/// see the journal's open items for a real UART).
+fn print_from_process(buf: &[u8], len: usize) {
+    use crate::{serial_write_byte as byte, serial_write_str as s, serial_write_u64 as dec};
+    crate::cpu::without_interrupts(|| {
+        let id = sched::current();
+        let mut line_start = true;
+        for &b in buf.iter().take(len) {
+            if line_start {
+                s(b"[user ");
+                dec(id as u64);
+                s(b" '");
+                s(sched::name(id).as_bytes());
+                s(b"'] ");
+                line_start = false;
+            }
+            match b {
+                b'\n' => {
+                    s(b"\n");
+                    line_start = true;
+                }
+                0x20..=0x7E => byte(b),
+                _ => byte(b'.'),
+            }
+        }
+        if !line_start {
+            s(b"\n");
+        }
+    });
+}
