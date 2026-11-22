@@ -1,0 +1,27 @@
+[package]
+name = "freya-kernel"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+# no deps
+
+[[bin]]
+name = "freya-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+lto = false          # LTO must be off — it can eliminate no_mangle symbols called from asm
+codegen-units = 1
+panic = "abort"
+strip = false        # keep symbols for debugging; re-enable when kernel is stable
+
+[build-dependencies]
+
+[package.metadata]
+# nothing
+
+[workspace]

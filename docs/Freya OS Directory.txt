@@ -1,0 +1,30 @@
+FreyaOS/
+├── bootloader/
+│   ├── BIOS/
+│   │   ├── stage1.asm          -- Stage 1 bootloader (MBR, 16-bit real mode)
+│   │   └── stage2.asm          -- Stage 2 bootloader (loads kernel + enters long mode)
+│   ├── UEFI/
+│   │   └── UEFILoader.rs       -- (WIP) UEFI loader
+│   ├── boot.rs                 -- (WIP) Rust boot support / shared boot logic
+│   └── diskIO.rs               -- (WIP) Disk I/O helpers
+├── kernel/
+│   ├── src/
+│   │   └── main.rs             -- Rust kernel entry point (_start)
+│   ├── Cargo.toml              -- Cargo configuration for the kernel
+│   ├── Cargo.lock              -- Cargo lockfile
+│   ├── x86_64-freya.json       -- Custom target specification for the kernel
+│   └── kernel.ld               -- Linker script for the kernel (memory layout)
+├── build/
+│   ├── Makefile                -- Build script to assemble bootloaders and build the kernel
+│   └── out/                    -- Build artifacts (created by Makefile)
+│       ├── stage1.bin
+│       ├── stage2.pre.bin
+│       ├── stage2.bin
+│       ├── kernel.elf
+│       ├── kernel.bin
+│       └── freya-os.img
+└── docs/
+    ├── Phase 1 Freya.docx
+    ├── Sprint 1.docx
+    ├── Freya Bootloader Implementation.docx
+    └── Freya OS-AI Development Roadmap.docx

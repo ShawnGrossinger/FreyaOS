@@ -1,0 +1,25 @@
+FreyaOS/
+├── bootloader/
+│   ├── BIOS/
+│   │   ├── stage1.asm      -- Stage 1 bootloader (MBR, 16-bit real mode)
+│   │   └── stage2.asm      -- Stage 2 bootloader (transitions to 32-bit and 64-bit)
+│   ├── UEFI/
+│   │   └── UEFILoader.rs   -- bootloader for UEFI loading (still in works)
+│   ├── boot.rs
+│   └── diskIO.rs
+├── kernel/
+│   ├── src/
+│   │   └── main.rs         -- Rust kernel entry point (_start)
+│   ├── Cargo.toml          -- Cargo configuration for the kernel
+│   ├── x86_64-freya.json   -- Custom target specification for the kernel
+│   └── kernel.ld           -- Linker script for the kernel (memory layout)
+├── build/
+│   ├── Makefile            -- Build script to assemble bootloaders and build the kernel
+│   └── out/                -- Output directly for build artifacts (created by Makefile)
+│       ├── stage1.bin      -- .bin of stage1.asm
+│       └── stage2.bin      -- .bin of stage2.asm
+├── images/
+│   └──  ...
+├── src/                    -- (Future) Source code for kernel / stage 2 (likely in Rust)
+│   └── ... 
+└── docs/                   -- Documentation, roadmap, etc.
