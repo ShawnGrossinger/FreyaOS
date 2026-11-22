@@ -20,7 +20,8 @@ QEMU=${QEMU:-qemu-system-x86_64}
 TIMEOUT=${TIMEOUT:-60}
 ROOT=out/test
 
-# name | FREYA_DEMO | RAM | patterns that must all appear, separated by ;;
+# name | FREYA_DEMO (or bios-if-on: see below) | RAM | patterns that must
+#        all appear, separated by ;;
 #      | optional extra QEMU arguments
 #      | optional keys to press once the keyboard driver is ready (QEMU
 #        sendkey names, space-separated). Afterwards "QEMU exited by
@@ -28,6 +29,7 @@ ROOT=out/test
 CASES=(
   "image||||"   # not booted: checks the disk image's layout (see check_image)
   "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!;;'probe' killed by vector 14 #PF;;\\[user [0-9]+ 'ipc'\\] printed for me by the log server;;driver handled 10"
+  "bios-if-on|bios-if-on|128M|BIOS had left them ON after its last call; stage 2 turned them off\\): PASS;;self-tests: [0-9]+ passed, 0 failed"
   "dirty-ram||128M-dirty|self-tests: [0-9]+ passed, 0 failed;;init complete"
   "boot-4G||4G|physical map at 0xffff800000000000: 4096 MiB;;init complete - boot thread done; scheduler and timer running"
   "ud2|ud2|128M|vector 6 #UD Invalid Opcode"
@@ -149,7 +151,11 @@ for entry in "${CASES[@]}"; do
   dir="$ROOT/$name"; mkdir -p "$dir"
   printf '  %-19s building...' "$name"
 
-  if ! make -s OUTDIR="$dir" FREYA_DEMO="$demo" all > "$dir/build.log" 2>&1; then
+  # "bios-if-on" isn't a kernel demo: it builds stage2 to leave interrupts
+  # on after its BIOS calls, as the T430's BIOS does (Entry 16).
+  build=(FREYA_DEMO="$demo")
+  [ "$demo" = bios-if-on ] && build=(FREYA_DEMO= BIOS_LEAVES_IF_ON=1)
+  if ! make -s OUTDIR="$dir" "${build[@]}" all > "$dir/build.log" 2>&1; then
     printf '\r  FAIL  %-19s build failed (see %s)\n' "$name" "$dir/build.log"
     tail -5 "$dir/build.log" | sed 's/^/          /'
     fail=$((fail + 1)); continue

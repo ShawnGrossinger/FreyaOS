@@ -60,6 +60,26 @@ impl E820Entry {
     }
 }
 
+/// Where stage2 records FLAGS as its last BIOS call left them (Entry 16).
+pub const BIOS_FLAGS_ADDR: usize = 0x04F0;
+
+extern "C" {
+    /// RFLAGS when the kernel's _start was entered (entry.asm).
+    static entry_rflags: u64;
+}
+
+const IF: u64 = 1 << 9;
+
+/// The BIOS returned from stage2's last call with interrupts enabled.
+pub fn bios_left_interrupts_on() -> bool {
+    unsafe { (BIOS_FLAGS_ADDR as *const u16).read_volatile() as u64 & IF != 0 }
+}
+
+/// Interrupts were enabled when the kernel was entered.
+pub fn entered_with_interrupts_on() -> bool {
+    unsafe { core::ptr::read_volatile(&raw const entry_rflags) & IF != 0 }
+}
+
 /// Read the E820 map left by stage2
 /// 
 /// # Safety

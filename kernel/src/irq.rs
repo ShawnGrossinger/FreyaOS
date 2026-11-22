@@ -415,34 +415,38 @@ pub fn selftest() -> bool {
     ok
 }
 
-/// After init_ioapic: the hardware says what we told it.
+/// After init_ioapic: the hardware says what we told it. The facts a
+/// failure turns on come first: on a machine without a serial port only
+/// the first 160 characters of a failed line stay on screen (Entry 16).
 pub fn selftest_ioapic(setup: &IoApicSetup) -> bool {
-    use crate::{serial_write_hex as hex, serial_write_str as s, serial_write_u64 as dec};
-    s(b"[ioapic] self-test I/O APIC version ");
-    hex(setup.version as u64);
-    s(b", ");
+    use crate::{serial_write_str as s, serial_write_u64 as dec};
+    s(b"[ioapic] self-test set up with interrupts ");
+    s(if setup.before_interrupts { b"off" } else { b"ON" });
+    s(b"; ");
     dec(setup.inputs as u64);
-    s(b" inputs, all masked, ");
+    s(b" inputs masked (");
+    dec(setup.firmware_live as u64);
+    s(b" left live by the firmware), ");
     dec(setup.routed as u64);
-    s(b" ISA lines wired; keyboard (line 1) on input ");
+    s(b" ISA lines wired; keyboard ");
     let expected = VECTOR_BASE as u32 + 1;
     let keyboard_ok = match entry_of(1) {
         Some((input, low)) => {
+            s(b"on input ");
             dec(input as u64);
-            s(b" as vector ");
-            hex((low & 0xFF) as u64);
+            s(b", vector ");
+            dec((low & 0xFF) as u64);
+            s(if low & IOAPIC_MASKED != 0 { b" masked" } else { b" UNMASKED" });
             s(if low & IOAPIC_LEVEL != 0 { b", level" } else { b", edge" });
             s(if low & IOAPIC_ACTIVE_LOW != 0 { b", active low" } else { b", active high" });
             low & 0xFF == expected && low & IOAPIC_MASKED != 0
         }
         None => {
-            s(b"(not wired)");
+            s(b"not wired");
             false
         }
     };
-    s(if setup.before_interrupts { b"; set up before interrupts were enabled" } else { b"; set up AFTER interrupts were enabled" });
-    s(b"; ");
-    dec(setup.firmware_live as u64);
-    s(b" inputs left live by the firmware");
-    verdict(setup.version >= 0x11 && setup.inputs >= 16 && setup.routed >= 15 && keyboard_ok && setup.before_interrupts)
+    s(b"; version ");
+    dec(setup.version as u64);
+    verdict(setup.before_interrupts && setup.version >= 0x11 && setup.inputs >= 16 && setup.routed >= 15 && keyboard_ok)
 }

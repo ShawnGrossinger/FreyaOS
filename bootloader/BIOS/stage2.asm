@@ -56,6 +56,11 @@ KERNEL_STACK_TOP equ 0x00080000
 
 COM1_BASE         equ 0x03F8
 
+; FLAGS as the last BIOS call left them, for the kernel's log (0x4F0-0x4FF
+; is the BIOS data area's "inter-application communication area", kept
+; free for programs like this one).
+BIOS_FLAGS        equ 0x04F0
+
 ; --- Stage 2 entry ---
 start:
 
@@ -202,6 +207,23 @@ start:
     ; Entries stared at physical 0x504 (24 bytes each, max 32).
     ; Entry count stored at 0x0500 as a 16-bit word.
     call get_e820_map
+
+    ; --- Interrupts off, for good ---
+    ; INT 13h and INT 15h return with RETF 2 (to keep their carry flag),
+    ; which also keeps whatever IF the BIOS handler left: the CLI at the top
+    ; of stage 2 doesn't survive them. SeaBIOS (QEMU) returns with IF clear;
+    ; the T430's BIOS returns with it set, so the kernel used to start with
+    ; interrupts on and the PIC still putting the timer on vector 8, one of
+    ; the CPU's exception vectors (Entry 16). Record what the BIOS left, for
+    ; the kernel's log, then CLI: from here until the kernel loads its own
+    ; IDT there is nothing that could take an interrupt.
+%ifdef __BIOS_LEAVES_IF_ON
+    sti                           ; test build: behave like the T430's BIOS
+%endif
+    pushf
+    pop ax
+    mov [BIOS_FLAGS], ax
+    cli
 
     ; --- Set up GDT and enter protected mode ---
     lgdt [gdt_descriptor]

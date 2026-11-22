@@ -77,8 +77,12 @@ $(KERNELBIN): $(KERNELELF)
 # -------------------------
 
 # Stage2 preliminary build (with placeholder kernel constants) so we can compute its size.
+# BIOS_LEAVES_IF_ON=1 (test.sh's bios-if-on case): stage2 turns interrupts
+# on after its last BIOS call, as the T430's BIOS leaves them (Entry 16).
+STAGE2_DEFS := $(if $(BIOS_LEAVES_IF_ON),-D__BIOS_LEAVES_IF_ON,)
+
 $(STAGE2PRE): $(BOOTDIR)/stage2.asm | $(OUTDIR)
-	$(NASM) -f bin $(BOOTDIR)/stage2.asm -o $(STAGE2PRE)
+	$(NASM) -f bin $(STAGE2_DEFS) $(BOOTDIR)/stage2.asm -o $(STAGE2PRE)
 
 # Stage2 final build: compute Stage2 sectors, then compute kernel LBA/sectors, then assemble.
 $(STAGE2): $(BOOTDIR)/stage2.asm $(STAGE2PRE) $(KERNELBIN) | $(OUTDIR)
@@ -92,7 +96,7 @@ $(STAGE2): $(BOOTDIR)/stage2.asm $(STAGE2PRE) $(KERNELBIN) | $(OUTDIR)
 	  echo "ERROR: kernel is $$KERNEL_SECTORS sectors; stage2 loads at most $(KERNEL_MAX_SECTORS) (1 MiB, below its page tables at 0x200000)."; \
 	  exit 1; \
 	fi; \
-	$(NASM) -f bin \
+	$(NASM) -f bin $(STAGE2_DEFS) \
 	  -D__KERNEL_LBA=$$KERNEL_LBA \
 	  -D__KERNEL_SECTORS=$$KERNEL_SECTORS \
 	  $(BOOTDIR)/stage2.asm -o $(STAGE2); \

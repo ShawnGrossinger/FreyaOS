@@ -26,6 +26,14 @@ extern __bss_start
 extern __bss_end
 
 _start:
+    ; Interrupts off before anything else, whatever the loader left: until
+    ; the PICs are remapped they put the timer on vector 8, a CPU exception
+    ; vector (Entry 16). RFLAGS as found is kept in r15, which the .bss
+    ; clearing below doesn't touch, and saved for the self-test after it.
+    pushfq
+    cli
+    pop r15
+
     ; Zero .bss. Stage2 only copies the bytes in kernel.bin, and .bss is
     ; not in kernel.bin, so without this every zero-initialised static
     ; (including the IDT) starts as whatever was left in RAM. QEMU's RAM
@@ -37,6 +45,7 @@ _start:
     sub rcx, rdi                ; byte count
     xor eax, eax
     rep stosb
+    mov [rel entry_rflags], r15
 
     ; Align stack to 16 bytes for the SysV ABI.
     and rsp, -16
@@ -385,6 +394,8 @@ section .bss
 align 8
 global syscall_kernel_rsp
 syscall_kernel_rsp: resq 1      ; = TSS.RSP0, set by gdt::set_kernel_stack
+global entry_rflags
+entry_rflags:       resq 1      ; RFLAGS when _start was entered
 syscall_user_rsp:   resq 1      ; scratch while switching stacks
 
 ; ---------------------------------------------------------------------------

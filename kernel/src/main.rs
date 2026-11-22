@@ -214,6 +214,13 @@ fn current_line(out: &mut [u8; LINE_MAX]) -> usize {
     })
 }
 
+/// Text at a column, leaving the rest of the row as it is.
+fn vga_text(row: usize, col: usize, text: &[u8], attr: u8) {
+    for (i, &ch) in text.iter().enumerate() {
+        vga_cell(row, col + i, ch, attr);
+    }
+}
+
 fn vga_cell(row: usize, col: usize, ch: u8, attr: u8) {
     if row < 25 && col < 80 {
         let cell = (0xB8000 + (row * 80 + col) * 2) as *mut u16;
@@ -329,7 +336,8 @@ fn vga_print(row: usize, msg: &[u8], attr: u8) {
 ///   - Paging on; first 2 MiB identity-mapped (2MiB huge page)
 ///   - Kernel loaded at physical 0x0010_0000
 ///   - E820 map at 0x0500 (count u16) / 0x0504 (entries, 24 B each)
-///   - Interrupts disabled
+///   - FLAGS after the last BIOS call at 0x04F0 (u16)
+///   - Interrupts disabled (and _start disables them anyway: Entry 16)
 #[no_mangle]
 pub extern "C" fn rust_start() -> ! {
 
@@ -353,6 +361,12 @@ pub extern "C" fn rust_start() -> ! {
     serial_write_str(b"[idt] loaded: a gate for every vector (0-255), code selector ");
     serial_write_hex(cs as u64);
     serial_write_str(b", #DF on IST1\n");
+
+    // --- Interrupts were off from the bootloader on (Entry 16) ---
+    let bios_left_if = boot::bios_left_interrupts_on();
+    serial_write_str(b"[boot] self-test interrupts were off when the kernel started (the BIOS had left them ");
+    serial_write_str(if bios_left_if { b"ON after its last call; stage 2 turned them off)" } else { b"off)" });
+    let entry_ok = selftest::verdict(!boot::entered_with_interrupts_on());
 
     // --- Paging: kernel-owned tables, guard page under the stack ---
     // After the IDT, so a mistake here is reported rather than silent.
@@ -567,7 +581,7 @@ pub extern "C" fn rust_start() -> ! {
     // report, so reaching this point means they passed.
     vga_status(0, b"FreyaOS kernel:  ", true);
     vga_status(1, b"Segments + TSS:  ", true);
-    vga_status(2, b"Exception table: ", int3_ok);
+    vga_status(2, b"Exception table: ", int3_ok && entry_ok);
     vga_status(3, b"Page tables:     ", true);
     vga_status(4, b"Memory map:      ", true);
     vga_status(5, b"Frame allocator: ", pmm_ok);
@@ -583,6 +597,10 @@ pub extern "C" fn rust_start() -> ! {
     vga_status(12, b"Scheduler:       ", sched_ok);
     vga_status(13, b"User mode:       ", user_ok);
     vga_status(14, b"IPC + drivers:   ", ipc_ok);
+    if bios_left_if {
+        // Worth seeing on a real machine: this is what Entry 16 was about.
+        vga_text(0, 26, b"(the BIOS left interrupts on; stage 2 turns them off)", 0x08);
+    }
 
     // --- One line that says whether everything is up ---
     let all_ok = selftest::summary();

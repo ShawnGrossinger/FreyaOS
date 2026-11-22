@@ -153,11 +153,16 @@ pub const NOT_AN_EXCEPTION: u64 = u64::MAX;
 static BREAKPOINT_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Interrupts nobody set up: on a vector with no handler, or an interrupt
-/// on a CPU exception's vector. Counted and acknowledged, not fatal.
-static UNEXPECTED: AtomicU64 = AtomicU64::new(0);
-static LAST_UNEXPECTED: AtomicU64 = AtomicU64::new(0);
-/// How many of those the self-test raised on purpose.
-static RAISED_BY_TEST: AtomicU64 = AtomicU64::new(0);
+/// on a CPU exception's vector. Counted and acknowledged, not fatal. The
+/// ones the self-test raises on purpose are counted apart, so that "last
+/// vector" names a real one (Entry 15's version let the test's 0x90
+/// overwrite the T430's: Entry 16).
+static FROM_HARDWARE: AtomicU64 = AtomicU64::new(0);
+static LAST_FROM_HARDWARE: AtomicU64 = AtomicU64::new(0);
+static FROM_TEST: AtomicU64 = AtomicU64::new(0);
+/// The vector the self-test is about to raise, or NO_TEST.
+static TEST_VECTOR: AtomicU64 = AtomicU64::new(NO_TEST);
+const NO_TEST: u64 = u64::MAX;
 
 /// How many hardware interrupt handlers are active on this task's stack.
 /// Nonzero means "inside an interrupt handler", where allocating is
@@ -348,11 +353,17 @@ fn arrived_as_interrupt(frame: &InterruptFrame) -> bool {
 /// priority. Then carry on: an interrupt nobody asked for is a setup
 /// problem to report, not a reason to stop the machine.
 fn unexpected_interrupt(frame: &InterruptFrame) {
-    let n = UNEXPECTED.fetch_add(1, Ordering::Relaxed) + 1;
-    LAST_UNEXPECTED.store(frame.vector, Ordering::Relaxed);
+    let by_test = TEST_VECTOR.compare_exchange(frame.vector, NO_TEST, Ordering::Relaxed, Ordering::Relaxed).is_ok();
+    let n = if by_test {
+        FROM_TEST.fetch_add(1, Ordering::Relaxed);
+        1
+    } else {
+        LAST_FROM_HARDWARE.store(frame.vector, Ordering::Relaxed);
+        FROM_HARDWARE.fetch_add(1, Ordering::Relaxed) + 1
+    };
     let through_apic = frame.vector >= 16 && crate::apic::in_service(frame.vector as u8);
     if n <= 4 {
-        s(b"[idt] unexpected interrupt on vector ");
+        s(if by_test { b"[idt] test interrupt on vector " } else { b"[idt] unexpected interrupt on vector " });
         dec(frame.vector);
         if frame.vector < EXCEPTION_VECTORS as u64 {
             s(b" (");
@@ -366,9 +377,10 @@ fn unexpected_interrupt(frame: &InterruptFrame) {
     }
 }
 
-/// Unexpected interrupts so far, and the vector of the last one.
+/// Unexpected interrupts from the hardware so far, and the vector of the
+/// last one.
 pub fn unexpected() -> (u64, u64) {
-    (UNEXPECTED.load(Ordering::Relaxed), LAST_UNEXPECTED.load(Ordering::Relaxed))
+    (FROM_HARDWARE.load(Ordering::Relaxed), LAST_FROM_HARDWARE.load(Ordering::Relaxed))
 }
 
 /// With interrupts on. Raises, from the local APIC, what the T430 met by
@@ -382,31 +394,30 @@ pub fn selftest_unexpected() -> bool {
     for (vector, what) in [(17u8, &b"on #AC's vector (17), which carries an error code as an exception"[..]),
                            (19, &b"on #XM's vector (19), which carries none: told apart by the APIC's in-service bit"[..]),
                            (0x90, &b"on a vector nothing uses (0x90)"[..])] {
-        let (before, _) = unexpected();
-        RAISED_BY_TEST.fetch_add(1, Ordering::Relaxed);
+        let before = FROM_TEST.load(Ordering::Relaxed);
+        TEST_VECTOR.store(vector as u64, Ordering::Relaxed);
         let sent = crate::apic::send_self_ipi(vector);
         let mut seen = false;
         for _ in 0..10_000_000 {
-            if unexpected().0 != before {
+            if FROM_TEST.load(Ordering::Relaxed) != before {
                 seen = true;
                 break;
             }
             core::hint::spin_loop();
         }
-        let (_, last) = unexpected();
+        TEST_VECTOR.store(NO_TEST, Ordering::Relaxed);
         s(b"[idt] self-test an interrupt ");
         s(what);
         s(b": ");
-        s(if seen { b"counted as unexpected, kernel carried on" } else { b"never seen" });
-        ok &= verdict(sent && seen && last == vector as u64);
+        s(if seen { b"handled as unexpected, kernel carried on" } else { b"never seen" });
+        ok &= verdict(sent && seen);
     }
     ok
 }
 
 /// End of boot: interrupts from the hardware that nothing asked for.
 pub fn selftest_none_unexpected() -> bool {
-    let (total, last) = unexpected();
-    let from_hardware = total - RAISED_BY_TEST.load(Ordering::Relaxed).min(total);
+    let (from_hardware, last) = unexpected();
     s(b"[idt] self-test unexpected interrupts from the hardware during boot: ");
     dec(from_hardware);
     if from_hardware > 0 {
