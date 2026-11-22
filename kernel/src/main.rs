@@ -5,7 +5,9 @@ use core::panic::PanicInfo;
 
 mod boot;
 mod disk_io;
+mod gdt;
 mod idt;
+mod paging;
 
 use boot::{read_e820_map, E820Entry};
 
@@ -267,6 +269,23 @@ unsafe fn protect_range(start: usize, end: usize) {
     }
 }
 
+/// Blank the 80x25 text screen and hide the BIOS's blinking cursor, so the
+/// kernel's status lines aren't interleaved with leftover BIOS output.
+fn vga_clear() {
+    for cell in 0..80 * 25usize {
+        unsafe {
+            *((0xb8000 + cell * 2) as *mut u8) = b' ';
+            *((0xb8000 + cell * 2 + 1) as *mut u8) = 0x07; // grey on black
+        }
+    }
+
+    // CRTC register 0x0A (cursor start): bit 5 set = cursor off.
+    unsafe {
+        outb(0x3D4, 0x0A);
+        outb(0x3D5, 0x20);
+    }
+}
+
 /// -----------------------------------------------------------------
 /// Kernel entry point
 /// -----------------------------------------------------------------
@@ -308,13 +327,34 @@ fn vga_print(row: usize, msg: &[u8], attr: u8) {
 #[no_mangle]
 pub extern "C" fn rust_start() -> ! {
 
+    vga_clear();
     serial_init();
     serial_write_str(b"[kernel] FreyaOS kernel starting\n");
+
+    // --- Segments: the kernel's own GDT + TSS (IST1 = double fault stack) ---
+    // Must come before the IDT: the IDT copies CS into its gates, and the
+    // #DF gate's IST index needs TR loaded.
+    gdt::init();
+    let (cs, tr) = gdt::current_selectors();
+    serial_write_str(b"[gdt] loaded: cs=");
+    serial_write_hex(cs as u64);
+    serial_write_str(b" tr=");
+    serial_write_hex(tr as u64);
+    serial_write_str(b"\n");
 
     // --- Exceptions: install the IDT before anything else can fault ---
     let cs = idt::init();
     serial_write_str(b"[idt] loaded: 32 exception gates, code selector ");
     serial_write_hex(cs as u64);
+    serial_write_str(b", #DF on IST1\n");
+
+    // --- Paging: kernel-owned tables, guard page under the stack ---
+    // After the IDT, so a mistake here is reported rather than silent.
+    let cr3 = paging::init();
+    serial_write_str(b"[paging] cr3=");
+    serial_write_hex(cr3);
+    serial_write_str(b" stack guard page at ");
+    serial_write_hex(paging::STACK_GUARD_PAGE);
     serial_write_str(b"\n");
 
     if idt::selftest_breakpoint() {
@@ -327,6 +367,7 @@ pub extern "C" fn rust_start() -> ! {
     // kernel with a full report on serial and a summary on screen.
     // unsafe { core::arch::asm!("ud2"); }                             // #UD, vector 6
     // unsafe { core::ptr::read_volatile(0x1000_0000 as *const u8); } // #PF, vector 14, CR2=0x10000000
+    // demo_stack_overflow(0);                                         // #DF on IST1, guard page hit
 
     // --- Read E820 memory map left by stage2 ---
     let e820 = unsafe { read_e820_map() };
@@ -388,16 +429,34 @@ pub extern "C" fn rust_start() -> ! {
         }
     }
 
-    // --- VGA status display (rows 4-8, below BIOS output) ---
-    vga_print(4, b"FreyaOS kernel:  OK", 0x0A);
-    vga_print(5, b"Memory map:      OK", 0x0A);
-    vga_print(6, b"Frame allocator: OK", 0x0A);
-    vga_print(7, b"Sanitise check:  OK", 0x0A);
-    vga_print(8, b"Exception table: OK", 0x0A);
-    vga_print(9, b"--- FreyaOS foundation ready ---", 0x0F);
+    // --- VGA status display (screen was cleared at entry) ---
+    vga_print(0, b"FreyaOS kernel:  OK", 0x0A);
+    vga_print(1, b"Segments + TSS:  OK", 0x0A);
+    vga_print(2, b"Exception table: OK", 0x0A);
+    vga_print(3, b"Page tables:     OK", 0x0A);
+    vga_print(4, b"Memory map:      OK", 0x0A);
+    vga_print(5, b"Frame allocator: OK", 0x0A);
+    vga_print(6, b"Sanitise check:  OK", 0x0A);
+    vga_print(7, b"--- FreyaOS foundation ready ---", 0x0F);
 
     serial_write_str(b"[kernel] init complete - halting\n");
     halt();
+}
+
+/// Demo only: recurse until the kernel stack runs into its guard page.
+/// Each frame keeps a 512-byte buffer alive so the 64 KiB stack is used up
+/// in ~120 calls. black_box stops the compiler from turning the recursion
+/// into a loop or deleting the buffer.
+#[allow(dead_code)]
+#[inline(never)]
+fn demo_stack_overflow(depth: u64) -> u64 {
+    let buf = [depth; 64];
+    core::hint::black_box(&buf);
+    if core::hint::black_box(true) {
+        demo_stack_overflow(depth + 1) + buf[0]
+    } else {
+        0
+    }
 }
 
 fn halt() -> ! {

@@ -12,6 +12,9 @@
 //! P=0 would give #NP instead). Either way the error code has the IDT bit set
 //! and carries the original vector number, and the report decodes it.
 //!
+//! The double fault gate (vector 8) uses IST1 (see gdt.rs), so #DF always
+//! runs on its own stack, even when the kernel stack is the thing that broke.
+//!
 //! Interrupts stay disabled (no `sti`) until the legacy PIC is remapped: the
 //! BIOS routes IRQ0-7 to vectors 8-15, so the first timer tick would arrive
 //! looking like a double fault.
@@ -142,8 +145,8 @@ static BREAKPOINT_HITS: AtomicU64 = AtomicU64::new(0);
 // ---------------------------------------------------------------------------
 
 /// Fill the IDT and load IDTR. Returns the code selector written into the
-/// gates (read from CS rather than hard-coded, so it stays correct when the
-/// kernel gets its own GDT).
+/// gates (read from CS rather than hard-coded). Call after gdt::init(), so
+/// CS is the kernel's own code selector and the TSS for IST1 is loaded.
 pub fn init() -> u16 {
     let cs = read_cs();
 
@@ -158,6 +161,12 @@ pub fn init() -> u16 {
         for v in 0..EXCEPTION_VECTORS {
             (*idt).0[v] = IdtEntry::interrupt_gate(isr_stub_table[v], cs);
         }
+
+        // #DF switches to the dedicated stack in TSS.IST1 no matter what RSP
+        // held. Without this, a kernel stack overflow escalates #PF -> #DF
+        // -> triple fault, because #DF would try to push onto the same
+        // dead stack.
+        (*idt).0[8].ist = crate::gdt::DOUBLE_FAULT_IST;
 
         // lidt copies base+limit into the IDTR register, so the Idtr value
         // itself can live on the stack. The table it points at cannot.
@@ -328,6 +337,20 @@ fn report_serial(f: &InterruptFrame, cr2: u64) {
         s(b"\n");
     }
 
+    // #DF hides its cause, but CR2 still holds the last page-fault address.
+    // If that's the guard page, the kernel stack overflowed: the #PF frame
+    // couldn't be pushed, which escalated to #DF on the IST1 stack.
+    if f.vector == 8 {
+        s(b"  cr2=");
+        hex(cr2);
+        s(b"  (last page-fault address)\n");
+    }
+    if matches!(f.vector, 8 | 14) && crate::paging::is_stack_guard(cr2) {
+        s(b"  diagnosis: KERNEL STACK OVERFLOW (hit guard page ");
+        hex(crate::paging::STACK_GUARD_PAGE);
+        s(b")\n");
+    }
+
     // #TS, #NP, #SS, #GP carry a selector-style error code.
     if matches!(f.vector, 10..=13) && f.error_code != 0 {
         s(b"  cause: ");
@@ -421,7 +444,9 @@ fn report_vga(f: &InterruptFrame, cr2: u64) {
     crate::vga_print(21, line.as_bytes(), ATTR);
 
     let mut line = Line::new();
-    if f.vector == 14 {
+    if matches!(f.vector, 8 | 14) && crate::paging::is_stack_guard(cr2) {
+        line.str(b"KERNEL STACK OVERFLOW  CR2=").hex(cr2);
+    } else if f.vector == 14 {
         line.str(b"CR2=").hex(cr2).str(b"  (full report on COM1)");
     } else {
         line.str(b"Full register dump on COM1");

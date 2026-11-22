@@ -266,14 +266,11 @@ pm_entry:
 
     ; Now in compatibility mode (32-bit code, but LMA is active).
 
-    ; Write 'S2' to VGA — confirms paging works + we're here
-    mov dword [0xb8000], 0x1F321F53   ; 'S','2' in white-on-blue
-    mov dword [0xb8004], 0x1F4A1F20   ; ' ','J' in white-on-blue
-
-    ; Far jump to the 64-bit trampoline (within stage2, NOT directly
-    ; to the kernel). This avoids a QEMU TCG translation-block issue
-    ; where the mode-switch boundary causes a spurious page fault at
-    ; the far jump's target address.
+    ; Far jump into 64-bit code. Loading CS with the 64-bit selector is
+    ; what actually leaves compatibility mode. We land on a short 64-bit
+    ; trampoline (below) rather than the kernel itself so the data
+    ; segments and the full 64-bit RSP are set before any kernel code
+    ; runs.
     jmp 0x18:trampoline_64
 
 ; ---------------------------------------------------------------------------

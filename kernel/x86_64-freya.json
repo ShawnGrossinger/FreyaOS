@@ -16,6 +16,7 @@
   "panic-strategy": "abort",
   "executables": true,
   "disable-redzone": true,
+  "stack-probes": { "kind": "inline" },
   "relocation-model": "static",
   "code-model": "small",
   "tls-model": "local-exec",

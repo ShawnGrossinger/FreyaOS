@@ -7,9 +7,8 @@
 ;   - enabled SSE (CR4.OSFXSR + OSXMMEXCPT, CR0.EM=0 CR0.MP=1)
 ;   - set RSP = KERNEL_STACK_TOP (0x80000)
 ;
-; _start does a VGA probe (to confirm we reached the kernel), zeroes .bss
-; (which is NOT in kernel.bin — objcopy drops NOBITS sections), and hands
-; off to Rust.
+; _start zeroes .bss (which is NOT in kernel.bin — objcopy drops NOBITS
+; sections) and hands off to Rust.
 ;
 ; The second half of this file holds the exception entry stubs that the IDT
 ; points at (see src/idt.rs).
@@ -27,15 +26,6 @@ extern __bss_start
 extern __bss_end
 
 _start:
-    ; VGA probe: 'KK' white-on-red at row 1, col 0 (0xb8000 + 80*2)
-    ; Stage2 wrote 'S2 J' at row 0.  If we see KK on row 1, the
-    ; entire boot chain from BIOS to kernel entry is proven.
-    mov rax, 0xb80a0
-    mov byte [rax],     'K'
-    mov byte [rax + 1], 0x4F
-    mov byte [rax + 2], 'K'
-    mov byte [rax + 3], 0x4F
-
     ; Zero .bss. Stage2 only copies the bytes in kernel.bin, and .bss is
     ; not in kernel.bin, so without this every zero-initialised static
     ; (including the IDT) starts as whatever was left in RAM. QEMU's RAM
