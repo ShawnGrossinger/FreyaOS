@@ -22,8 +22,8 @@ ROOT=out/test
 
 # name | FREYA_DEMO | RAM | patterns that must all appear, separated by ;;
 CASES=(
-  "boot-128M||128M|init complete - halting"
-  "boot-4G||4G|physical map at 0xffff800000000000: 4096 MiB;;init complete - halting"
+  "boot-128M||128M|init complete - idle, timer running;;self-test [0-9]+ ticks in 100 ms"
+  "boot-4G||4G|physical map at 0xffff800000000000: 4096 MiB;;init complete - idle, timer running"
   "ud2|ud2|128M|vector 6 #UD Invalid Opcode"
   "page_fault|page_fault|128M|vector 14 #PF Page Fault;;cr2=0x0000000010000000;;page not present, read"
   "stack_overflow|stack_overflow|128M|vector 8 #DF Double Fault;;KERNEL STACK OVERFLOW"

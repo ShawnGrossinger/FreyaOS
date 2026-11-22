@@ -4,20 +4,24 @@
 //!   - `IdtEntry`: one 16-byte 64-bit gate descriptor
 //!   - `IDT`: 256 gates in a static (lives in .bss, zeroed by `_start`)
 //!   - `init()`: points gates 0-31 at the asm stubs in entry.asm, loads IDTR
-//!   - `exception_dispatch()`: called by `isr_common` with the saved CPU state
+//!   - `interrupt_dispatch()`: called by `isr_common` with the saved CPU state
 //!
-//! Vectors 32-255 are deliberately left as all-zero entries. If anything ever
-//! arrives on one, the CPU raises #GP (vector 13) instead: type 0 fails the
-//! gate-type check, which comes before the present check (a valid type with
-//! P=0 would give #NP instead). Either way the error code has the IDT bit set
-//! and carries the original vector number, and the report decodes it.
+//! Two more gates carry hardware interrupts from the local APIC: the timer
+//! (apic::TIMER_VECTOR, 0x30) and spurious interrupts (0xFF).
+//!
+//! Every other vector from 32 to 255 is deliberately left as an all-zero
+//! entry. If anything ever arrives on one, the CPU raises #GP (vector 13)
+//! instead: type 0 fails the gate-type check, which comes before the present
+//! check (a valid type with P=0 would give #NP instead). Either way the
+//! error code has the IDT bit set and carries the original vector number,
+//! and the report decodes it.
 //!
 //! The double fault gate (vector 8) uses IST1 (see gdt.rs), so #DF always
 //! runs on its own stack, even when the kernel stack is the thing that broke.
 //!
-//! Interrupts stay disabled (no `sti`) until the legacy PIC is remapped: the
-//! BIOS routes IRQ0-7 to vectors 8-15, so the first timer tick would arrive
-//! looking like a double fault.
+//! Interrupts stay disabled until pic::remap_and_mask() has moved the legacy
+//! PICs off vectors 8-15 (where IRQ 0 would look like a double fault) and
+//! apic::init() has the timer ready.
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -136,6 +140,9 @@ const _: () = assert!(core::mem::size_of::<InterruptFrame>() == 22 * 8);
 extern "C" {
     /// Addresses of isr_stub_0 .. isr_stub_31 (entry.asm, .rodata).
     static isr_stub_table: [u64; EXCEPTION_VECTORS];
+    /// Hardware interrupt stubs (entry.asm).
+    fn isr_stub_48();
+    fn isr_stub_255();
 }
 
 static BREAKPOINT_HITS: AtomicU64 = AtomicU64::new(0);
@@ -167,6 +174,12 @@ pub fn init() -> u16 {
         // -> triple fault, because #DF would try to push onto the same
         // dead stack.
         (*idt).0[8].ist = crate::gdt::DOUBLE_FAULT_IST;
+
+        // Hardware interrupts from the local APIC.
+        (*idt).0[crate::apic::TIMER_VECTOR as usize] =
+            IdtEntry::interrupt_gate(isr_stub_48 as *const () as u64, cs);
+        (*idt).0[crate::apic::SPURIOUS_VECTOR as usize] =
+            IdtEntry::interrupt_gate(isr_stub_255 as *const () as u64, cs);
 
         // lidt copies base+limit into the IDTR register, so the Idtr value
         // itself can live on the stack. The table it points at cannot.
@@ -221,7 +234,7 @@ pub fn selftest_breakpoint() -> bool {
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-extern "C" fn exception_dispatch(frame: &mut InterruptFrame) {
+extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
     // Read CR2 first. It only means something for #PF, and anything later
     // in this function could in principle fault and overwrite it.
     let cr2 = read_cr2();
@@ -235,6 +248,10 @@ extern "C" fn exception_dispatch(frame: &mut InterruptFrame) {
             crate::serial_write_hex(frame.rip);
             crate::serial_write_str(b"\n");
         }
+
+        // Hardware interrupts: handle and return to the interrupted code.
+        v if v == crate::apic::TIMER_VECTOR as u64 => crate::apic::on_timer(),
+        v if v == crate::apic::SPURIOUS_VECTOR as u64 => crate::apic::on_spurious(),
 
         // Everything else is fatal for now. Returning from a fault would
         // re-execute the faulting instruction forever.

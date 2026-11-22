@@ -63,7 +63,7 @@ _start:
 
 section .text
 
-extern exception_dispatch
+extern interrupt_dispatch
 
 ; Vector where the CPU does NOT push an error code.
 %macro ISR_NOERR 1
@@ -113,8 +113,15 @@ ISR_ERR   29    ; #VC  VMM communication (AMD)
 ISR_ERR   30    ; #SX  security exception (AMD)
 ISR_NOERR 31    ;      reserved
 
+; Hardware interrupts from the local APIC (vector numbers must match
+; TIMER_VECTOR and SPURIOUS_VECTOR in src/apic.rs).
+global isr_stub_48
+global isr_stub_255
+ISR_NOERR 48    ;      APIC timer
+ISR_NOERR 255   ;      APIC spurious interrupt
+
 ; ---------------------------------------------------------------------------
-; isr_common — shared path for every exception.
+; isr_common — shared path for every exception and hardware interrupt.
 ;
 ; Stack on arrival (lowest address first):
 ;   vector, error_code, RIP, CS, RFLAGS, RSP, SS      = 7 qwords
@@ -150,7 +157,7 @@ isr_common:
 
     cld                         ; SysV requires DF=0 at function entry
     lea rdi, [rsp + 512]        ; arg0 = &InterruptFrame (points at saved r15)
-    call exception_dispatch     ; returns only for recoverable vectors (#BP)
+    call interrupt_dispatch     ; returns for #BP and hardware interrupts
 
     fxrstor [rsp]
     add rsp, 512

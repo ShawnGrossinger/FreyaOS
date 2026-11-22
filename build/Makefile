@@ -29,7 +29,7 @@ STAGE2    := $(OUTDIR)/stage2.bin
 KERNELELF := $(OUTDIR)/kernel.elf
 KERNELBIN := $(OUTDIR)/kernel.bin
 
-.PHONY: all clean run debug test
+.PHONY: all clean run trace debug test
 
 all: $(IMG)
 
@@ -132,7 +132,22 @@ $(IMG): $(STAGE1) $(STAGE2) $(KERNELBIN) | $(OUTDIR)
 	  -no-reboot \
 	  -no-shutdown
 
+# The kernel reports its own exceptions on serial and screen, so `run` only
+# logs CPU resets (triple faults) and guest errors. With the timer running
+# at 100 Hz, `-d int` grows the log by about 8 MB a minute.
 run: $(IMG)
+	qemu-system-x86_64 \
+	  -drive format=raw,file=$(IMG),if=ide,media=disk,index=0 \
+	  -serial stdio \
+	  -m 128M \
+	  -no-reboot \
+	  -no-shutdown \
+	  -d cpu_reset,guest_errors -D /tmp/qemu-int.log
+
+# Same as run, logging every interrupt and exception. For faults before the
+# kernel's IDT exists (stage2, early _start). Grows quickly once the timer
+# is on.
+trace: $(IMG)
 	qemu-system-x86_64 \
 	  -drive format=raw,file=$(IMG),if=ide,media=disk,index=0 \
 	  -serial stdio \

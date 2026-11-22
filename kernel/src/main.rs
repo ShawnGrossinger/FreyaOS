@@ -5,12 +5,14 @@ extern crate alloc; // Box, Vec, String, BTreeMap, backed by heap.rs
 
 use core::panic::PanicInfo;
 
+mod apic;
 mod boot;
 mod disk_io;
 mod gdt;
 mod heap;
 mod idt;
 mod paging;
+mod pic;
 mod pmm;
 mod selftest;
 mod vmm;
@@ -318,6 +320,28 @@ pub extern "C" fn rust_start() -> ! {
         None => selftest::check(b"kernel", b"alloc_frame returned a frame", false),
     };
 
+    // --- Interrupts: legacy PICs out of the way, local APIC timer on ---
+    // Last, so every allocation and mapping above happened with interrupts
+    // off; apic::selftest() turns them on and leaves them on.
+    pic::remap_and_mask();
+    let irq_ok = match apic::init() {
+        Ok(info) => {
+            serial_write_str(b"[apic] local APIC id ");
+            serial_write_u64(info.id as u64);
+            serial_write_str(b", version ");
+            serial_write_hex(info.version as u64);
+            serial_write_str(b", registers at ");
+            serial_write_hex(info.phys_base);
+            serial_write_str(b"; timer at ");
+            serial_write_u64(apic::TIMER_HZ);
+            serial_write_str(b" Hz on vector ");
+            serial_write_hex(apic::TIMER_VECTOR as u64);
+            serial_write_str(b"\n");
+            apic::selftest(&info)
+        }
+        Err(why) => selftest::check(b"apic", why, false),
+    };
+
     // --- VGA status display (screen was cleared at entry) ---
     // Steps with no result value either succeed or end in an exception
     // report, so reaching this point means they passed.
@@ -331,64 +355,97 @@ pub extern "C" fn rust_start() -> ! {
     vga_status(7, b"Page mapping:    ", vmm_ok);
     vga_status(8, b"Kernel heap:     ", heap_ok);
     vga_status(9, b"Sanitise check:  ", sanitize_ok);
+    vga_status(10, b"Timer interrupt: ", irq_ok);
 
     // --- One line that says whether everything is up ---
     let all_ok = selftest::summary();
     let (passed, failed) = selftest::counts();
-    vga_summary(10, passed, failed);
+    vga_summary(11, passed, failed);
 
     // Build-time fault demo, if one was requested (halts).
     run_requested_demo();
 
     if all_ok {
-        vga_print(11, b"--- FreyaOS foundation ready ---", 0x0F);
-        serial_write_str(b"[kernel] init complete - halting\n");
+        vga_print(12, b"--- FreyaOS foundation ready ---", 0x0F);
+        serial_write_str(b"[kernel] init complete - idle, timer running\n");
     } else {
-        vga_print(11, b"--- SELF-TEST FAILURE: see serial log ---", 0x0C);
-        serial_write_str(b"[kernel] init complete WITH FAILURES - halting\n");
+        vga_print(12, b"--- SELF-TEST FAILURE: see serial log ---", 0x0C);
+        serial_write_str(b"[kernel] init complete WITH FAILURES - idle\n");
     }
-    halt();
+    idle(13);
 }
 
 /// "Self-tests:      N passed, M failed", green if none failed.
 fn vga_summary(row: usize, passed: u32, failed: u32) {
-    let mut line = [b' '; 80];
-    let mut len = 0;
-    let mut put = |bytes: &[u8]| {
+    let mut line = VgaLine::new();
+    line.put(b"Self-tests:      ")
+        .num(passed as u64)
+        .put(b" passed, ")
+        .num(failed as u64)
+        .put(b" failed");
+    vga_print(row, line.as_bytes(), if failed == 0 { 0x0A } else { 0x0C });
+}
+
+/// Build an 80-column VGA line from text and decimal numbers.
+struct VgaLine {
+    buf: [u8; 80],
+    len: usize,
+}
+
+impl VgaLine {
+    fn new() -> Self {
+        VgaLine { buf: [b' '; 80], len: 0 }
+    }
+
+    fn put(&mut self, bytes: &[u8]) -> &mut Self {
         for &b in bytes {
-            if len < line.len() {
-                line[len] = b;
-                len += 1;
+            if self.len < self.buf.len() {
+                self.buf[self.len] = b;
+                self.len += 1;
             }
         }
-    };
-    let digits = |mut n: u32| {
-        let mut buf = [0u8; 10];
-        let mut i = buf.len();
-        loop {
-            i -= 1;
-            buf[i] = b'0' + (n % 10) as u8;
+        self
+    }
+
+    fn num(&mut self, mut n: u64) -> &mut Self {
+        let mut digits = [0u8; 20];
+        let mut count = 0;
+        for slot in digits.iter_mut() {
+            *slot = b'0' + (n % 10) as u8;
+            count += 1;
             n /= 10;
-            if n == 0 || i == 0 {
+            if n == 0 {
                 break;
             }
         }
-        buf
-    };
-    let p = digits(passed);
-    let f = digits(failed);
-    put(b"Self-tests:      ");
-    put(trim_leading_zeros(&p));
-    put(b" passed, ");
-    put(trim_leading_zeros(&f));
-    put(b" failed");
-    let attr = if failed == 0 { 0x0A } else { 0x0C };
-    vga_print(row, &line[..len.min(line.len())], attr);
+        for &d in digits.iter().take(count).rev() {
+            self.put(&[d]);
+        }
+        self
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.buf.get(..self.len).unwrap_or(&self.buf)
+    }
 }
 
-fn trim_leading_zeros(digits: &[u8]) -> &[u8] {
-    let first = digits.iter().position(|&d| d != 0).unwrap_or(digits.len() - 1);
-    &digits[first..]
+/// After boot: sleep until the next interrupt, forever, keeping the uptime
+/// line on screen current. `sti; hlt` as a pair cannot miss a wakeup: an
+/// interrupt is only taken after the instruction following `sti`, which is
+/// the `hlt` itself.
+fn idle(row: usize) -> ! {
+    let mut shown = u64::MAX;
+    loop {
+        let ticks = apic::ticks();
+        let seconds = ticks / apic::TIMER_HZ;
+        if seconds != shown {
+            shown = seconds;
+            let mut line = VgaLine::new();
+            line.put(b"Uptime:          ").num(seconds).put(b" s  (").num(ticks).put(b" timer ticks)");
+            vga_print(row, line.as_bytes(), 0x07);
+        }
+        unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
+    }
 }
 
 /// Fault demos, chosen at build time:  FREYA_DEMO=<name> make run

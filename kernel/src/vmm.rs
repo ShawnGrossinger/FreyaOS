@@ -20,19 +20,26 @@
 //!                          VGA). Temporary: user space will own the lower
 //!                          half.
 //!   0xFFFF_8000_0000_0000  physical map, all RAM (PML4 256, up to 512 GiB)
-//!   0xFFFF_C000_0000_0000  kernel dynamic mappings (PML4 384): heap,
-//!                          device registers, anything built with map()
+//!   0xFFFF_C000_0000_0000  kernel dynamic mappings (PML4 384): self-tests
+//!                          and anything built with map()
+//!   0xFFFF_C040_0000_0000  device window (inside slot 384): map_mmio()
+//!   0xFFFF_C080_0000_0000  kernel heap (PML4 385, see heap.rs)
 //!
 //! Every table is reached through the physical map, so this module only
 //! works after paging::map_physical_memory().
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::paging::{self, ADDR_MASK, HUGE, NO_EXECUTE, PRESENT, WRITABLE};
 use crate::pmm::{self, PAGE_SIZE};
 
 /// Start of the kernel's dynamic mapping region.
 pub const KERNEL_DYNAMIC_BASE: u64 = 0xFFFF_C000_0000_0000;
+
+/// Device registers are mapped here, 256 GiB into the dynamic region, well
+/// clear of the pages the self-tests use.
+pub const DEVICE_WINDOW_BASE: u64 = KERNEL_DYNAMIC_BASE + 0x40_0000_0000;
 
 const ENTRIES: usize = 512;
 const WRITE_THROUGH: u64 = 1 << 3; // PWT
@@ -324,6 +331,35 @@ impl AddressSpace {
         let leaf = *table(table_phys).add(index(virt, 1));
         (leaf & PRESENT != 0).then_some(leaf)
     }
+}
+
+// ===========================================================================
+// Device window
+// ===========================================================================
+
+static NEXT_DEVICE_VA: AtomicU64 = AtomicU64::new(DEVICE_WINDOW_BASE);
+
+/// Map `bytes` of device registers starting at physical `phys` into the
+/// device window, uncached (PageFlags::MMIO), and return the virtual
+/// address that corresponds to `phys`. Device memory is not RAM, so it is
+/// not in the physical map; drivers reach it only through this.
+///
+/// A simple bump allocator: mappings are never removed. If a page fails to
+/// map, the pages already mapped for this call stay mapped.
+///
+/// # Safety
+/// `phys` must be device memory the caller is entitled to drive.
+pub unsafe fn map_mmio(phys: u64, bytes: u64) -> Result<u64, MapError> {
+    let first = phys & !(PAGE_SIZE - 1);
+    let end = (phys + bytes + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let pages = (end - first) / PAGE_SIZE;
+    let va = NEXT_DEVICE_VA.fetch_add(pages * PAGE_SIZE, Ordering::Relaxed);
+
+    let mut ks = AddressSpace::kernel();
+    for i in 0..pages {
+        ks.map(va + i * PAGE_SIZE, first + i * PAGE_SIZE, PageFlags::MMIO)?;
+    }
+    Ok(va + (phys - first))
 }
 
 // ===========================================================================
