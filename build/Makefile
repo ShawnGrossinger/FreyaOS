@@ -15,6 +15,9 @@ NASM    ?= nasm
 OBJCOPY ?= llvm-objcopy
 
 SECTOR  := 512
+# stage2 loads at most 1 MiB of kernel (it must end below stage2's page
+# tables at 0x200000) and refuses anything bigger at boot. Catch it here.
+KERNEL_MAX_SECTORS := 2048
 OUTDIR  := out
 BOOTDIR := ../bootloader/BIOS
 KERNDIR := ../kernel
@@ -26,7 +29,7 @@ STAGE2    := $(OUTDIR)/stage2.bin
 KERNELELF := $(OUTDIR)/kernel.elf
 KERNELBIN := $(OUTDIR)/kernel.bin
 
-.PHONY: all clean run debug
+.PHONY: all clean run debug test
 
 all: $(IMG)
 
@@ -41,14 +44,25 @@ KERNEL_SRCS := $(shell find $(KERNDIR)/src -name '*.rs') \
 			   $(KERNDIR)/entry.asm $(KERNDIR)/kernel.ld $(KERNDIR)/build.rs \
 			   $(KERNDIR)/Cargo.toml $(KERNDIR)/x86_64-freya.json
 
-$(KERNELELF): $(KERNEL_SRCS) | $(OUTDIR)
+# Build-time fault demo: FREYA_DEMO=<name> make run  (names: see
+# run_requested_demo() in kernel/src/main.rs). The stamp file's name holds
+# the current choice, so changing FREYA_DEMO rebuilds the kernel even when
+# no source changed.
+DEMO_STAMP := $(OUTDIR)/.demo-$(if $(FREYA_DEMO),$(FREYA_DEMO),none)
+
+$(DEMO_STAMP): | $(OUTDIR)
+	rm -f $(OUTDIR)/.demo-*
+	touch $@
+
+$(KERNELELF): $(KERNEL_SRCS) $(DEMO_STAMP) | $(OUTDIR)
 	cd $(KERNDIR) && \
 	  RUST_TARGET_PATH=$(abspath $(KERNDIR)) \
 	  RUSTFLAGS="-C link-arg=--script=kernel.ld" \
+	  FREYA_DEMO="$(FREYA_DEMO)" \
 	  cargo +nightly build \
 	    --target x86_64-freya.json \
 	    --release \
-	    -Z build-std=core,compiler_builtins \
+	    -Z build-std=core,compiler_builtins,alloc \
 	    -Z build-std-features=compiler-builtins-mem \
 	    -Z json-target-spec
 	cp $(KERNDIR)/target/x86_64-freya/release/freya-kernel $(KERNELELF)
@@ -72,7 +86,11 @@ $(STAGE2): $(BOOTDIR)/stage2.asm $(STAGE2PRE) $(KERNELBIN) | $(OUTDIR)
 	KERNEL_LBA=$$(( 1 + $$STAGE2_SECTORS )); \
 	KERNEL_SIZE=$$(stat -c%s $(KERNELBIN)); \
 	KERNEL_SECTORS=$$(( ($$KERNEL_SIZE + $(SECTOR) - 1)/$(SECTOR) )); \
-	echo "[layout] stage2_sectors=$$STAGE2_SECTORS  kernel_lba=$$KERNEL_LBA  kernel_sectors=$$KERNEL_SECTORS"; \
+	echo "[layout] stage2_sectors=$$STAGE2_SECTORS  kernel_lba=$$KERNEL_LBA  kernel_sectors=$$KERNEL_SECTORS (stage2 limit: $(KERNEL_MAX_SECTORS))"; \
+	if [ $$KERNEL_SECTORS -gt $(KERNEL_MAX_SECTORS) ]; then \
+	  echo "ERROR: kernel is $$KERNEL_SECTORS sectors; stage2 loads at most $(KERNEL_MAX_SECTORS) (1 MiB, below its page tables at 0x200000)."; \
+	  exit 1; \
+	fi; \
 	$(NASM) -f bin \
 	  -D__KERNEL_LBA=$$KERNEL_LBA \
 	  -D__KERNEL_SECTORS=$$KERNEL_SECTORS \
@@ -133,6 +151,11 @@ debug: $(IMG)
 	  -no-reboot \
 	  -no-shutdown \
 	  -s -S
+
+# Build and boot every test case headless, check each one's output, and
+# print a summary. Non-zero exit if anything failed. See test.sh.
+test:
+	./test.sh
 
 clean:
 	rm -rf $(OUTDIR)

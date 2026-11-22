@@ -398,9 +398,8 @@ pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
         }
         None => false,
     };
-    s(b"[paging] self-test alias (physmap write, identity read): ");
-    s(if alias_ok { b"PASS\n" } else { b"FAIL\n" });
-    ok &= alias_ok;
+    s(b"[paging] self-test alias (physmap write, identity read)");
+    ok &= crate::selftest::verdict(alias_ok);
 
     // --- 2. allocate past the old 8 MiB limit ---
     let mut chain: u64 = 0; // physical address of the last frame, 0 = end
@@ -434,8 +433,7 @@ pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
     s(b" frames, first above 8 MiB at ");
     hex(high_frame);
     s(if all_zeroed { b", all zeroed" } else { b", NOT ZEROED" });
-    s(if alloc_ok { b": PASS\n" } else { b": FAIL\n" });
-    ok &= alloc_ok;
+    ok &= crate::selftest::verdict(alloc_ok);
 
     // --- 3. last usable frame ---
     let mut top: u64 = 0;
@@ -459,8 +457,7 @@ pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
         s(b"[paging] self-test top of RAM: no usable region found");
         false
     };
-    s(if top_ok { b": PASS\n" } else { b": FAIL\n" });
-    ok &= top_ok;
+    ok &= crate::selftest::verdict(top_ok);
 
     ok
 }

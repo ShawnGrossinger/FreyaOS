@@ -38,6 +38,11 @@ SECTIONS
     . = ALIGN(4096);
     __kernel_end = .;
 
+    /* _start zeroes .bss before the kernel has its own page tables, while
+     * stage2's tables at 0x200000 are still live: the image and .bss must
+     * end below them. This is also stage2's 2048-sector (1 MiB) limit. */
+    ASSERT(__kernel_end <= 0x200000, "kernel image + .bss would overlap stage2's page tables at 0x200000")
+
     /DISCARD/ : {
         *(.comment)
         *(.eh_frame)

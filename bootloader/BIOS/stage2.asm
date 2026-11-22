@@ -3,7 +3,8 @@
 ;
 ; Responsibilities:
 ; - (Real mode) enable A20
-; - (Real mode) load kernel from disk into 0x0010_0000 (1 MiB) using INT 13h extensions
+; - (Real mode) load kernel from disk into 0x0010_0000 (1 MiB) using INT 13h extensions,
+;   in 32 KiB chunks through a bounce buffer, copied up with unreal mode
 ; - enter 32-bit protected mode
 ; - set up minimal IA-32e paging (identity-map first 2 MiB using a single 2 MiB page)
 ; - enable long mode and jump to the kernel entry at 0x0010_0000
@@ -28,11 +29,21 @@ BITS 16
 
 KERNEL_ENTRY      equ 0x00100000
 
-; BIOS-friendly bounce buffer (< 1 MiB)
-; We read the kernel here in real mode, then copy it to 0x0010_0000 in 32-bit PM.
+; BIOS-friendly bounce buffer (< 1 MiB). INT 13h can only write below
+; 1 MiB, so each chunk of the kernel is read here, then copied up to its
+; final address with a 32-bit copy in unreal mode (see enter_unreal).
 KERNEL_TMP_ADDR   equ 0x00010000
 KERNEL_TMP_SEG    equ 0x1000
 KERNEL_TMP_OFF    equ 0x0000
+
+; Sectors per INT 13h read: 32 KiB, well inside the 64 KiB bounce buffer
+; and under the 127-sector limit some BIOSes put on one call.
+LOAD_CHUNK_SECTORS equ 64
+
+; Largest kernel image: 1 MiB (0x100000-0x200000). Its .bss follows the
+; image and must stay below stage2's page tables at 0x200000, which are
+; live until the kernel switches CR3; kernel.ld asserts that at link time.
+KERNEL_MAX_SECTORS equ 2048
 
 PML4_ADDR         equ 0x00200000
 PDPT_ADDR         equ 0x00201000
@@ -110,10 +121,7 @@ start:
     jmp hang
 .kernel_constants_ok:
 
-    ; Real-mode BIOS DAP buffer uses a 16:16 pointer. Starting at 0x0010_0000
-    ; (0xFFFF:0x0010), we can only address ~64KiB-16 bytes in real mode.
-    ; Keep this revival loader simple: cap the kernel to 127 sectors (~63.5KiB).
-    cmp ax, 127
+    cmp ax, KERNEL_MAX_SECTORS
     jbe .kernel_size_ok
     mov si, msg_kernel_too_big
     call print_string
@@ -122,19 +130,55 @@ start:
     jmp hang
 .kernel_size_ok:
 
-    ; --- Load kernel to 0x0010_0000 using INT 13h AH=42h ---
+    ; --- Load the kernel to 0x0010_0000, one chunk at a time ---
+    ; Each pass: INT 13h AH=42h reads up to LOAD_CHUNK_SECTORS into the
+    ; bounce buffer, then a 32-bit copy (unreal mode) moves them up to
+    ; load_dest, above 1 MiB.
+    mov dword [load_lba], __KERNEL_LBA
+    mov word [load_left], __KERNEL_SECTORS
+    mov dword [load_dest], KERNEL_ENTRY
+
+.load_chunk:
+    mov cx, [load_left]
+    test cx, cx
+    jz .read_ok
+    cmp cx, LOAD_CHUNK_SECTORS
+    jbe .chunk_size_ok
+    mov cx, LOAD_CHUNK_SECTORS
+.chunk_size_ok:
+    mov [load_count], cx
+
     mov si, kernel_dap
-    mov word [si + 2], __KERNEL_SECTORS
+    mov [si + 2], cx
     mov word [si + 4], KERNEL_TMP_OFF
     mov word [si + 6], KERNEL_TMP_SEG
-    mov dword [si + 8], __KERNEL_LBA
+    mov eax, [load_lba]
+    mov [si + 8], eax
     mov dword [si + 12], 0
 
     mov ah, 0x42
     mov dl, [boot_drive]
     int 0x13
-    jnc .read_ok
+    jc .read_error
 
+    ; The BIOS may have reloaded segment limits, so (re)enter unreal mode
+    ; before every copy rather than once.
+    call enter_unreal
+    movzx ecx, word [load_count]
+    shl ecx, 7                    ; sectors * 512 / 4 = dwords
+    mov esi, KERNEL_TMP_ADDR
+    mov edi, [load_dest]
+    cld
+    a32 rep movsd                 ; DS:ESI -> ES:EDI, 32-bit addresses
+
+    movzx eax, word [load_count]
+    add [load_lba], eax
+    sub [load_left], ax
+    shl eax, 9                    ; sectors -> bytes
+    add [load_dest], eax
+    jmp .load_chunk
+
+.read_error:
     ; Print AH error code over serial before halting
     push ax
     mov si, msg_read_err_code
@@ -182,13 +226,8 @@ pm_entry:
 
     mov esp, 0x00090000   ; simple stack below 1 MiB
 
-    ; Copy kernel from bounce buffer to final 1 MiB destination
-    ; (We do this before enabling paging/long mode.)
-    cld
-    mov esi, KERNEL_TMP_ADDR
-    mov edi, KERNEL_ENTRY
-    mov ecx, (__KERNEL_SECTORS * 512) / 4
-    rep movsd
+    ; (The kernel is already at KERNEL_ENTRY: the real-mode loader copied
+    ; each chunk up as it went.)
 
     ; --- Build minimal page tables for long mode ---
     ; Identity-map first 2 MiB using a single 2 MiB page (PDE.PS=1)
@@ -310,6 +349,37 @@ kernel_read_error:
     mov si, msg_kernel_read_error_serial
     call serial_write_string
     jmp hang
+
+; ---------------------------------------------------------------------------------------------
+; enter_unreal - give DS and ES 4 GiB limits while staying in real mode
+;
+; Switch to protected mode just long enough to load DS and ES from the flat
+; data descriptor (0x10), then switch back. Real-mode segment loads only
+; change a segment's base, not its cached limit, so after returning DS=ES=0
+; keep the 4 GiB limit and 32-bit addresses (a32 prefix) reach above 1 MiB.
+; CS is never reloaded, so code keeps running as ordinary 16-bit code.
+; ---------------------------------------------------------------------------------------------
+enter_unreal:
+    pushfd
+    push eax
+    push bx
+    cli
+    lgdt [gdt_descriptor]
+    mov eax, cr0
+    or al, 1
+    mov cr0, eax                  ; protected mode (CS still a real-mode segment)
+    mov bx, 0x10                  ; flat 32-bit data descriptor
+    mov ds, bx
+    mov es, bx
+    and al, 0xFE
+    mov cr0, eax                  ; back to real mode
+    xor bx, bx
+    mov ds, bx                    ; base 0 again; limit stays 4 GiB
+    mov es, bx
+    pop bx
+    pop eax
+    popfd
+    ret
 
 hang:
     cli
@@ -502,7 +572,7 @@ msg_stage2 db "Stage 2: OK", 0x0D, 0x0A, 0
 msg_kernel_loaded db "Kernel loaded", 0x0D, 0x0A, 0
 msg_kernel_not_patched db "Kernel constants not patched", 0x0D, 0x0A, 0
 msg_kernel_read_error db "Kernel read failed", 0x0D, 0x0A, 0
-msg_kernel_too_big db "Kernel too large (max 127 sectors)", 0x0D, 0x0A, 0
+msg_kernel_too_big db "Kernel too large (max 2048 sectors)", 0x0D, 0x0A, 0
 msg_a20_fail db "A20 enable failed - halting", 0x0D, 0x0A, 0
 msg_e820_ok db "E820 map collected", 0x0D, 0x0A, 0
 msg_e820_fail db "E820 not supported", 0x0D, 0x0A, 0
@@ -512,7 +582,7 @@ msg_stage2_serial db "[stage2] Stage 2: OK", 0x0A, 0
 msg_kernel_loaded_serial db "[stage2] Kernel loaded", 0x0A, 0
 msg_kernel_not_patched_serial db "[stage2] ERROR: kernel constants not patched", 0x0A, 0
 msg_kernel_read_error_serial db "[stage2] ERROR: kernel read failed", 0x0A, 0
-msg_kernel_too_big_serial db "[stage2] ERROR: kernel too large (max 127 sectors)", 0x0A, 0
+msg_kernel_too_big_serial db "[stage2] ERROR: kernel too large (max 2048 sectors)", 0x0A, 0
 msg_a20_fail_serial db "[stage2] ERROR: kernel too large (max 127 sectors)", 0x0A, 0
 msg_e820_ok_serial db "[stage2] E820 map collected", 0x0A, 0
 msg_e820_fail_serial db "[stage2] ERROR: E820 not supported", 0x0A, 0
@@ -527,6 +597,12 @@ kernel_dap:
     dw 0              ; offset (filled)
     dw 0              ; segment (filled)
     dq 0              ; LBA (filled)
+
+; Chunked-load state
+load_lba   dd 0       ; next LBA to read
+load_dest  dd 0       ; where the next chunk goes (physical, >= 1 MiB)
+load_left  dw 0       ; sectors still to read
+load_count dw 0       ; sectors in the current chunk
 
 ; ---------------------------------------------------------------------------------------------
 ; GDT

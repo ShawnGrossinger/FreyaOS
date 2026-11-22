@@ -344,10 +344,7 @@ pub unsafe fn selftest() -> bool {
     let mut ok = true;
 
     fn check(ok: &mut bool, name: &[u8], pass: bool) {
-        crate::serial_write_str(b"[vmm] self-test ");
-        crate::serial_write_str(name);
-        crate::serial_write_str(if pass { b": PASS\n" } else { b": FAIL\n" });
-        *ok &= pass;
+        *ok &= crate::selftest::check(b"vmm", name, pass);
     }
 
     // --- 1. map, translate, alias ---
@@ -395,9 +392,7 @@ pub unsafe fn selftest() -> bool {
         s(b"[vmm] self-test ");
         s(what);
         s(map_result(got));
-        let pass = got == Err(want);
-        s(if pass { b": PASS\n" } else { b": FAIL\n" });
-        ok &= pass;
+        ok &= crate::selftest::verdict(got == Err(want));
     }
     let got = ks.unmap(va + PAGE_SIZE);
     s(b"[vmm] self-test unmap of a page never mapped -> ");
@@ -405,9 +400,7 @@ pub unsafe fn selftest() -> bool {
         Ok(_) => b"unmapped",
         Err(e) => e.name(),
     });
-    let pass = got == Err(UnmapError::NotMapped);
-    s(if pass { b": PASS\n" } else { b": FAIL\n" });
-    ok &= pass;
+    ok &= crate::selftest::verdict(got == Err(UnmapError::NotMapped));
 
     // --- 4. unmap hands back the frame and the address goes away ---
     let returned = ks.unmap(va);
@@ -492,7 +485,6 @@ pub unsafe fn selftest() -> bool {
 /// Use after unmap: the page is used, unmapped, then used again. The CPU
 /// cached the translation during the first use; the second use faults
 /// (not present) only because unmap() flushed that TLB entry with invlpg.
-#[allow(dead_code)]
 pub unsafe fn demo_use_after_unmap() {
     let mut ks = AddressSpace::kernel();
     let va = KERNEL_DYNAMIC_BASE + 0x10_0000;
@@ -505,7 +497,6 @@ pub unsafe fn demo_use_after_unmap() {
 }
 
 /// Write to a read-only mapping: protection-violation #PF on a write.
-#[allow(dead_code)]
 pub unsafe fn demo_write_read_only() {
     let mut ks = AddressSpace::kernel();
     let va = KERNEL_DYNAMIC_BASE + 0x10_0000;

@@ -1,0 +1,453 @@
+//! heap.rs — the kernel heap.
+//!
+//! Backs Rust's `alloc` crate (Box, Vec, String, BTreeMap, ...) for kernel
+//! code. It is the variable-size allocator that capability tables and
+//! other kernel objects will be built on.
+//!
+//! Design: a first-fit free list, kept sorted by address so neighbours
+//! can be merged (coalesced) on free. Free blocks store their own
+//! bookkeeping in place:
+//!
+//!   free block:  [ size: usize | next: *mut FreeBlock | ...zeros... ]
+//!
+//! Every block start and size is a multiple of 16, so splitting a block
+//! never leaves a sliver too small to hold that 16-byte header.
+//!
+//! The heap lives in its own virtual region and grows on demand: when no
+//! free block fits, it takes frames from pmm and maps them (KERNEL_DATA:
+//! writable, no-execute) at the top of the heap. It never shrinks yet.
+//!
+//! Sanitising, matching the frame allocator's Raw -> Sanitized rule:
+//! freed memory is zeroed immediately, and new heap pages arrive zeroed
+//! from pmm. So every free byte is zero except free-block headers, and the
+//! allocator clears the one header an allocation can overlap. The result:
+//! every allocation is returned zeroed, and nothing one owner wrote is
+//! ever visible to the next.
+//!
+//! Misuse halts with a message instead of corrupting memory: freeing a
+//! pointer outside the heap, freeing something already free (double free),
+//! or re-entering the allocator (e.g. allocating from an exception handler
+//! that interrupted an allocation).
+
+use core::alloc::{GlobalAlloc, Layout};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::pmm::{self, PAGE_SIZE};
+use crate::vmm::{AddressSpace, PageFlags};
+
+/// The heap's virtual region: PML4 slot 385, right after the general
+/// dynamic region (vmm::KERNEL_DYNAMIC_BASE, slot 384).
+pub const HEAP_BASE: u64 = 0xFFFF_C080_0000_0000;
+/// How far it may grow.
+pub const HEAP_MAX: u64 = 1024 * 1024 * 1024; // 1 GiB
+/// Grow by at least this much at a time, so small allocations don't each
+/// cost a page-table walk.
+const GROW_STEP: u64 = 64 * 1024;
+
+/// Block granularity and minimum size: room for the free-block header.
+const BLOCK: usize = 16;
+
+#[repr(C)]
+struct FreeBlock {
+    size: usize,
+    next: *mut FreeBlock,
+}
+
+struct Heap {
+    head: *mut FreeBlock, // lowest-addressed free block
+    top: u64,             // end of the mapped heap (exclusive)
+    in_use: u64,          // bytes handed out and not yet freed
+    allocations: u64,
+    frees: u64,
+}
+
+static mut HEAP: Heap = Heap {
+    head: core::ptr::null_mut(),
+    top: HEAP_BASE,
+    in_use: 0,
+    allocations: 0,
+    frees: 0,
+};
+
+/// Held for the duration of every alloc/free. With one CPU and interrupts
+/// off, finding it already held can only mean re-entry.
+static LOCK: AtomicBool = AtomicBool::new(false);
+
+fn fatal(msg: &[u8], value: u64) -> ! {
+    crate::serial_write_str(b"[heap] FATAL: ");
+    crate::serial_write_str(msg);
+    crate::serial_write_hex(value);
+    crate::serial_write_str(b"\n");
+    crate::halt();
+}
+
+fn lock() {
+    if LOCK.swap(true, Ordering::Acquire) {
+        fatal(b"allocator re-entered (allocating inside an exception handler?) ", 0);
+    }
+}
+
+fn unlock() {
+    LOCK.store(false, Ordering::Release);
+}
+
+fn align_up(x: usize, align: usize) -> usize {
+    (x + align - 1) & !(align - 1)
+}
+
+/// Bytes a layout actually occupies. Must give the same answer on alloc
+/// and on free, since Rust hands the layout back to dealloc.
+fn block_size(layout: Layout) -> usize {
+    align_up(layout.size().max(BLOCK), BLOCK)
+}
+
+impl Heap {
+    /// First fit: carve `size` bytes at `align` out of the first free block
+    /// that can hold them. Leftover space in front of and behind the
+    /// allocation stays on the list, in address order.
+    unsafe fn take(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+        let mut link: *mut *mut FreeBlock = &mut self.head;
+        while !(*link).is_null() {
+            let block = *link;
+            let start = block as usize;
+            let end = start + (*block).size;
+            let alloc_start = align_up(start, align);
+            let alloc_end = alloc_start + size;
+
+            if alloc_end <= end {
+                let front = alloc_start - start; // a multiple of 16: 0 or a whole block
+                let back = end - alloc_end;
+                let mut rest = (*block).next;
+
+                if back >= BLOCK {
+                    let tail = alloc_end as *mut FreeBlock;
+                    (*tail).size = back;
+                    (*tail).next = rest;
+                    rest = tail;
+                }
+                if front >= BLOCK {
+                    (*block).size = front;
+                    (*block).next = rest;
+                    rest = block;
+                } else {
+                    // The allocation starts where this block's header was:
+                    // clear it, so the caller gets all zeros.
+                    core::ptr::write_bytes(start as *mut u8, 0, BLOCK);
+                }
+                *link = rest;
+                return Some(alloc_start as *mut u8);
+            }
+            link = &mut (*block).next;
+        }
+        None
+    }
+
+    /// Put [start, start + size) on the free list, merging with adjacent
+    /// free blocks. Halts if it overlaps a block that is already free.
+    /// The range's bytes must already be zero.
+    unsafe fn give(&mut self, start: usize, size: usize) {
+        let end = start + size;
+
+        // Find the neighbours: `prev` ends at or before `start`, `next`
+        // begins at or after `end`.
+        let mut prev: *mut FreeBlock = core::ptr::null_mut();
+        let mut next = self.head;
+        while !next.is_null() && (next as usize) < start {
+            prev = next;
+            next = (*next).next;
+        }
+        if !prev.is_null() && prev as usize + (*prev).size > start {
+            fatal(b"double free (inside an already-free block) at ", start as u64);
+        }
+        if !next.is_null() && (next as usize) < end {
+            fatal(b"double free (overlaps an already-free block) at ", start as u64);
+        }
+
+        let block = start as *mut FreeBlock;
+        (*block).size = size;
+        (*block).next = next;
+
+        // Merge with the following block.
+        if !next.is_null() && end == next as usize {
+            (*block).size += (*next).size;
+            (*block).next = (*next).next;
+            core::ptr::write_bytes(next as *mut u8, 0, BLOCK); // its header is now interior
+        }
+
+        // Link from, or merge into, the preceding block.
+        if prev.is_null() {
+            self.head = block;
+        } else if prev as usize + (*prev).size == start {
+            (*prev).size += (*block).size;
+            (*prev).next = (*block).next;
+            core::ptr::write_bytes(block as *mut u8, 0, BLOCK);
+        } else {
+            (*prev).next = block;
+        }
+    }
+
+    /// Map at least `min_bytes` more at the top of the heap and add it to
+    /// the free list. False if the region is full or memory ran out; any
+    /// pages mapped before the failure are released again.
+    unsafe fn grow(&mut self, min_bytes: u64) -> bool {
+        let bytes = (min_bytes.max(GROW_STEP) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        if self.top + bytes > HEAP_BASE + HEAP_MAX {
+            return false;
+        }
+
+        let mut ks = AddressSpace::kernel();
+        let mut mapped = 0;
+        while mapped < bytes {
+            let va = self.top + mapped;
+            let ok = match pmm::alloc_frame() {
+                Some(frame) => {
+                    // pmm frames arrive zeroed, as give() requires.
+                    if ks.map(va, frame as u64, PageFlags::KERNEL_DATA).is_ok() {
+                        true
+                    } else {
+                        pmm::free_frame(frame);
+                        false
+                    }
+                }
+                None => false,
+            };
+            if !ok {
+                // Roll back this growth step.
+                while mapped > 0 {
+                    mapped -= PAGE_SIZE;
+                    if let Ok(frame) = ks.unmap(self.top + mapped) {
+                        pmm::free_frame(frame as usize);
+                    }
+                }
+                return false;
+            }
+            mapped += PAGE_SIZE;
+        }
+
+        let start = self.top as usize;
+        self.top += bytes;
+        self.give(start, bytes as usize);
+        true
+    }
+}
+
+// ===========================================================================
+// GlobalAlloc: what Box, Vec, ... call
+// ===========================================================================
+
+pub struct KernelHeap;
+
+unsafe impl GlobalAlloc for KernelHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        lock();
+        let heap = &mut *(&raw mut HEAP);
+        let size = block_size(layout);
+        let align = layout.align().max(BLOCK);
+
+        let mut result = heap.take(size, align);
+        // Grow by enough to fit even the worst-case alignment padding.
+        if result.is_none() && heap.grow((size + align) as u64) {
+            result = heap.take(size, align);
+        }
+
+        let ptr = match result {
+            Some(p) => {
+                heap.in_use += size as u64;
+                heap.allocations += 1;
+                p
+            }
+            None => core::ptr::null_mut(), // Rust's alloc error path takes over
+        };
+        unlock();
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        lock();
+        let heap = &mut *(&raw mut HEAP);
+        let size = block_size(layout);
+        let start = ptr as u64;
+
+        if start < HEAP_BASE || start + size as u64 > heap.top || start % BLOCK as u64 != 0 {
+            fatal(b"free of a pointer that is not a heap block: ", start);
+        }
+
+        // Sanitise before the memory goes back on the list.
+        core::ptr::write_bytes(ptr, 0, size);
+        heap.give(ptr as usize, size);
+        heap.in_use -= size as u64;
+        heap.frees += 1;
+        unlock();
+    }
+}
+
+#[global_allocator]
+static GLOBAL: KernelHeap = KernelHeap;
+
+// ===========================================================================
+// Stats
+// ===========================================================================
+
+pub struct HeapStats {
+    pub mapped: u64,
+    pub in_use: u64,
+    pub free_blocks: u64,
+    pub largest_free: u64,
+    pub allocations: u64,
+    pub frees: u64,
+}
+
+pub fn stats() -> HeapStats {
+    lock();
+    let heap = unsafe { &*(&raw const HEAP) };
+    let mut free_blocks = 0;
+    let mut largest_free = 0;
+    let mut block = heap.head;
+    while !block.is_null() {
+        unsafe {
+            free_blocks += 1;
+            largest_free = largest_free.max((*block).size as u64);
+            block = (*block).next;
+        }
+    }
+    let stats = HeapStats {
+        mapped: heap.top - HEAP_BASE,
+        in_use: heap.in_use,
+        free_blocks,
+        largest_free,
+        allocations: heap.allocations,
+        frees: heap.frees,
+    };
+    unlock();
+    stats
+}
+
+// ===========================================================================
+// Self-test
+// ===========================================================================
+
+/// Exercise the heap through the same types kernel code will use.
+///
+/// The raw-allocation checks call GLOBAL (this allocator) directly rather
+/// than alloc::alloc::alloc. LLVM treats the latter as a known allocation
+/// function and may delete an allocation that is freed without being used,
+/// which would let a check pass without ever reaching this code.
+pub fn selftest() -> bool {
+    use alloc::boxed::Box;
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use crate::selftest::check;
+
+    let mut ok = true;
+    let in_heap = |p: u64| (HEAP_BASE..HEAP_BASE + HEAP_MAX).contains(&p);
+
+    // 1. Box: a value lands in the heap region and reads back.
+    {
+        let b = Box::new(0xF4E7_A0u64);
+        let addr = &*b as *const u64 as u64;
+        ok &= check(b"heap", b"Box<u64> lives in the heap region and reads back", in_heap(addr) && *b == 0xF4E7_A0);
+    }
+
+    // 2. Fresh allocations are zeroed (the sanitising invariant).
+    unsafe {
+        let layout = Layout::from_size_align(256, 16).unwrap();
+        let p = GLOBAL.alloc(layout);
+        let zeroed = !p.is_null() && (0..256).all(|i| p.add(i).read_volatile() == 0);
+        if !p.is_null() {
+            GLOBAL.dealloc(p, layout);
+        }
+        ok &= check(b"heap", b"a fresh 256-byte allocation is all zeros", zeroed);
+    }
+
+    // 3. Over-aligned allocation.
+    unsafe {
+        let layout = Layout::from_size_align(64, 4096).unwrap();
+        let p = GLOBAL.alloc(layout);
+        let aligned = !p.is_null() && p as u64 % 4096 == 0;
+        if !p.is_null() {
+            GLOBAL.dealloc(p, layout);
+        }
+        ok &= check(b"heap", b"a 4096-aligned allocation is 4096-aligned", aligned);
+    }
+
+    // 4. Vec growth past one growth step: forces heap growth and realloc.
+    {
+        let mut v: Vec<u64> = Vec::new();
+        for i in 0..20_000u64 {
+            v.push(i);
+        }
+        let sum: u64 = v.iter().sum();
+        ok &= check(b"heap", b"Vec<u64> of 20,000 (160 KiB, grows the heap) sums correctly",
+                    v.len() == 20_000 && sum == 20_000 * 19_999 / 2);
+    }
+
+    // 5. String.
+    {
+        let mut text = String::new();
+        for _ in 0..100 {
+            text.push_str("FreyaOS ");
+        }
+        ok &= check(b"heap", b"String built from 100 pieces has the right length and content",
+                    text.len() == 800 && text.starts_with("FreyaOS FreyaOS") && text.ends_with("FreyaOS "));
+    }
+
+    // 6. BTreeMap: many small allocations and frees in mixed order.
+    {
+        let mut map = BTreeMap::new();
+        for k in 0..2_000u32 {
+            map.insert(k, k * 3);
+        }
+        let lookups_ok = (0..2_000u32).all(|k| map.get(&k) == Some(&(k * 3)));
+        map.retain(|k, _| k % 2 == 1);
+        ok &= check(b"heap", b"BTreeMap with 2,000 entries: lookups, then removing half",
+                    lookups_ok && map.len() == 1_000 && map.get(&2).is_none() && map.get(&3) == Some(&9));
+    }
+
+    // 7. Freed memory is zeroed straight away (past the 16-byte header the
+    //    free list keeps in place).
+    unsafe {
+        let layout = Layout::from_size_align(128, 16).unwrap();
+        let p = GLOBAL.alloc(layout);
+        let cleared = if p.is_null() {
+            false
+        } else {
+            core::ptr::write_bytes(p, 0xAA, 128);
+            GLOBAL.dealloc(p, layout);
+            // Still mapped: the heap never unmaps. Reading it here is the
+            // test, not something kernel code may do.
+            (BLOCK..128).all(|i| core::ptr::read_volatile(p.add(i)) == 0)
+        };
+        ok &= check(b"heap", b"freed memory is zeroed immediately", cleared);
+    }
+
+    // 8. Everything above was dropped: nothing in use, and every free
+    //    block merged back into one.
+    let st = stats();
+    ok &= check(b"heap", b"after all tests: 0 bytes in use, free space merged into 1 block",
+                st.in_use == 0 && st.free_blocks == 1 && st.largest_free == st.mapped);
+
+    crate::serial_write_str(b"[heap] region ");
+    crate::serial_write_hex(HEAP_BASE);
+    crate::serial_write_str(b": ");
+    crate::serial_write_u64(st.mapped / 1024);
+    crate::serial_write_str(b" KiB mapped, ");
+    crate::serial_write_u64(st.allocations);
+    crate::serial_write_str(b" allocations, ");
+    crate::serial_write_u64(st.frees);
+    crate::serial_write_str(b" frees\n");
+
+    ok
+}
+
+/// Demo (halts): free the same allocation twice. Calls GLOBAL directly:
+/// through alloc::alloc, LLVM may delete this unused alloc/free pair
+/// entirely, and the double free never reaches the allocator.
+pub fn demo_double_free() {
+    unsafe {
+        let layout = Layout::from_size_align(64, 16).unwrap();
+        let p = GLOBAL.alloc(layout);
+        GLOBAL.dealloc(p, layout);
+        GLOBAL.dealloc(p, layout);
+    }
+}

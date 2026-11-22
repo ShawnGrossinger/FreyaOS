@@ -1,14 +1,18 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc; // Box, Vec, String, BTreeMap, backed by heap.rs
+
 use core::panic::PanicInfo;
 
 mod boot;
 mod disk_io;
 mod gdt;
+mod heap;
 mod idt;
 mod paging;
 mod pmm;
+mod selftest;
 mod vmm;
 
 use boot::read_e820_map;
@@ -211,18 +215,8 @@ pub extern "C" fn rust_start() -> ! {
     serial_write_hex(paging::STACK_GUARD_PAGE);
     serial_write_str(b"\n");
 
-    let selftest_ok = idt::selftest_breakpoint();
-    if selftest_ok {
-        serial_write_str(b"[idt] int3 self-test: PASS (handler returned, registers intact)\n");
-    } else {
-        serial_write_str(b"[idt] int3 self-test: FAIL\n");
-    }
-
-    // Fault-reporting demos. Uncomment ONE at a time: each one halts the
-    // kernel with a full report on serial and a summary on screen.
-    // unsafe { core::arch::asm!("ud2"); }                             // #UD, vector 6
-    // unsafe { core::ptr::read_volatile(0x1000_0000 as *const u8); } // #PF, vector 14, CR2=0x10000000
-    // demo_stack_overflow(0);                                         // #DF on IST1, guard page hit
+    let int3_ok = idt::selftest_breakpoint();
+    let int3_ok = selftest::check(b"idt", b"int3 handler returns with registers intact", int3_ok);
 
     // --- Read E820 memory map left by stage2 ---
     let e820 = unsafe { read_e820_map() };
@@ -297,14 +291,8 @@ pub extern "C" fn rust_start() -> ! {
     // --- Page mapping API: map/unmap/translate 4 KiB pages ---
     let vmm_ok = unsafe { vmm::selftest() };
 
-    // Fault demos for the mapping API (each halts):
-    // unsafe { vmm::demo_use_after_unmap(); }  // #PF, not present
-    // unsafe { vmm::demo_write_read_only(); }  // #PF, protection violation on write
-
-    // Fault demo for the physical map (halts): jump to the kernel's own
-    // code through its physical-map alias. NX makes that an instruction-
-    // fetch page fault even though the bytes are valid code.
-    // unsafe { let f: extern "C" fn() = core::mem::transmute(paging::phys_to_virt(0x10_0000)); f(); }
+    // --- Kernel heap: Box, Vec, String, BTreeMap ---
+    let heap_ok = heap::selftest();
 
     // --- Smoke-test: allocate a frame and verify it is zeroed ---
     let sanitize_ok = match unsafe { pmm::alloc_frame() } {
@@ -322,21 +310,12 @@ pub extern "C" fn rust_start() -> ! {
             };
 
             let all_zero = slice.iter().all(|&b| b == 0);
+            unsafe { pmm::free_frame(phys) };
 
-            if all_zero {
-
-                serial_write_str(b"[kernel] sanitize check: PASS\n");
-            } else {
-
-                serial_write_str(b"[kernel] sanitize check: FAIL - frame not zeroed!\n");
-            }
-            all_zero
+            selftest::check(b"kernel", b"a freshly allocated frame is all zeros", all_zero)
         }
 
-        None => {
-                serial_write_str(b"[kernel] FATAL: alloc_frame returned None\n");
-                false
-        }
+        None => selftest::check(b"kernel", b"alloc_frame returned a frame", false),
     };
 
     // --- VGA status display (screen was cleared at entry) ---
@@ -344,22 +323,119 @@ pub extern "C" fn rust_start() -> ! {
     // report, so reaching this point means they passed.
     vga_status(0, b"FreyaOS kernel:  ", true);
     vga_status(1, b"Segments + TSS:  ", true);
-    vga_status(2, b"Exception table: ", selftest_ok);
+    vga_status(2, b"Exception table: ", int3_ok);
     vga_status(3, b"Page tables:     ", true);
     vga_status(4, b"Memory map:      ", true);
     vga_status(5, b"Frame allocator: ", pmm_ok);
     vga_status(6, b"Physical map:    ", physmap_ok);
     vga_status(7, b"Page mapping:    ", vmm_ok);
-    vga_status(8, b"Sanitise check:  ", sanitize_ok);
+    vga_status(8, b"Kernel heap:     ", heap_ok);
+    vga_status(9, b"Sanitise check:  ", sanitize_ok);
 
-    if selftest_ok && pmm_ok && physmap_ok && vmm_ok && sanitize_ok {
-        vga_print(9, b"--- FreyaOS foundation ready ---", 0x0F);
+    // --- One line that says whether everything is up ---
+    let all_ok = selftest::summary();
+    let (passed, failed) = selftest::counts();
+    vga_summary(10, passed, failed);
+
+    // Build-time fault demo, if one was requested (halts).
+    run_requested_demo();
+
+    if all_ok {
+        vga_print(11, b"--- FreyaOS foundation ready ---", 0x0F);
         serial_write_str(b"[kernel] init complete - halting\n");
     } else {
-        vga_print(9, b"--- SELF-TEST FAILURE: see serial log ---", 0x0C);
+        vga_print(11, b"--- SELF-TEST FAILURE: see serial log ---", 0x0C);
         serial_write_str(b"[kernel] init complete WITH FAILURES - halting\n");
     }
     halt();
+}
+
+/// "Self-tests:      N passed, M failed", green if none failed.
+fn vga_summary(row: usize, passed: u32, failed: u32) {
+    let mut line = [b' '; 80];
+    let mut len = 0;
+    let mut put = |bytes: &[u8]| {
+        for &b in bytes {
+            if len < line.len() {
+                line[len] = b;
+                len += 1;
+            }
+        }
+    };
+    let digits = |mut n: u32| {
+        let mut buf = [0u8; 10];
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 || i == 0 {
+                break;
+            }
+        }
+        buf
+    };
+    let p = digits(passed);
+    let f = digits(failed);
+    put(b"Self-tests:      ");
+    put(trim_leading_zeros(&p));
+    put(b" passed, ");
+    put(trim_leading_zeros(&f));
+    put(b" failed");
+    let attr = if failed == 0 { 0x0A } else { 0x0C };
+    vga_print(row, &line[..len.min(line.len())], attr);
+}
+
+fn trim_leading_zeros(digits: &[u8]) -> &[u8] {
+    let first = digits.iter().position(|&d| d != 0).unwrap_or(digits.len() - 1);
+    &digits[first..]
+}
+
+/// Fault demos, chosen at build time:  FREYA_DEMO=<name> make run
+/// `make test` builds each one and checks the report it produces.
+fn run_requested_demo() {
+    let demo = match option_env!("FREYA_DEMO") {
+        Some(d) if !d.is_empty() => d,
+        _ => return,
+    };
+    serial_write_str(b"[demo] FREYA_DEMO=");
+    serial_write_str(demo.as_bytes());
+    serial_write_str(b"\n");
+
+    unsafe {
+        match demo {
+            // #UD, vector 6
+            "ud2" => core::arch::asm!("ud2"),
+            // #PF, not present: above everything that is mapped
+            "page_fault" => {
+                core::ptr::read_volatile(0x1000_0000 as *const u8);
+            }
+            // #DF on IST1 after the stack hits its guard page
+            "stack_overflow" => {
+                demo_stack_overflow(0);
+            }
+            // #PF, instruction fetch: kernel code through its no-execute
+            // physical-map alias
+            "nx" => {
+                let f: extern "C" fn() = core::mem::transmute(paging::phys_to_virt(0x10_0000));
+                f();
+            }
+            // #PF, not present: used, unmapped, used again
+            "use_after_unmap" => vmm::demo_use_after_unmap(),
+            // #PF, protection violation on a write
+            "write_read_only" => vmm::demo_write_read_only(),
+            // [heap] FATAL: double free
+            "heap_double_free" => heap::demo_double_free(),
+            // [kernel] PANIC with file and line
+            "panic" => panic!("FREYA_DEMO=panic"),
+            _ => {
+                serial_write_str(b"[demo] unknown; known: ud2 page_fault stack_overflow nx \
+                                   use_after_unmap write_read_only heap_double_free panic\n");
+                return;
+            }
+        }
+    }
+    serial_write_str(b"[demo] returned without faulting\n");
 }
 
 /// One status row: label followed by OK (green) or FAIL (red).
@@ -381,7 +457,6 @@ fn vga_status(row: usize, label: &[u8], ok: bool) {
 /// Each frame keeps a 512-byte buffer alive so the 64 KiB stack is used up
 /// in ~120 calls. black_box stops the compiler from turning the recursion
 /// into a loop or deleting the buffer.
-#[allow(dead_code)]
 #[inline(never)]
 fn demo_stack_overflow(depth: u64) -> u64 {
     let buf = [depth; 64];
@@ -402,7 +477,21 @@ fn halt() -> ! {
 
 #[cfg(not(test))]
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    serial_write_str(b"[kernel] PANIC\n");
+fn panic(info: &PanicInfo) -> ! {
+    // File, line and (for messages without {} arguments) the text. Printed
+    // without core::fmt, which would add ~10 KiB to the kernel.
+    serial_write_str(b"\n[kernel] PANIC");
+    if let Some(location) = info.location() {
+        serial_write_str(b" at ");
+        serial_write_str(location.file().as_bytes());
+        serial_write_str(b":");
+        serial_write_u64(location.line() as u64);
+    }
+    if let Some(message) = info.message().as_str() {
+        serial_write_str(b": ");
+        serial_write_str(message.as_bytes());
+    }
+    serial_write_str(b"\n");
+    vga_print(20, b"!! KERNEL PANIC - file and line on COM1", 0x4F);
     halt();
 }

@@ -367,7 +367,8 @@ pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
     dec(pmm.free);
     s(b") matches bitmap recount (");
     dec(counted);
-    s(if count_ok { b"): PASS\n" } else { b"): FAIL\n" });
+    s(b")");
+    crate::selftest::verdict(count_ok);
 
     let mut last = 0u64;
     for (base, end) in e820.iter().filter_map(usable) {
@@ -379,7 +380,8 @@ pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
     let top_ok = pmm.is_free(last / PAGE_SIZE);
     s(b"[pmm] self-test last usable frame ");
     hex(last);
-    s(if top_ok { b" is tracked and free: PASS\n" } else { b" NOT tracked or not free: FAIL\n" });
+    s(b" is tracked and free");
+    crate::selftest::verdict(top_ok);
 
     let before = free_frames();
     let round_trip_ok = match alloc_frame() {
@@ -397,8 +399,8 @@ pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
         }
         None => false,
     };
-    s(b"[pmm] self-test alloc/free/alloc round trip: ");
-    s(if round_trip_ok { b"PASS\n" } else { b"FAIL\n" });
+    s(b"[pmm] self-test alloc/free/alloc returns the same frame, counter tracks it");
+    crate::selftest::verdict(round_trip_ok);
 
     count_ok && top_ok && round_trip_ok
 }
