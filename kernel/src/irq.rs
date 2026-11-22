@@ -14,17 +14,23 @@
 //!     interrupts, so one that fires while the driver is busy isn't lost.
 //!
 //! Lines 0-15 are the ISA interrupts (keyboard = 1, ...). Each has its own
-//! vector, VECTOR_BASE + line; Phase 5 routes the real devices onto them
-//! through the I/O APIC, which then also masks a line until it is acked.
+//! vector, VECTOR_BASE + line. The I/O APIC (found through the ACPI MADT,
+//! acpi.rs) carries the real devices there: every input starts masked, and
+//! an ISA line is unmasked when a driver first waits on it. A level-
+//! triggered line is masked again from each interrupt until the driver
+//! acks it (otherwise it would fire again at once, forever); an edge-
+//! triggered one stays open, and the per-line count keeps any interrupt
+//! that arrives while the driver is busy.
+//!
 //! Line 16 is a test line with no device behind it: the kernel raises it
 //! by sending itself an interrupt through the local APIC, so the whole
-//! path from interrupt to user-space driver can be tested today.
+//! path from interrupt to user-space driver can be tested without one.
 
 use crate::cap::Cap;
 use crate::cpu::without_interrupts;
 use crate::sched::{self, State};
 use crate::syscall::{ERR_BAD_ARGUMENT, ERR_WRONG_CAPABILITY};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub const LINES: usize = 17;
 pub const TEST_LINE: u8 = 16;
@@ -36,9 +42,118 @@ pub const VECTOR_BASE: u8 = 0x40;
 static PENDING: [AtomicU32; LINES] = [const { AtomicU32::new(0) }; LINES];
 static TOTAL: AtomicU32 = AtomicU32::new(0);
 
+// ===========================================================================
+// The I/O APIC
+// ===========================================================================
+
+const ISA_LINES: usize = 16;
+const NOT_ROUTED: u32 = u32::MAX;
+const IOAPIC_MASKED: u32 = 1 << 16;
+const IOAPIC_LEVEL: u32 = 1 << 15;
+const IOAPIC_ACTIVE_LOW: u32 = 1 << 13;
+
+/// Virtual address of the I/O APIC's two registers (0 = none found).
+static IOAPIC: AtomicU64 = AtomicU64::new(0);
+/// Which I/O APIC input each ISA line is wired to.
+static INPUT: [AtomicU32; ISA_LINES] = [const { AtomicU32::new(NOT_ROUTED) }; ISA_LINES];
+static LEVEL: [AtomicBool; ISA_LINES] = [const { AtomicBool::new(false) }; ISA_LINES];
+
+fn ioapic_read(reg: u32) -> u32 {
+    let base = IOAPIC.load(Ordering::Relaxed);
+    unsafe {
+        ((base) as *mut u32).write_volatile(reg); // IOREGSEL
+        ((base + 0x10) as *const u32).read_volatile() // IOWIN
+    }
+}
+
+fn ioapic_write(reg: u32, value: u32) {
+    let base = IOAPIC.load(Ordering::Relaxed);
+    unsafe {
+        (base as *mut u32).write_volatile(reg);
+        ((base + 0x10) as *mut u32).write_volatile(value);
+    }
+}
+
+pub struct IoApicSetup {
+    pub version: u32,
+    pub inputs: u32,
+    pub routed: u32,
+}
+
+/// Mask every input, then wire each ISA line to its vector (still masked),
+/// with the polarity and trigger the MADT gives. Interrupts go to this CPU.
+pub fn init_ioapic(info: &crate::acpi::Info) -> Result<IoApicSetup, &'static [u8]> {
+    let io = info.ioapic.ok_or(&b"no I/O APIC in the ACPI MADT"[..])?;
+    let va = unsafe { crate::vmm::map_mmio(io.phys, 0x20) }.map_err(|_| &b"could not map the I/O APIC"[..])?;
+    IOAPIC.store(va, Ordering::Relaxed);
+    let version_reg = ioapic_read(1);
+    let inputs = ((version_reg >> 16) & 0xFF) + 1;
+    for i in 0..inputs {
+        ioapic_write(0x10 + 2 * i, IOAPIC_MASKED);
+        ioapic_write(0x11 + 2 * i, 0);
+    }
+    // Overridden lines first: an override can move ISA line m onto input n
+    // (e.g. the old timer, line 0, onto input 2), and then line n must not
+    // take input n too.
+    let destination = (crate::apic::id() as u32) << 24;
+    let mut claimed = 0u64;
+    let mut routed = 0;
+    for overridden in [true, false] {
+        for (line, route) in info.isa.iter().enumerate() {
+            if (route.gsi != line as u32) != overridden || route.gsi < io.gsi_base {
+                continue;
+            }
+            let input = route.gsi - io.gsi_base;
+            if input >= inputs || input >= 64 || claimed & (1 << input) != 0 {
+                continue;
+            }
+            claimed |= 1 << input;
+            let low = (VECTOR_BASE as u32 + line as u32)
+                | if route.active_low { IOAPIC_ACTIVE_LOW } else { 0 }
+                | if route.level { IOAPIC_LEVEL } else { 0 }
+                | IOAPIC_MASKED;
+            ioapic_write(0x11 + 2 * input, destination);
+            ioapic_write(0x10 + 2 * input, low);
+            INPUT[line].store(input, Ordering::Relaxed);
+            LEVEL[line].store(route.level, Ordering::Relaxed);
+            routed += 1;
+        }
+    }
+    Ok(IoApicSetup { version: version_reg & 0xFF, inputs, routed })
+}
+
+/// Mask or unmask ISA line `line` at the I/O APIC (no-op if not routed).
+fn set_masked(line: u8, masked: bool) {
+    let Some(input) = INPUT.get(line as usize).map(|i| i.load(Ordering::Relaxed)) else { return };
+    if input == NOT_ROUTED || IOAPIC.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    crate::cpu::without_interrupts(|| {
+        let low = ioapic_read(0x10 + 2 * input);
+        ioapic_write(0x10 + 2 * input, if masked { low | IOAPIC_MASKED } else { low & !IOAPIC_MASKED });
+    });
+}
+
+/// The redirection entry (low half) for ISA line `line`, for the self-test.
+pub fn entry_of(line: u8) -> Option<(u32, u32)> {
+    let input = INPUT.get(line as usize)?.load(Ordering::Relaxed);
+    (input != NOT_ROUTED && IOAPIC.load(Ordering::Relaxed) != 0).then(|| (input, ioapic_read(0x10 + 2 * input)))
+}
+
+fn is_level(line: u8) -> bool {
+    LEVEL.get(line as usize).is_some_and(|l| l.load(Ordering::Relaxed))
+}
+
+fn is_routed_or_test(line: u8) -> bool {
+    line == TEST_LINE || INPUT.get(line as usize).is_some_and(|i| i.load(Ordering::Relaxed) != NOT_ROUTED)
+}
+
 /// interrupt_dispatch, for vectors VECTOR_BASE..VECTOR_BASE + LINES.
 /// Interrupt context: count it, acknowledge it, wake the driver.
 pub fn on_interrupt(line: u8) {
+    if is_level(line) {
+        set_masked(line, true); // until the driver acks it
+    }
     PENDING[line as usize].fetch_add(1, Ordering::Relaxed);
     TOTAL.fetch_add(1, Ordering::Relaxed);
     crate::apic::end_of_interrupt();
@@ -75,6 +190,10 @@ pub fn wait(slot: u64) -> i64 {
         Ok(l) => l,
         Err(e) => return e,
     };
+    if !is_routed_or_test(line) {
+        return ERR_BAD_ARGUMENT; // no such line on this machine
+    }
+    set_masked(line, false); // a driver is waiting: let it through
     without_interrupts(|| unsafe {
         loop {
             let pending = &PENDING[line as usize];
@@ -92,11 +211,16 @@ pub fn wait(slot: u64) -> i64 {
     })
 }
 
-/// irq_ack(slot): the driver has handled the line. Nothing to unmask yet
-/// (the test line has no device); Phase 5's I/O APIC unmasks it here.
+/// irq_ack(slot): the driver has handled the line; a level-triggered one is
+/// unmasked again.
 pub fn ack(slot: u64) -> i64 {
     match line_cap(slot) {
-        Ok(_) => 0,
+        Ok(line) => {
+            if is_level(line) {
+                set_masked(line, false);
+            }
+            0
+        }
         Err(e) => e,
     }
 }
@@ -163,6 +287,7 @@ const READ_CLOCK: u64 = 0;
 const OUTSIDE_RANGE: u64 = 1;
 const IRQ_LOOP: u64 = 2;
 const MISUSE: u64 = 3;
+const POWER_UNKNOWN: u64 = 4;
 
 const CMOS: Cap = Cap::IoPorts { base: 0x70, count: 2 };
 const TEST_IRQ: Cap = Cap::Irq { line: TEST_LINE };
@@ -193,9 +318,17 @@ pub fn selftest() -> bool {
     let misuse = run(MISUSE, CMOS, TEST_IRQ);
     ok &= check(
         b"driver",
-        b"the keyboard port with a CMOS capability, no capability, the wrong kind, a bad width: all refused",
+        b"the keyboard port with a CMOS capability, no capability, the wrong kind, a bad width, the power switch without a Power capability: all refused",
         outside == Some(ExitStatus::Code(WRONG as u64)) && none == Some(ExitStatus::Code(WRONG as u64))
             && misuse == Some(ExitStatus::Code(0)),
+    );
+    // The Power capability itself, asked for an action that doesn't exist
+    // (so this test can never restart or switch off the machine it runs on).
+    let unknown = run(POWER_UNKNOWN, Cap::Power, Cap::None);
+    ok &= check(
+        b"driver",
+        b"a Power capability asked for an action that doesn't exist: refused as a bad argument",
+        unknown == Some(ExitStatus::Code(ERR_BAD_ARGUMENT as u64)),
     );
 
     // 3. An interrupt line delivered to a user-space driver, 10 times. The
@@ -223,4 +356,32 @@ pub fn selftest() -> bool {
     ok &= verdict(handled == Some(ExitStatus::Code(10)) && PENDING[TEST_LINE as usize].load(Ordering::Relaxed) == 0);
 
     ok
+}
+
+/// After init_ioapic: the hardware says what we told it.
+pub fn selftest_ioapic(setup: &IoApicSetup) -> bool {
+    use crate::{serial_write_hex as hex, serial_write_str as s, serial_write_u64 as dec};
+    s(b"[ioapic] self-test I/O APIC version ");
+    hex(setup.version as u64);
+    s(b", ");
+    dec(setup.inputs as u64);
+    s(b" inputs, all masked, ");
+    dec(setup.routed as u64);
+    s(b" ISA lines wired; keyboard (line 1) on input ");
+    let expected = VECTOR_BASE as u32 + 1;
+    let keyboard_ok = match entry_of(1) {
+        Some((input, low)) => {
+            dec(input as u64);
+            s(b" as vector ");
+            hex((low & 0xFF) as u64);
+            s(if low & IOAPIC_LEVEL != 0 { b", level" } else { b", edge" });
+            s(if low & IOAPIC_ACTIVE_LOW != 0 { b", active low" } else { b", active high" });
+            low & 0xFF == expected && low & IOAPIC_MASKED != 0
+        }
+        None => {
+            s(b"(not wired)");
+            false
+        }
+    };
+    verdict(setup.version >= 0x11 && setup.inputs >= 16 && setup.routed >= 15 && keyboard_ok)
 }

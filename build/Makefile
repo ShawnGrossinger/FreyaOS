@@ -29,7 +29,7 @@ STAGE2    := $(OUTDIR)/stage2.bin
 KERNELELF := $(OUTDIR)/kernel.elf
 KERNELBIN := $(OUTDIR)/kernel.bin
 
-.PHONY: all clean run trace debug test
+.PHONY: all clean run trace debug test rehearse usb
 
 all: $(IMG)
 
@@ -103,19 +103,26 @@ $(STAGE2): $(BOOTDIR)/stage2.asm $(STAGE2PRE) $(KERNELBIN) | $(OUTDIR)
 	  exit 1; \
 	fi
 
-# Stage1 final build: needs the final Stage2 sector count.
-$(STAGE1): $(BOOTDIR)/stage1.asm $(STAGE2) | $(OUTDIR)
+# Stage1 final build: needs the final Stage2 sector count, and the whole
+# image's size for its partition table.
+$(STAGE1): $(BOOTDIR)/stage1.asm $(STAGE2) $(KERNELBIN) | $(OUTDIR)
 	@STAGE2_SIZE=$$(stat -c%s $(STAGE2)); \
 	STAGE2_SECTORS=$$(( ($$STAGE2_SIZE + $(SECTOR) - 1)/$(SECTOR) )); \
-	echo "[stage1] assembling with __STAGE2_SECTORS=$$STAGE2_SECTORS"; \
-	$(NASM) -f bin -D__STAGE2_SECTORS=$$STAGE2_SECTORS $(BOOTDIR)/stage1.asm -o $(STAGE1)
+	KERNEL_SECTORS=$$(( ($$(stat -c%s $(KERNELBIN)) + $(SECTOR) - 1)/$(SECTOR) )); \
+	IMAGE_SECTORS=$$(( (1 + $$STAGE2_SECTORS + $$KERNEL_SECTORS + 2047) / 2048 * 2048 )); \
+	echo "[stage1] assembling with __STAGE2_SECTORS=$$STAGE2_SECTORS __IMAGE_SECTORS=$$IMAGE_SECTORS"; \
+	$(NASM) -f bin -D__STAGE2_SECTORS=$$STAGE2_SECTORS -D__IMAGE_SECTORS=$$IMAGE_SECTORS $(BOOTDIR)/stage1.asm -o $(STAGE1)
 
 # -------------------------
 # Image
 # -------------------------
 
+# Padded to a whole MiB, the size the partition table in stage1 claims.
+# (Some BIOS disk paths, QEMU's q35 AHCI among them, refuse a disk of a
+# few hundred sectors; a USB stick is always far bigger anyway.)
 $(IMG): $(STAGE1) $(STAGE2) $(KERNELBIN) | $(OUTDIR)
 	cat $(STAGE1) $(STAGE2) $(KERNELBIN) > $(IMG)
+	truncate -s %1M $(IMG)
 	@echo "Built: $(IMG)"
 
 # Run in QEMU.
@@ -167,6 +174,25 @@ debug: $(IMG)
 	  -no-reboot \
 	  -no-shutdown \
 	  -s -S
+
+# Boot the image the way the ThinkPad T430 will see it: from a USB stick
+# (EHCI), Ivy Bridge CPU, q35 chipset, no serial port. Ctrl+Alt+Del really
+# restarts and Ctrl+Alt+End closes the window, as on the laptop, so the keys
+# can be practised here first. snapshot=on: the image file is never changed.
+rehearse: $(IMG)
+	qemu-system-x86_64 \
+	  -machine q35 -cpu IvyBridge -m 2G \
+	  -drive if=none,id=stick,format=raw,file=$(IMG),snapshot=on \
+	  -device usb-ehci,id=ehci \
+	  -device usb-storage,bus=ehci.0,drive=stick,bootindex=0 \
+	  -serial none $(REHEARSE_ARGS)
+
+# Write the image to a USB stick: make usb DEV=/dev/sdX (see write-usb.sh,
+# which refuses anything that isn't an unmounted USB disk and asks first).
+usb: $(IMG)
+	@[ -n "$(DEV)" ] || { echo "usage: make usb DEV=/dev/sdX"; ./write-usb.sh --list; exit 2; }
+	@[ -z "$(FREYA_DEMO)" ] || { echo "FREYA_DEMO=$(FREYA_DEMO) is set: that image crashes on purpose. Unset it first."; exit 2; }
+	./write-usb.sh $(IMG) $(DEV)
 
 # Build and boot every test case headless, check each one's output, and
 # print a summary. Non-zero exit if anything failed. See test.sh.

@@ -94,7 +94,7 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 /// Busy-wait `ms` milliseconds (at most 54) on PIT channel 2, by polling.
 /// Channel 2 is the one whose gate and output are visible in port 0x61, so
 /// it can be timed without taking a single interrupt.
-fn pit_wait_ms(ms: u64) {
+pub(crate) fn pit_wait_ms(ms: u64) {
     let count = (PIT_HZ * ms / 1000) as u16;
     unsafe {
         // Gate on (bit 0), speaker data off (bit 1).
@@ -173,6 +173,11 @@ pub fn on_timer() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     write(REG_EOI, 0);
     crate::sched::on_tick();
+}
+
+/// This CPU's local APIC id (where the I/O APIC should send interrupts).
+pub fn id() -> u8 {
+    (read(REG_ID) >> 24) as u8
 }
 
 /// End-Of-Interrupt for any other interrupt handled through the local APIC.

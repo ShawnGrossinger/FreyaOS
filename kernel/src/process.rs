@@ -63,6 +63,12 @@ pub static DRIVER: Program = Program {
     image: include_bytes!(concat!(env!("OUT_DIR"), "/driver.bin")),
 };
 
+/// The PS/2 keyboard driver (user/keyboard.asm).
+pub static KEYBOARD: Program = Program {
+    name: "keyboard",
+    image: include_bytes!(concat!(env!("OUT_DIR"), "/keyboard.bin")),
+};
+
 /// Test program: its argument picks one thing to try (user/probe.asm).
 pub static PROBE: Program = Program {
     name: "probe",

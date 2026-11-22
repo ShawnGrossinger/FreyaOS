@@ -23,6 +23,10 @@ SYS_PORT_IN  equ 7                  ; port_in(ports, port, width): value
 SYS_PORT_OUT equ 8                  ; port_out(ports, port, width, value)
 SYS_IRQ_WAIT equ 9                  ; irq_wait(irq): returns once the line has fired
 SYS_IRQ_ACK  equ 10                 ; irq_ack(irq)
+SYS_POWER    equ 11                 ; power(cap, action): never returns if allowed
+
+POWER_RESTART  equ 0
+POWER_SHUTDOWN equ 1
 
 ; Message words go in RSI, RDX, R10, R8; R9 = slot of a capability to pass
 ; along, or NO_CAP.

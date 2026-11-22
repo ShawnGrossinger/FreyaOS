@@ -403,20 +403,31 @@ print_string:
     popa
     ret
 
-; serial_putc: write AL to COM1
+; serial_putc: write AL to COM1. Does nothing if serial_init found no UART
+; (the T430 has none), and never waits forever for one that doesn't answer.
 serial_putc:
+    cmp byte [serial_present], 0
+    je .absent
     push dx
+    push cx
     mov ah, al
+    mov cx, 0xFFFF
 .wait:
     mov dx, COM1_BASE + 5
     in al, dx
     test al, 0x20
-    jz .wait
+    jnz .ready
+    loop .wait
+.ready:
     mov dx, COM1_BASE
     mov al, ah
     out dx, al
+    pop cx
     pop dx
+.absent:
     ret
+
+serial_present db 0
 
 ; serial_write_string: prints 0-terminated string DS:SI
 serial_write_string:
@@ -468,6 +479,21 @@ serial_write_hex_byte:
 ; serial_init: configure COM1 for 38400 8N1
 serial_init:
     pusha
+    ; Is there a UART at all? Its scratch register (base + 7) keeps
+    ; whatever is written to it; an empty port reads back 0xFF (or 0x00).
+    mov dx, COM1_BASE + 7
+    mov al, 0xA5
+    out dx, al
+    in al, dx
+    cmp al, 0xA5
+    jne .none
+    mov al, 0x5A
+    out dx, al
+    in al, dx
+    cmp al, 0x5A
+    jne .none
+    mov byte [serial_present], 1
+
     mov dx, COM1_BASE + 1
     mov al, 0x00
     out dx, al
@@ -496,6 +522,7 @@ serial_init:
     mov al, 0x0B          ; IRQs enabled, RTS/DSR   
     out dx, al
 
+.none:
     popa
     ret
 

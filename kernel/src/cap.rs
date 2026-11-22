@@ -17,6 +17,7 @@
 //!   - IoPorts: may read and write the I/O ports [base, base + count): what
 //!     a user-space driver needs to talk to its device.
 //!   - Irq: may wait for (and acknowledge) one interrupt line.
+//!   - Power: may restart or switch off the machine.
 //!
 //! Capabilities are values; copying one into another table (spawn, or a
 //! transfer in a message) copies the authority. Endpoints are reference
@@ -37,6 +38,8 @@ pub enum Cap {
     Endpoint { ep: u8, badge: u64, rights: u8 },
     IoPorts { base: u16, count: u16 },
     Irq { line: u8 },
+    /// May restart or switch off the machine (power.rs).
+    Power,
 }
 
 pub type Caps = [Cap; MAX_CAPS];

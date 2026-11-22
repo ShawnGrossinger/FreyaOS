@@ -27,7 +27,10 @@ table:
     dq outside_range            ; 1: a port the capability doesn't cover
     dq irq_loop                 ; 2: handle 10 interrupts on the line in slot 1
     dq misuse                   ; 3: wrong capability kinds, bad widths
+    dq power_unknown            ; 4: the power switch with an action that doesn't exist
 table_end:
+
+POWER_NO_SUCH_ACTION equ 2      ; never valid, so a broken check can't switch anything off
 
 ; --- 0: the real-time clock -------------------------------------------------
 ; Wait while the clock is mid-update (status A bit 7), then read seconds.
@@ -123,8 +126,30 @@ misuse:
     syscall
     cmp rax, ERR_WRONG_CAPABILITY
     jne bad
+    mov eax, SYS_POWER          ; the power switch through a port capability
+    mov edi, PORTS
+    mov esi, POWER_NO_SUCH_ACTION
+    syscall
+    cmp rax, ERR_WRONG_CAPABILITY
+    jne bad
+    mov eax, SYS_POWER          ; ... and through an empty slot
+    mov edi, 9
+    mov esi, POWER_NO_SUCH_ACTION
+    syscall
+    cmp rax, ERR_WRONG_CAPABILITY
+    jne bad
     xor edi, edi
     jmp exit
+
+; --- 4: an unknown power action -----------------------------------------------
+; Slot 0 holds the Power capability here. The action doesn't exist, so the
+; kernel must refuse it as a bad argument (not as a missing capability).
+power_unknown:
+    mov eax, SYS_POWER
+    xor edi, edi
+    mov esi, POWER_NO_SUCH_ACTION
+    syscall
+    jmp exit_rax                ; expect ERR_BAD_ARGUMENT
 
 bad:
     mov edi, 0xBAD

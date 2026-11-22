@@ -23,6 +23,7 @@
 //!   8 port_out(ports, port, width, v)  -> 0
 //!   9 irq_wait(irq)                    -> 0 once the line has fired
 //!  10 irq_ack(irq)                     -> 0
+//!  11 power(power, action)             -> never returns (0 restart, 1 off)
 //!
 //! Message registers: send/call take the four words in RSI, RDX, R10, R8
 //! and in R9 the slot of a capability to pass along (-1 for none). recv and
@@ -51,6 +52,7 @@ pub const SYS_PORT_IN: u64 = 7;
 pub const SYS_PORT_OUT: u64 = 8;
 pub const SYS_IRQ_WAIT: u64 = 9;
 pub const SYS_IRQ_ACK: u64 = 10;
+pub const SYS_POWER: u64 = 11;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
 /// write: the slot doesn't hold the console capability.
@@ -175,12 +177,26 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
         SYS_PORT_OUT => crate::irq::port_io(f.rdi, f.rsi, f.rdx, f.r10, true),
         SYS_IRQ_WAIT => crate::irq::wait(f.rdi),
         SYS_IRQ_ACK => crate::irq::ack(f.rdi),
+        SYS_POWER => sys_power(f.rdi, f.rsi),
         _ => ERR_BAD_SYSCALL,
     };
     f.rax = result as u64;
     // A kill takes effect on the way back to ring 3.
     if sched::kill_requested() {
         sched::exit_with(ExitStatus::Killed);
+    }
+}
+
+/// power(slot, action): restart (0) or switch off (1), with the Power
+/// capability in `slot`. Doesn't return when it works.
+fn sys_power(slot: u64, action: u64) -> i64 {
+    if sched::current_cap(slot) != Cap::Power {
+        return ERR_WRONG_CAPABILITY;
+    }
+    match action {
+        crate::power::RESTART => crate::power::restart(),
+        crate::power::SHUT_DOWN => crate::power::shut_down(),
+        _ => ERR_BAD_ARGUMENT,
     }
 }
 

@@ -6,6 +6,7 @@ extern crate alloc; // Box, Vec, String, BTreeMap, backed by heap.rs
 use core::panic::PanicInfo;
 
 mod apic;
+mod acpi;
 mod boot;
 mod cap;
 mod cpu;
@@ -18,6 +19,7 @@ mod irq;
 mod paging;
 mod pic;
 mod pmm;
+mod power;
 mod process;
 mod sched;
 mod selftest;
@@ -58,9 +60,24 @@ unsafe fn inb(port: u16) -> u8 {
     val
 }
 
+/// Set by serial_init if a UART answers at COM1. The T430 has none; on such
+/// a machine every serial write is skipped (the screen log still gets it).
+static SERIAL_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn serial_init() {
 
     unsafe {
+
+        // A UART's scratch register (base + 7) keeps what is written to
+        // it; an empty port reads back 0xFF or 0x00.
+        outb(COM1 + 7, 0xA5);
+        let first = inb(COM1 + 7) == 0xA5;
+        outb(COM1 + 7, 0x5A);
+        let present = first && inb(COM1 + 7) == 0x5A;
+        SERIAL_PRESENT.store(present, core::sync::atomic::Ordering::Relaxed);
+        if !present {
+            return;
+        }
 
         outb(COM1 + 1, 0x00); // disable interrupts
         outb(COM1 + 3, 0x80); // enable DLAB
@@ -72,14 +89,107 @@ fn serial_init() {
     }
 }
 
+/// Every byte of output goes to the screen log (rows 18-24) and, if there
+/// is one, to COM1.
 fn serial_write_byte(b: u8) {
+    screen_log_byte(b);
+    if !SERIAL_PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
 
     unsafe {
 
-        // Wait for Transmitter Holking Register Empty
-        while (inb(COM1 + 5) & 0x20) == 0 {}
+        // Wait for the transmitter holding register to empty, but not
+        // forever: a UART that stops answering mustn't hang the kernel.
+        let mut patience = 100_000u32;
+        while (inb(COM1 + 5) & 0x20) == 0 && patience > 0 {
+            patience -= 1;
+        }
 
         outb(COM1 + 0, b);
+    }
+}
+
+// ------------------------------------------------------------------
+// Screen log: the last lines of output, at the bottom of the screen
+// ------------------------------------------------------------------
+//
+// Real hardware like the T430 has no serial port, so everything printed
+// is also kept here: rows 18-24, scrolling, long lines wrapped. A shadow
+// copy in RAM is redrawn on each scroll (reading VGA memory back is slow).
+// The line being printed is also kept whole, so a failing self-test can
+// be repeated after the summary, where it stays on screen.
+
+const LOG_TOP: usize = 18;
+const LOG_ROWS: usize = 7;
+const LOG_ATTR: u8 = 0x07;
+const LINE_MAX: usize = 160;
+
+struct ScreenLog {
+    rows: [[u8; 80]; LOG_ROWS],
+    col: usize,
+    line: [u8; LINE_MAX],
+    line_len: usize,
+}
+
+static mut SCREEN_LOG: ScreenLog =
+    ScreenLog { rows: [[b' '; 80]; LOG_ROWS], col: 0, line: [0; LINE_MAX], line_len: 0 };
+
+fn screen_log_byte(b: u8) {
+    cpu::without_interrupts(|| {
+        let log = unsafe { &mut *(&raw mut SCREEN_LOG) };
+        match b {
+            b'\r' => {}
+            b'\n' => {
+                screen_log_scroll(log);
+                log.line_len = 0;
+            }
+            _ => {
+                if log.col >= 80 {
+                    screen_log_scroll(log); // wrap
+                }
+                if let Some(last) = log.rows.last_mut() {
+                    if let Some(cell) = last.get_mut(log.col) {
+                        *cell = b;
+                    }
+                }
+                vga_cell(LOG_TOP + LOG_ROWS - 1, log.col, b, LOG_ATTR);
+                log.col += 1;
+                if let Some(slot) = log.line.get_mut(log.line_len) {
+                    *slot = b;
+                    log.line_len += 1;
+                }
+            }
+        }
+    });
+}
+
+fn screen_log_scroll(log: &mut ScreenLog) {
+    log.rows.rotate_left(1);
+    if let Some(last) = log.rows.last_mut() {
+        *last = [b' '; 80];
+    }
+    log.col = 0;
+    for (r, row) in log.rows.iter().enumerate() {
+        for (c, &ch) in row.iter().enumerate() {
+            vga_cell(LOG_TOP + r, c, ch, LOG_ATTR);
+        }
+    }
+}
+
+/// The line printed so far (up to LINE_MAX bytes), for selftest.rs.
+fn current_line(out: &mut [u8; LINE_MAX]) -> usize {
+    cpu::without_interrupts(|| {
+        let log = unsafe { &*(&raw const SCREEN_LOG) };
+        *out = log.line;
+        log.line_len
+    })
+}
+
+fn vga_cell(row: usize, col: usize, ch: u8, attr: u8) {
+    if row < 25 && col < 80 {
+        let cell = (0xB8000 + (row * 80 + col) * 2) as *mut u16;
+        unsafe { cell.write_volatile((attr as u16) << 8 | ch as u16) };
     }
 }
 
@@ -350,6 +460,25 @@ pub extern "C" fn rust_start() -> ! {
         Err(why) => selftest::check(b"apic", why, false),
     };
 
+    // --- Firmware tables (ACPI) and the I/O APIC ---
+    // ACPI says where the I/O APIC is and how ISA interrupts reach it, and
+    // how to switch off and restart. Every I/O APIC input starts masked.
+    let acpi = acpi::init();
+    let mut firmware_ok = acpi::selftest(&acpi);
+    let ioapic_ready = match &acpi {
+        Ok(info) => match irq::init_ioapic(info) {
+            Ok(setup) => {
+                firmware_ok &= irq::selftest_ioapic(&setup);
+                true
+            }
+            Err(why) => {
+                firmware_ok &= selftest::check(b"ioapic", why, false);
+                false
+            }
+        },
+        Err(_) => false,
+    };
+
     // --- Scheduler: the boot thread becomes task 0 ---
     // Only with a working timer: sleeping and preemption both run off it,
     // and without ticks the sleep test would wait forever.
@@ -415,28 +544,54 @@ pub extern "C" fn rust_start() -> ! {
     vga_status(8, b"Kernel heap:     ", heap_ok);
     vga_status(9, b"Sanitise check:  ", sanitize_ok);
     vga_status(10, b"Timer interrupt: ", irq_ok);
-    vga_status(11, b"Scheduler:       ", sched_ok);
-    vga_status(12, b"User mode:       ", user_ok);
-    vga_status(13, b"IPC + drivers:   ", ipc_ok);
+    vga_status(11, b"ACPI + I/O APIC: ", firmware_ok);
+    vga_status(12, b"Scheduler:       ", sched_ok);
+    vga_status(13, b"User mode:       ", user_ok);
+    vga_status(14, b"IPC + drivers:   ", ipc_ok);
 
     // --- One line that says whether everything is up ---
     let all_ok = selftest::summary();
     let (passed, failed) = selftest::counts();
-    vga_summary(14, passed, failed);
+    vga_summary(15, passed, failed);
 
     // Build-time fault demo, if one was requested (halts).
     run_requested_demo();
 
     // The uptime line is kept current by a task of its own.
-    if sched::is_enabled() && sched::spawn("clock", clock_task, 16).is_err() {
+    if sched::is_enabled() && sched::spawn("clock", clock_task, 17).is_err() {
         serial_write_str(b"[kernel] could not start the clock task\n");
     }
 
+    // The keyboard driver: a user process with exactly the capabilities it
+    // needs, including Power, so the person at the keyboard can restart or
+    // switch off cleanly.
+    let keyboard = ioapic_ready
+        && user_mode_on
+        && process::spawn(
+            &process::KEYBOARD,
+            0,
+            cap::table(&[
+                cap::Cap::Console,
+                cap::Cap::Irq { line: 1 },
+                cap::Cap::IoPorts { base: 0x60, count: 1 },
+                cap::Cap::IoPorts { base: 0x64, count: 1 },
+                cap::Cap::Power,
+            ]),
+        )
+        .is_ok();
+    if !keyboard {
+        serial_write_str(b"[kernel] no keyboard driver: to switch off, hold the power button (safe: nothing is written to disk)\n");
+    }
+
     if all_ok {
-        vga_print(15, b"--- FreyaOS foundation ready ---", 0x0F);
+        vga_print(
+            16,
+            if keyboard { b"--- FreyaOS ready ---  Ctrl+Alt+Del: restart   Ctrl+Alt+End: switch off" } else { b"--- FreyaOS foundation ready ---" },
+            0x0F,
+        );
         serial_write_str(b"[kernel] init complete - boot thread done; scheduler and timer running\n");
     } else {
-        vga_print(15, b"--- SELF-TEST FAILURE: see serial log ---", 0x0C);
+        vga_print(16, b"--- SELF-TEST FAILURE: the failed tests are at the bottom of the screen ---", 0x0C);
         serial_write_str(b"[kernel] init complete WITH FAILURES\n");
     }
 

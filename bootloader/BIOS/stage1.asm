@@ -9,6 +9,10 @@
 ; Notes:
 ; - Requires INT 13h Extensions (EDD). If unsupported, prints an error and halts.
 ; - Stage2 is assumed to immediately follow the MBR (LBA 1).
+; - The sector ends with a partition table holding one active partition
+;   over the whole image. Without one, some BIOSes (ThinkPads among them)
+;   boot a USB stick as a floppy, with no EDD and drive 0x00; with one, they
+;   treat it as a hard disk.
 ; ---------------------------------------------------------------------------------------------
 
 [org 0x7C00]
@@ -16,6 +20,9 @@ BITS 16
 
 %ifndef __STAGE2_SECTORS
     %define __STAGE2_SECTORS 32
+%endif
+%ifndef __IMAGE_SECTORS
+    %define __IMAGE_SECTORS 2048
 %endif
 
 STAGE2_LOAD_OFF  equ 0x7E00
@@ -124,6 +131,25 @@ dap:
     dw 0
     dq 0
 
-; Pad to 512 bytes and add boot signature
-times 510 - ($ - $$) db 0
+; Code and data must end before the disk signature at 440.
+%if ($ - $$) > 440
+    %error "stage1 code is over 440 bytes: it would overwrite the partition table"
+%endif
+times 440 - ($ - $$) db 0
+
+dd 0x59455246                   ; disk signature ("FREY")
+dw 0
+
+; Partition table (4 x 16 bytes at offset 446). Entry 1: active (0x80),
+; type 0x7F (set aside for experimental operating systems), LBA 1 to the
+; end of the image. CHS start 0/0/2 = LBA 1; CHS end FE FF FF means "use
+; the LBA fields".
+db 0x80
+db 0x00, 0x02, 0x00
+db 0x7F
+db 0xFE, 0xFF, 0xFF
+dd 1
+dd __IMAGE_SECTORS - 1
+times 3 * 16 db 0
+
 dw 0xAA55
