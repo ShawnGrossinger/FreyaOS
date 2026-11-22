@@ -37,8 +37,13 @@ const REG_VERSION: usize = 0x030;
 const REG_TPR: usize = 0x080; // task priority: 0 = accept everything
 const REG_EOI: usize = 0x0B0;
 const REG_SVR: usize = 0x0F0; // spurious vector + software enable (bit 8)
+const REG_ISR: usize = 0x100; // in-service bits, 8 registers 0x10 apart
+const REG_LVT_CMCI: usize = 0x2F0; // only if the version register's max LVT >= 6
 const REG_LVT_TIMER: usize = 0x320;
+const REG_LVT_THERMAL: usize = 0x330; // only if max LVT >= 5
+const REG_LVT_PERF: usize = 0x340; // only if max LVT >= 4
 const REG_LVT_LINT0: usize = 0x350;
+const REG_LVT_LINT1: usize = 0x360;
 const REG_LVT_ERROR: usize = 0x370;
 const REG_TIMER_INITIAL: usize = 0x380;
 const REG_TIMER_CURRENT: usize = 0x390;
@@ -46,6 +51,7 @@ const REG_TIMER_DIVIDE: usize = 0x3E0;
 
 const LVT_MASKED: u32 = 1 << 16;
 const LVT_TIMER_PERIODIC: u32 = 1 << 17;
+const LVT_DELIVERY_NMI: u32 = 0b100 << 8;
 const SVR_ENABLE: u32 = 1 << 8;
 const DIVIDE_BY_16: u32 = 0b0011;
 
@@ -60,6 +66,14 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 static SPURIOUS: AtomicU64 = AtomicU64::new(0);
 static COUNTS_PER_10MS: AtomicU32 = AtomicU32::new(0);
 
+/// The local APIC's interrupt sources other than the timer (its "local
+/// vector table"), and what the firmware had left in each before init()
+/// set them. Every one of them can send an interrupt on a vector of its
+/// own choosing, so any left unmasked is a source the kernel didn't ask for.
+pub const LVT_NAMES: [&[u8]; 5] = [b"LINT0", b"LINT1", b"error", b"perf", b"thermal"];
+const LVT_REGS: [usize; 5] = [REG_LVT_LINT0, REG_LVT_LINT1, REG_LVT_ERROR, REG_LVT_PERF, REG_LVT_THERMAL];
+static FIRMWARE_LVT: [AtomicU32; 6] = [const { AtomicU32::new(LVT_MASKED) }; 6]; // last: CMCI
+static MAX_LVT: AtomicU32 = AtomicU32::new(0);
 fn read(reg: usize) -> u32 {
     let base = BASE.load(Ordering::Relaxed) as usize;
     unsafe { core::ptr::read_volatile((base + reg) as *const u32) }
@@ -136,9 +150,21 @@ pub fn init() -> Result<ApicInfo, &'static [u8]> {
     BASE.store(va, Ordering::Relaxed);
 
     // --- Basic configuration ---
+    // Every source of interrupts except the timer is masked, whatever the
+    // firmware left in it (Entry 15: the T430 took an interrupt nobody
+    // asked for). LINT1 stays the NMI input it is wired as on every PC.
+    let max_lvt = (read(REG_VERSION) >> 16) & 0xFF;
+    MAX_LVT.store(max_lvt, Ordering::Relaxed);
+    for (i, &reg) in LVT_REGS.iter().enumerate() {
+        if present(reg, max_lvt) {
+            FIRMWARE_LVT[i].store(read(reg), Ordering::Relaxed);
+        }
+    }
+    if max_lvt >= 6 {
+        FIRMWARE_LVT[5].store(read(REG_LVT_CMCI), Ordering::Relaxed);
+    }
     write(REG_TPR, 0); // accept every priority
-    write(REG_LVT_LINT0, LVT_MASKED); // the PIC's old route in; PICs are masked anyway
-    write(REG_LVT_ERROR, LVT_MASKED);
+    mask_local_sources(max_lvt);
     write(REG_SVR, SVR_ENABLE | SPURIOUS_VECTOR as u32);
 
     // --- Calibrate: how far does the timer count in 10 ms? ---
@@ -178,6 +204,85 @@ pub fn on_timer() {
 /// This CPU's local APIC id (where the I/O APIC should send interrupts).
 pub fn id() -> u8 {
     (read(REG_ID) >> 24) as u8
+}
+
+/// The registers exist once init() has mapped them.
+pub fn ready() -> bool {
+    BASE.load(Ordering::Relaxed) != 0
+}
+
+/// The local APIC is handling an interrupt on `vector` (its in-service bit
+/// is set). A CPU exception never sets it, so on an exception vector this
+/// tells an interrupt from the exception. False before init().
+pub fn in_service(vector: u8) -> bool {
+    ready() && read(REG_ISR + 0x10 * (vector as usize / 32)) & (1 << (vector % 32)) != 0
+}
+
+/// Mask every local interrupt source except the timer; LINT1 is the NMI
+/// input on every PC, so it is set to deliver exactly that.
+fn mask_local_sources(max_lvt: u32) {
+    write(REG_LVT_LINT0, LVT_MASKED); // the PIC's old route in; PICs are masked anyway
+    write(REG_LVT_LINT1, LVT_DELIVERY_NMI);
+    write(REG_LVT_ERROR, LVT_MASKED);
+    write(REG_LVT_PERF, LVT_MASKED);
+    if max_lvt >= 5 {
+        write(REG_LVT_THERMAL, LVT_MASKED);
+    }
+    if max_lvt >= 6 {
+        write(REG_LVT_CMCI, LVT_MASKED);
+    }
+}
+
+/// Every local source but the timer is masked and LINT1 is NMI.
+fn local_sources_masked(max_lvt: u32) -> bool {
+    let mut quiet = read(REG_LVT_LINT0) & LVT_MASKED != 0
+        && read(REG_LVT_LINT1) & (LVT_MASKED | 0b111 << 8) == LVT_DELIVERY_NMI
+        && read(REG_LVT_ERROR) & LVT_MASKED != 0
+        && read(REG_LVT_PERF) & LVT_MASKED != 0;
+    if max_lvt >= 5 {
+        quiet &= read(REG_LVT_THERMAL) & LVT_MASKED != 0;
+    }
+    if max_lvt >= 6 {
+        quiet &= read(REG_LVT_CMCI) & LVT_MASKED != 0;
+    }
+    quiet
+}
+
+fn present(reg: usize, max_lvt: u32) -> bool {
+    match reg {
+        REG_LVT_THERMAL => max_lvt >= 5,
+        REG_LVT_CMCI => max_lvt >= 6,
+        _ => true,
+    }
+}
+
+/// An LVT entry is a live source of interrupts on a vector of its own:
+/// unmasked with fixed delivery (mode 0).
+fn live_fixed(value: u32) -> bool {
+    value & LVT_MASKED == 0 && (value >> 8) & 0b111 == 0
+}
+
+/// How many LVT entries the firmware had left as live sources.
+pub fn firmware_live_count() -> u32 {
+    (0..6).filter(|&i| live_fixed(FIRMWARE_LVT[i].load(Ordering::Relaxed))).count() as u32
+}
+
+/// For the boot log: every LVT entry the firmware had left as a live source
+/// of fixed interrupts, with its vector. Returns how many.
+pub fn report_firmware_lvts() -> u32 {
+    let mut live = 0;
+    for i in 0..6 {
+        let value = FIRMWARE_LVT[i].load(Ordering::Relaxed);
+        if live_fixed(value) {
+            live += 1;
+            crate::serial_write_str(b"[apic] the firmware left the ");
+            crate::serial_write_str(if i < 5 { LVT_NAMES[i] } else { b"CMCI" });
+            crate::serial_write_str(b" entry unmasked, vector ");
+            crate::serial_write_u64((value & 0xFF) as u64);
+            crate::serial_write_str(b" (now masked)\n");
+        }
+    }
+    live
 }
 
 /// End-Of-Interrupt for any other interrupt handled through the local APIC.
@@ -259,6 +364,27 @@ pub fn selftest(info: &ApicInfo) -> bool {
     let enabled = unsafe { rdmsr(IA32_APIC_BASE) } & APIC_BASE_ENABLE != 0
         && read(REG_SVR) & SVR_ENABLE != 0;
     ok &= check(b"apic", b"local APIC enabled (IA32_APIC_BASE and SVR)", enabled);
+
+    // Every interrupt source but the timer masked; LINT1 is NMI. Then play
+    // the firmware: leave two sources live (the performance counter and
+    // APIC error entries, which can't fire unless set up further), and
+    // check the masking puts them back. Interrupts are off meanwhile.
+    let max_lvt = MAX_LVT.load(Ordering::Relaxed);
+    let mut quiet = local_sources_masked(max_lvt);
+    quiet &= crate::cpu::without_interrupts(|| {
+        write(REG_LVT_PERF, 0x90);
+        write(REG_LVT_ERROR, 0x90);
+        let live = !local_sources_masked(max_lvt);
+        mask_local_sources(max_lvt);
+        live && local_sources_masked(max_lvt)
+    });
+    let firmware_live = report_firmware_lvts();
+    crate::serial_write_str(b"[apic] self-test every local interrupt source but the timer is masked (LINT1: NMI), and masking undoes live ones; ");
+    crate::serial_write_u64(max_lvt as u64 + 1);
+    crate::serial_write_str(b" LVT entries, ");
+    crate::serial_write_u64(firmware_live as u64);
+    crate::serial_write_str(b" left live by the firmware");
+    ok &= crate::selftest::verdict(quiet);
 
     crate::serial_write_str(b"[apic] self-test timer calibrated against the PIT: ");
     crate::serial_write_u64(info.counts_per_10ms as u64);

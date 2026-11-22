@@ -49,16 +49,26 @@ _start:
     jmp .hang
 
 ; ---------------------------------------------------------------------------
-; CPU exception entry stubs (vectors 0-31)
+; Entry stubs: one for every vector, 0 to 255
 ;
-; On an exception in 64-bit mode the CPU:
+; On an exception or interrupt in 64-bit mode the CPU:
 ;   1. aligns RSP down to 16 bytes
 ;   2. pushes SS, RSP, RFLAGS, CS, RIP
-;   3. for some vectors only, pushes an error code
+;   3. for some exceptions only, pushes an error code
 ;
 ; Every stub makes the frame uniform: vectors without a CPU error code push
 ; a dummy 0 first. Then every stub pushes its vector number and jumps to
 ; isr_common. The resulting layout is mirrored by InterruptFrame in idt.rs.
+;
+; The CPU pushes an error code only for an EXCEPTION on vectors 8, 10-14,
+; 17, 21, 29 and 30. An interrupt that arrives on one of those vectors
+; (from a device or a local APIC entry the firmware left set up) brings no
+; error code, and a stub that assumed one would leave every later push 8
+; bytes off: isr_common's FXSAVE then faults with #GP, which is exactly
+; what the T430 showed in Entry 15. So those stubs check: after the CPU's
+; pushes, RSP is 16-aligned with an error code and 8 off without one. With
+; none, the stub pushes NOT_AN_EXCEPTION in its place, and idt.rs reports
+; an unexpected interrupt instead of a CPU exception.
 ; ---------------------------------------------------------------------------
 
 section .text
@@ -73,10 +83,18 @@ isr_stub_%1:
     jmp isr_common
 %endmacro
 
-; Vector where the CPU DOES push an error code (it is already on the stack).
+; Vector where a CPU exception DOES push an error code (it is already on
+; the stack) - unless this is an interrupt, not an exception (see above).
+NOT_AN_EXCEPTION equ -1         ; no CPU error code is ever all ones
 %macro ISR_ERR 1
 isr_stub_%1:
+    test rsp, 8                 ; 0: the CPU pushed an error code
+    jnz %%no_error_code
     push qword %1               ; vector number
+    jmp isr_common
+%%no_error_code:
+    push qword NOT_AN_EXCEPTION
+    push qword %1
     jmp isr_common
 %endmacro
 
@@ -113,17 +131,12 @@ ISR_ERR   29    ; #VC  VMM communication (AMD)
 ISR_ERR   30    ; #SX  security exception (AMD)
 ISR_NOERR 31    ;      reserved
 
-; Hardware interrupts from the local APIC (vector numbers must match
-; TIMER_VECTOR and SPURIOUS_VECTOR in src/apic.rs).
-global isr_stub_48
-global isr_stub_255
-ISR_NOERR 48    ;      APIC timer
-ISR_NOERR 255   ;      APIC spurious interrupt
-
-; Interrupt lines for user-space drivers (src/irq.rs): line n on vector
-; 0x40 + n. Lines 0-15 are the ISA interrupts, line 16 the test line.
-%assign v 0x40
-%rep 17
+; Vectors 32-255: interrupts. idt.rs decides what each one means: the APIC
+; timer (0x30), driver lines (0x40-0x50), the APIC spurious vector (0xFF);
+; anything else is reported as unexpected instead of faulting for want of
+; a gate.
+%assign v 32
+%rep 224
 ISR_NOERR v
 %assign v v+1
 %endrep
@@ -375,7 +388,7 @@ syscall_kernel_rsp: resq 1      ; = TSS.RSP0, set by gdt::set_kernel_stack
 syscall_user_rsp:   resq 1      ; scratch while switching stacks
 
 ; ---------------------------------------------------------------------------
-; isr_stub_table — addresses of the 32 stubs, read by idt.rs to fill gates.
+; isr_stub_table — addresses of all 256 stubs, read by idt.rs to fill gates.
 ; ---------------------------------------------------------------------------
 section .rodata
 
@@ -383,17 +396,7 @@ global isr_stub_table
 align 8
 isr_stub_table:
 %assign i 0
-%rep 32
-    dq isr_stub_%+i
-%assign i i+1
-%endrep
-
-; Stubs for the driver interrupt lines, vectors 0x40-0x50, in order.
-global irq_stub_table
-align 8
-irq_stub_table:
-%assign i 0x40
-%rep 17
+%rep 256
     dq isr_stub_%+i
 %assign i i+1
 %endrep

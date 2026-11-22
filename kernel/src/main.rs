@@ -177,6 +177,34 @@ fn screen_log_scroll(log: &mut ScreenLog) {
     }
 }
 
+/// The log's rows as they are now. A crash report takes this before it
+/// prints anything, so the lines that led up to the crash aren't scrolled
+/// off by the report itself.
+fn screen_log_snapshot() -> [[u8; 80]; LOG_ROWS] {
+    cpu::without_interrupts(|| unsafe { (*(&raw const SCREEN_LOG)).rows })
+}
+
+/// Rows 0 to 17 after a fatal error, for machines with no serial port:
+/// `lines` (white on red) from the top, then the log as it stood before
+/// the error, under a heading. Rows 18 to 24 keep the live log, which shows
+/// the end of the full report.
+fn crash_screen(lines: &[&[u8]], before: &[[u8; 80]; LOG_ROWS]) {
+    const RED: u8 = 0x4F;
+    const HEADING_ROW: usize = LOG_TOP - LOG_ROWS - 1; // 10
+    for row in 0..LOG_TOP {
+        vga_print(row, b"", 0x07);
+    }
+    for (row, line) in lines.iter().take(HEADING_ROW).enumerate() {
+        vga_print(row, line, RED);
+    }
+    vga_print(HEADING_ROW, b"Before it happened (the last lines of the log):", 0x0E);
+    for (r, line) in before.iter().enumerate() {
+        for (c, &ch) in line.iter().enumerate() {
+            vga_cell(HEADING_ROW + 1 + r, c, ch, 0x07);
+        }
+    }
+}
+
 /// The line printed so far (up to LINE_MAX bytes), for selftest.rs.
 fn current_line(out: &mut [u8; LINE_MAX]) -> usize {
     cpu::without_interrupts(|| {
@@ -322,7 +350,7 @@ pub extern "C" fn rust_start() -> ! {
 
     // --- Exceptions: install the IDT before anything else can fault ---
     let cs = idt::init();
-    serial_write_str(b"[idt] loaded: 32 exception gates, code selector ");
+    serial_write_str(b"[idt] loaded: a gate for every vector (0-255), code selector ");
     serial_write_hex(cs as u64);
     serial_write_str(b", #DF on IST1\n");
 
@@ -442,7 +470,30 @@ pub extern "C" fn rust_start() -> ! {
     // Last, so every allocation and mapping above happened with interrupts
     // off; apic::selftest() turns them on and leaves them on.
     pic::remap_and_mask();
-    let irq_ok = match apic::init() {
+    let apic_info = apic::init(); // masks every local source but the timer
+
+    // --- Firmware tables (ACPI) and the I/O APIC ---
+    // ACPI says where the I/O APIC is and how ISA interrupts reach it, and
+    // how to switch off and restart. Done BEFORE interrupts are enabled, so
+    // that every I/O APIC input is masked first: until then it holds
+    // whatever the firmware left there (Entry 15).
+    let acpi = acpi::init();
+    let mut firmware_ok = acpi::selftest(&acpi);
+    let ioapic_ready = match (&acpi, &apic_info) {
+        (Ok(info), Ok(_)) => match irq::init_ioapic(info) {
+            Ok(setup) => {
+                firmware_ok &= irq::selftest_ioapic(&setup);
+                true
+            }
+            Err(why) => {
+                firmware_ok &= selftest::check(b"ioapic", why, false);
+                false
+            }
+        },
+        _ => false,
+    };
+
+    let mut irq_ok = match apic_info {
         Ok(info) => {
             serial_write_str(b"[apic] local APIC id ");
             serial_write_u64(info.id as u64);
@@ -455,28 +506,9 @@ pub extern "C" fn rust_start() -> ! {
             serial_write_str(b" Hz on vector ");
             serial_write_hex(apic::TIMER_VECTOR as u64);
             serial_write_str(b"\n");
-            apic::selftest(&info)
+            apic::selftest(&info) & idt::selftest_unexpected()
         }
         Err(why) => selftest::check(b"apic", why, false),
-    };
-
-    // --- Firmware tables (ACPI) and the I/O APIC ---
-    // ACPI says where the I/O APIC is and how ISA interrupts reach it, and
-    // how to switch off and restart. Every I/O APIC input starts masked.
-    let acpi = acpi::init();
-    let mut firmware_ok = acpi::selftest(&acpi);
-    let ioapic_ready = match &acpi {
-        Ok(info) => match irq::init_ioapic(info) {
-            Ok(setup) => {
-                firmware_ok &= irq::selftest_ioapic(&setup);
-                true
-            }
-            Err(why) => {
-                firmware_ok &= selftest::check(b"ioapic", why, false);
-                false
-            }
-        },
-        Err(_) => false,
     };
 
     // --- Scheduler: the boot thread becomes task 0 ---
@@ -539,6 +571,9 @@ pub extern "C" fn rust_start() -> ! {
     vga_status(3, b"Page tables:     ", true);
     vga_status(4, b"Memory map:      ", true);
     vga_status(5, b"Frame allocator: ", pmm_ok);
+    // Anything the hardware sent that nobody asked for, over the whole boot.
+    irq_ok &= idt::selftest_none_unexpected();
+
     vga_status(6, b"Physical map:    ", physmap_ok);
     vga_status(7, b"Page mapping:    ", vmm_ok);
     vga_status(8, b"Kernel heap:     ", heap_ok);
@@ -772,6 +807,7 @@ fn halt() -> ! {
 fn panic(info: &PanicInfo) -> ! {
     // File, line and (for messages without {} arguments) the text. Printed
     // without core::fmt, which would add several KiB to the kernel.
+    let before = screen_log_snapshot();
     serial_write_str(b"\n[kernel] PANIC");
     if let Some(location) = info.location() {
         serial_write_str(b" at ");
@@ -784,6 +820,33 @@ fn panic(info: &PanicInfo) -> ! {
         serial_write_str(message.as_bytes());
     }
     serial_write_str(b"\n");
-    vga_print(20, b"!! KERNEL PANIC - file and line on COM1", 0x4F);
+
+    let mut place = [0u8; 80];
+    let mut len = 0;
+    for &b in b"at ".iter().chain(info.location().map(|l| l.file().as_bytes()).unwrap_or(b"?")) {
+        if let Some(slot) = place.get_mut(len) {
+            *slot = b;
+            len += 1;
+        }
+    }
+    let mut digits = [0u8; 10];
+    let mut n = info.location().map(|l| l.line()).unwrap_or(0);
+    let mut d = digits.len();
+    loop {
+        d -= 1;
+        digits[d] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 || d == 0 {
+            break;
+        }
+    }
+    for &b in b":".iter().chain(&digits[d..]) {
+        if let Some(slot) = place.get_mut(len) {
+            *slot = b;
+            len += 1;
+        }
+    }
+    let message = info.message().as_str().map(|m| m.as_bytes()).unwrap_or(b"(message has arguments: see the log below)");
+    crash_screen(&[b"!! KERNEL PANIC", &place[..len], message], &before);
     halt();
 }

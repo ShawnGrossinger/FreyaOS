@@ -74,10 +74,21 @@ fn ioapic_write(reg: u32, value: u32) {
     }
 }
 
+/// I/O APIC inputs the firmware had left unmasked, for the boot summary.
+static FIRMWARE_LIVE: AtomicU32 = AtomicU32::new(0);
+
+pub fn firmware_live_inputs() -> u32 {
+    FIRMWARE_LIVE.load(Ordering::Relaxed)
+}
+
 pub struct IoApicSetup {
     pub version: u32,
     pub inputs: u32,
     pub routed: u32,
+    /// Inputs the firmware had left unmasked (before they were masked).
+    pub firmware_live: u32,
+    /// Whether interrupts were still off when the inputs were masked.
+    pub before_interrupts: bool,
 }
 
 /// Mask every input, then wire each ISA line to its vector (still masked),
@@ -88,7 +99,18 @@ pub fn init_ioapic(info: &crate::acpi::Info) -> Result<IoApicSetup, &'static [u8
     IOAPIC.store(va, Ordering::Relaxed);
     let version_reg = ioapic_read(1);
     let inputs = ((version_reg >> 16) & 0xFF) + 1;
+    let before_interrupts = !crate::cpu::interrupts_enabled();
+    let mut firmware_live = 0;
     for i in 0..inputs {
+        let low = ioapic_read(0x10 + 2 * i);
+        if low & IOAPIC_MASKED == 0 {
+            firmware_live += 1;
+            crate::serial_write_str(b"[ioapic] the firmware left input ");
+            crate::serial_write_u64(i as u64);
+            crate::serial_write_str(b" unmasked, vector ");
+            crate::serial_write_u64((low & 0xFF) as u64);
+            crate::serial_write_str(b" (now masked)\n");
+        }
         ioapic_write(0x10 + 2 * i, IOAPIC_MASKED);
         ioapic_write(0x11 + 2 * i, 0);
     }
@@ -119,7 +141,8 @@ pub fn init_ioapic(info: &crate::acpi::Info) -> Result<IoApicSetup, &'static [u8
             routed += 1;
         }
     }
-    Ok(IoApicSetup { version: version_reg & 0xFF, inputs, routed })
+    FIRMWARE_LIVE.store(firmware_live, Ordering::Relaxed);
+    Ok(IoApicSetup { version: version_reg & 0xFF, inputs, routed, firmware_live, before_interrupts })
 }
 
 /// Mask or unmask ISA line `line` at the I/O APIC (no-op if not routed).
@@ -417,5 +440,9 @@ pub fn selftest_ioapic(setup: &IoApicSetup) -> bool {
             false
         }
     };
-    verdict(setup.version >= 0x11 && setup.inputs >= 16 && setup.routed >= 15 && keyboard_ok)
+    s(if setup.before_interrupts { b"; set up before interrupts were enabled" } else { b"; set up AFTER interrupts were enabled" });
+    s(b"; ");
+    dec(setup.firmware_live as u64);
+    s(b" inputs left live by the firmware");
+    verdict(setup.version >= 0x11 && setup.inputs >= 16 && setup.routed >= 15 && keyboard_ok && setup.before_interrupts)
 }

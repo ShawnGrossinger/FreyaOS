@@ -142,16 +142,22 @@ pub struct InterruptFrame {
 const _: () = assert!(core::mem::size_of::<InterruptFrame>() == 22 * 8);
 
 extern "C" {
-    /// Addresses of isr_stub_0 .. isr_stub_31 (entry.asm, .rodata).
-    static isr_stub_table: [u64; EXCEPTION_VECTORS];
-    /// Hardware interrupt stubs (entry.asm).
-    fn isr_stub_48();
-    fn isr_stub_255();
-    /// entry.asm: stubs for vectors irq::VECTOR_BASE.. (one per line).
-    static irq_stub_table: [u64; crate::irq::LINES];
+    /// Addresses of isr_stub_0 .. isr_stub_255 (entry.asm, .rodata).
+    static isr_stub_table: [u64; IDT_ENTRIES];
 }
 
+/// The error code a stub pushes in place of the CPU's when an interrupt
+/// arrives on an exception vector that would carry one (entry.asm).
+pub const NOT_AN_EXCEPTION: u64 = u64::MAX;
+
 static BREAKPOINT_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Interrupts nobody set up: on a vector with no handler, or an interrupt
+/// on a CPU exception's vector. Counted and acknowledged, not fatal.
+static UNEXPECTED: AtomicU64 = AtomicU64::new(0);
+static LAST_UNEXPECTED: AtomicU64 = AtomicU64::new(0);
+/// How many of those the self-test raised on purpose.
+static RAISED_BY_TEST: AtomicU64 = AtomicU64::new(0);
 
 /// How many hardware interrupt handlers are active on this task's stack.
 /// Nonzero means "inside an interrupt handler", where allocating is
@@ -182,11 +188,10 @@ pub fn init() -> u16 {
         let idt = &raw mut IDT;
 
         // Write every entry explicitly, so correctness never depends on
-        // what was in RAM before.
+        // what was in RAM before. Every vector gets a gate: an interrupt
+        // nobody expected is then reported and survived, where a missing
+        // gate would have been a #GP.
         for v in 0..IDT_ENTRIES {
-            (*idt).0[v] = IdtEntry::missing();
-        }
-        for v in 0..EXCEPTION_VECTORS {
             (*idt).0[v] = IdtEntry::interrupt_gate(isr_stub_table[v], cs);
         }
 
@@ -195,15 +200,6 @@ pub fn init() -> u16 {
         // -> triple fault, because #DF would try to push onto the same
         // dead stack.
         (*idt).0[8].ist = crate::gdt::DOUBLE_FAULT_IST;
-
-        // Hardware interrupts from the local APIC.
-        (*idt).0[crate::apic::TIMER_VECTOR as usize] =
-            IdtEntry::interrupt_gate(isr_stub_48 as *const () as u64, cs);
-        (*idt).0[crate::apic::SPURIOUS_VECTOR as usize] =
-            IdtEntry::interrupt_gate(isr_stub_255 as *const () as u64, cs);
-        for (line, &stub) in (*(&raw const irq_stub_table)).iter().enumerate() {
-            (*idt).0[crate::irq::VECTOR_BASE as usize + line] = IdtEntry::interrupt_gate(stub, cs);
-        }
 
         // lidt copies base+limit into the IDTR register, so the Idtr value
         // itself can live on the stack. The table it points at cannot.
@@ -266,6 +262,16 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
         crate::cpu::assert_kernel_mxcsr(b"isr_common");
     }
 
+    if arrived_as_interrupt(frame) {
+        IRQ_DEPTH.fetch_add(1, Ordering::Relaxed);
+        unexpected_interrupt(frame);
+        IRQ_DEPTH.fetch_sub(1, Ordering::Relaxed);
+        if from_user(frame) {
+            crate::process::on_return_to_user();
+        }
+        return;
+    }
+
     match frame.vector {
         // #BP is a trap: RIP already points past the int3, so returning
         // simply resumes the interrupted code.
@@ -313,11 +319,109 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
         // Anything else is a kernel bug, and fatal. Returning from a fault
         // would re-execute the faulting instruction forever.
         _ => {
+            let before = crate::screen_log_snapshot();
             report_serial(frame, cr2);
-            report_vga(frame, cr2);
+            report_screen(frame, cr2, &before);
             crate::halt();
         }
     }
+}
+
+/// An interrupt, not a CPU exception, though it may have arrived on an
+/// exception's vector: any vector the kernel has no handler for, an
+/// exception vector whose stub found no error code, or an exception vector
+/// the local APIC says it is delivering (a CPU exception never sets the
+/// APIC's in-service bit). Vectors 0-15 can't come from an APIC at all.
+fn arrived_as_interrupt(frame: &InterruptFrame) -> bool {
+    let v = frame.vector;
+    if v < EXCEPTION_VECTORS as u64 {
+        frame.error_code == NOT_AN_EXCEPTION || (v >= 16 && crate::apic::in_service(v as u8))
+    } else {
+        v != crate::apic::TIMER_VECTOR as u64
+            && v != crate::apic::SPURIOUS_VECTOR as u64
+            && crate::irq::line_of(v).is_none()
+    }
+}
+
+/// Count it, say so (the first few times), and acknowledge it if the local
+/// APIC delivered it, so that it can't hold back interrupts of lower
+/// priority. Then carry on: an interrupt nobody asked for is a setup
+/// problem to report, not a reason to stop the machine.
+fn unexpected_interrupt(frame: &InterruptFrame) {
+    let n = UNEXPECTED.fetch_add(1, Ordering::Relaxed) + 1;
+    LAST_UNEXPECTED.store(frame.vector, Ordering::Relaxed);
+    let through_apic = frame.vector >= 16 && crate::apic::in_service(frame.vector as u8);
+    if n <= 4 {
+        s(b"[idt] unexpected interrupt on vector ");
+        dec(frame.vector);
+        if frame.vector < EXCEPTION_VECTORS as u64 {
+            s(b" (");
+            s(exception_name(frame.vector));
+            s(b"'s vector, but an interrupt, not the exception)");
+        }
+        s(if through_apic { b": acknowledged, carrying on\n" } else { b": carrying on\n" });
+    }
+    if through_apic {
+        crate::apic::end_of_interrupt();
+    }
+}
+
+/// Unexpected interrupts so far, and the vector of the last one.
+pub fn unexpected() -> (u64, u64) {
+    (UNEXPECTED.load(Ordering::Relaxed), LAST_UNEXPECTED.load(Ordering::Relaxed))
+}
+
+/// With interrupts on. Raises, from the local APIC, what the T430 met by
+/// surprise: an interrupt on an exception vector that carries an error
+/// code (17, #AC), one on an exception vector that doesn't (19, #XM), and
+/// one on a vector with no handler (0x90). Each must be counted and
+/// survived, and none reported as a CPU exception.
+pub fn selftest_unexpected() -> bool {
+    use crate::selftest::verdict;
+    let mut ok = true;
+    for (vector, what) in [(17u8, &b"on #AC's vector (17), which carries an error code as an exception"[..]),
+                           (19, &b"on #XM's vector (19), which carries none: told apart by the APIC's in-service bit"[..]),
+                           (0x90, &b"on a vector nothing uses (0x90)"[..])] {
+        let (before, _) = unexpected();
+        RAISED_BY_TEST.fetch_add(1, Ordering::Relaxed);
+        let sent = crate::apic::send_self_ipi(vector);
+        let mut seen = false;
+        for _ in 0..10_000_000 {
+            if unexpected().0 != before {
+                seen = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        let (_, last) = unexpected();
+        s(b"[idt] self-test an interrupt ");
+        s(what);
+        s(b": ");
+        s(if seen { b"counted as unexpected, kernel carried on" } else { b"never seen" });
+        ok &= verdict(sent && seen && last == vector as u64);
+    }
+    ok
+}
+
+/// End of boot: interrupts from the hardware that nothing asked for.
+pub fn selftest_none_unexpected() -> bool {
+    let (total, last) = unexpected();
+    let from_hardware = total - RAISED_BY_TEST.load(Ordering::Relaxed).min(total);
+    s(b"[idt] self-test unexpected interrupts from the hardware during boot: ");
+    dec(from_hardware);
+    if from_hardware > 0 {
+        s(b" (last on vector ");
+        dec(last);
+        s(b")");
+    }
+    // On a machine without a serial port only a failed line stays on
+    // screen, so this one also says what the firmware had left switched on.
+    s(b"; firmware had left live ");
+    dec(crate::apic::firmware_live_count() as u64);
+    s(b" local APIC and ");
+    dec(crate::irq::firmware_live_inputs() as u64);
+    s(b" I/O APIC sources");
+    crate::selftest::verdict(from_hardware == 0)
 }
 
 /// The interrupted code was running in ring 3.
@@ -544,33 +648,46 @@ fn decode_selector_error(err: u64) {
     }
 }
 
-/// Short report on screen, for machines with no serial port attached
-/// (the T430 has none). Rows 20-22, white on red.
-fn report_vga(f: &InterruptFrame, cr2: u64) {
-    const ATTR: u8 = 0x4F;
+/// The report on screen, for machines with no serial port attached (the
+/// T430 has none): rows 0 to 9 hold everything report_serial says that
+/// fits, and the log lines from before the exception sit under them.
+fn report_screen(f: &InterruptFrame, cr2: u64, before: &[[u8; 80]; crate::LOG_ROWS]) {
+    let mut title = Line::new();
+    title.str(b"!! CPU EXCEPTION ").dec(f.vector).str(b": ").str(exception_name(f.vector));
+    if crate::sched::is_enabled() {
+        let id = crate::sched::current();
+        title.str(b"   task ").dec(id as u64).str(b" '").str(crate::sched::name(id).as_bytes()).str(b"'");
+    }
 
-    let mut line = Line::new();
-    line.str(b"!! CPU EXCEPTION ").dec(f.vector).str(b": ").str(exception_name(f.vector));
-    crate::vga_print(20, line.as_bytes(), ATTR);
+    let mut place = Line::new();
+    place.str(b"RIP=").hex(f.rip).str(b"  ERR=").hex(f.error_code).str(b"  CR2=").hex(cr2);
 
-    let mut line = Line::new();
-    line.str(b"RIP=").hex(f.rip).str(b"  ERR=").hex(f.error_code);
-    crate::vga_print(21, line.as_bytes(), ATTR);
-
-    let mut line = Line::new();
+    let mut why = Line::new();
     let task_overflow = if matches!(f.vector, 8 | 14) { crate::sched::stack_guard_owner(cr2) } else { None };
     if matches!(f.vector, 8 | 14) && crate::paging::is_stack_guard(cr2) {
-        line.str(b"KERNEL STACK OVERFLOW  CR2=").hex(cr2);
+        why.str(b"KERNEL STACK OVERFLOW");
     } else if f.vector == 14 && crate::vmm::is_user_range(cr2, 1) {
-        line.str(b"KERNEL TOUCHED USER MEMORY  CR2=").hex(cr2);
+        why.str(b"KERNEL TOUCHED USER MEMORY");
     } else if let Some(id) = task_overflow {
-        line.str(b"TASK STACK OVERFLOW  task ").dec(id as u64).str(b"  CR2=").hex(cr2);
-    } else if f.vector == 14 {
-        line.str(b"CR2=").hex(cr2).str(b"  (full report on COM1)");
+        why.str(b"TASK STACK OVERFLOW  task ").dec(id as u64);
     } else {
-        line.str(b"Full register dump on COM1");
+        why.str(b"in the kernel, interrupts ").str(if f.rflags & (1 << 9) != 0 { b"on" } else { b"off" });
     }
-    crate::vga_print(22, line.as_bytes(), ATTR);
+
+    let mut cpu = Line::new();
+    cpu.str(b"RSP=").hex(f.rsp).str(b" RFLAGS=").hex(f.rflags).str(b" CS=").hex(f.cs & 0xFFFF);
+    let regs = [(b"rax", f.rax), (b"rbx", f.rbx), (b"rcx", f.rcx), (b"rdx", f.rdx), (b"rsi", f.rsi),
+                (b"rdi", f.rdi), (b"rbp", f.rbp), (b"r8 ", f.r8), (b"r9 ", f.r9), (b"r10", f.r10),
+                (b"r11", f.r11), (b"r12", f.r12), (b"r13", f.r13), (b"r14", f.r14), (b"r15", f.r15)];
+    let mut rows = [Line::new(), Line::new(), Line::new(), Line::new(), Line::new()];
+    for (i, (name, value)) in regs.iter().enumerate() {
+        rows[i / 3].str(&name[..]).str(b"=").hex(*value).str(b"  ");
+    }
+    crate::crash_screen(
+        &[title.as_bytes(), place.as_bytes(), why.as_bytes(), cpu.as_bytes(),
+          rows[0].as_bytes(), rows[1].as_bytes(), rows[2].as_bytes(), rows[3].as_bytes(), rows[4].as_bytes()],
+        before,
+    );
 }
 
 /// Fixed 80-column text line builder (no allocator, no core::fmt).

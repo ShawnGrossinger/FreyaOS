@@ -28,6 +28,7 @@ ROOT=out/test
 CASES=(
   "image||||"   # not booted: checks the disk image's layout (see check_image)
   "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!;;'probe' killed by vector 14 #PF;;\\[user [0-9]+ 'ipc'\\] printed for me by the log server;;driver handled 10"
+  "dirty-ram||128M-dirty|self-tests: [0-9]+ passed, 0 failed;;init complete"
   "boot-4G||4G|physical map at 0xffff800000000000: 4096 MiB;;init complete - boot thread done; scheduler and timer running"
   "ud2|ud2|128M|vector 6 #UD Invalid Opcode"
   "page_fault|page_fault|128M|vector 14 #PF Page Fault;;cr2=0x0000000010000000;;page not present, read"
@@ -58,6 +59,16 @@ boot() { # boot <image> <ram> <serial log> <keys> [extra QEMU arguments...]
   # touches a few MiB), so the host needn't have that much free.
   case $mem in *G) memargs=(-object "memory-backend-ram,id=ram0,size=$mem,reserve=off"
                              -machine memory-backend=ram0 -m "$mem") ;; esac
+  # "<size>-dirty": RAM starts full of random bytes, as on a real machine
+  # (QEMU's starts zeroed), from a file mapped privately as guest RAM.
+  local dirty=
+  case $mem in *-dirty)
+    mem=${mem%-dirty}; dirty=${log%/*}/dirty.ram
+    head -c "$mem" /dev/urandom > "$dirty" 2>/dev/null \
+      || dd if=/dev/urandom of="$dirty" bs=1M count="${mem%M}" status=none
+    memargs=(-object "memory-backend-file,id=ram0,size=$mem,mem-path=$dirty,share=off"
+             -machine memory-backend=ram0 -m "$mem") ;;
+  esac
 
   # Keys go in through QEMU's monitor, over a pair of named pipes.
   local mon=${log%/*}/monitor monitor=(-monitor none)
@@ -102,6 +113,7 @@ boot() { # boot <image> <ram> <serial log> <keys> [extra QEMU arguments...]
   wait "$pid" 2>/dev/null
   if [ -n "$reader" ]; then kill "$reader" 2>/dev/null; wait "$reader" 2>/dev/null; fi
   if [ -n "$keys" ]; then rm -f "$mon.in" "$mon.out"; fi
+  if [ -n "$dirty" ]; then rm -f "$dirty"; fi
   sed -i 's/\r$//' "$log"   # the kernel ends serial lines with \r\n
 }
 
