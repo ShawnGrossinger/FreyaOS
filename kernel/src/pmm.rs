@@ -21,8 +21,10 @@
 //! it is handed out). Freeing returns it to Raw. Typed allocation
 //! (Sanitized -> Typed) arrives with the capability layer.
 //!
-//! Single CPU, interrupts off: no locking yet. That changes with SMP or
-//! once interrupt handlers allocate.
+//! Concurrency: alloc_frame and free_frame run with interrupts disabled
+//! (cpu::without_interrupts), so a task switch can never land half-way
+//! through a bitmap update. That is sufficient on one CPU; SMP will need a
+//! real lock.
 
 use crate::boot::E820Entry;
 use crate::paging;
@@ -281,6 +283,11 @@ pub unsafe fn init(e820: &[E820Entry], early_used: (u64, u64)) -> PmmStats {
 /// Scans 64 frames per step, starting at the hint instead of frame 0.
 #[inline(never)]
 pub unsafe fn alloc_frame() -> Option<usize> {
+    crate::cpu::without_interrupts(|| alloc_frame_locked())
+}
+
+unsafe fn alloc_frame_locked() -> Option<usize> {
+    crate::cpu::assert_interrupts_off(b"pmm alloc_frame");
     let pmm = &mut *(&raw mut PMM);
     if pmm.bitmap.is_null() {
         fatal(b"alloc_frame called before pmm::init, caller near ", 0);
@@ -314,6 +321,11 @@ pub unsafe fn alloc_frame() -> Option<usize> {
 /// one (kernel image, bitmap, low memory), so freeing one of those is not
 /// caught and corrupts the allocator.
 pub unsafe fn free_frame(phys: usize) {
+    crate::cpu::without_interrupts(|| free_frame_locked(phys))
+}
+
+unsafe fn free_frame_locked(phys: usize) {
+    crate::cpu::assert_interrupts_off(b"pmm free_frame");
     let pmm = &mut *(&raw mut PMM);
     let phys = phys as u64;
     let frame = phys / PAGE_SIZE;

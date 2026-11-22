@@ -147,6 +147,21 @@ extern "C" {
 
 static BREAKPOINT_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// How many hardware interrupt handlers are active on this task's stack.
+/// Nonzero means "inside an interrupt handler", where allocating is
+/// forbidden (heap.rs checks). The scheduler saves and restores it per
+/// task, because a task switched out inside the timer handler resumes
+/// inside it, while a new task starts outside any handler.
+static IRQ_DEPTH: AtomicU64 = AtomicU64::new(0);
+
+pub fn irq_depth() -> u64 {
+    IRQ_DEPTH.load(Ordering::Relaxed)
+}
+
+pub fn set_irq_depth(depth: u64) {
+    IRQ_DEPTH.store(depth, Ordering::Relaxed);
+}
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -250,8 +265,18 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
         }
 
         // Hardware interrupts: handle and return to the interrupted code.
-        v if v == crate::apic::TIMER_VECTOR as u64 => crate::apic::on_timer(),
-        v if v == crate::apic::SPURIOUS_VECTOR as u64 => crate::apic::on_spurious(),
+        // The timer handler may switch tasks (sched::on_tick); the depth
+        // decrement then runs when this task is next scheduled.
+        v if v == crate::apic::TIMER_VECTOR as u64 => {
+            IRQ_DEPTH.fetch_add(1, Ordering::Relaxed);
+            crate::apic::on_timer();
+            IRQ_DEPTH.fetch_sub(1, Ordering::Relaxed);
+        }
+        v if v == crate::apic::SPURIOUS_VECTOR as u64 => {
+            IRQ_DEPTH.fetch_add(1, Ordering::Relaxed);
+            crate::apic::on_spurious();
+            IRQ_DEPTH.fetch_sub(1, Ordering::Relaxed);
+        }
 
         // Everything else is fatal for now. Returning from a fault would
         // re-execute the faulting instruction forever.
@@ -353,6 +378,25 @@ fn report_serial(f: &InterruptFrame, cr2: u64) {
         hex(crate::paging::STACK_GUARD_PAGE);
         s(b")\n");
     }
+    if matches!(f.vector, 8 | 14) {
+        if let Some(id) = crate::sched::stack_guard_owner(cr2) {
+            s(b"  diagnosis: TASK STACK OVERFLOW (task ");
+            dec(id as u64);
+            s(b" '");
+            s(crate::sched::name(id).as_bytes());
+            s(b"', hit guard page ");
+            hex(crate::sched::guard_page(id));
+            s(b")\n");
+        }
+    }
+    if crate::sched::is_enabled() {
+        let id = crate::sched::current();
+        s(b"  running task: ");
+        dec(id as u64);
+        s(b" '");
+        s(crate::sched::name(id).as_bytes());
+        s(b"'\n");
+    }
 
     // #TS, #NP, #SS, #GP carry a selector-style error code.
     if matches!(f.vector, 10..=13) && f.error_code != 0 {
@@ -447,8 +491,11 @@ fn report_vga(f: &InterruptFrame, cr2: u64) {
     crate::vga_print(21, line.as_bytes(), ATTR);
 
     let mut line = Line::new();
+    let task_overflow = if matches!(f.vector, 8 | 14) { crate::sched::stack_guard_owner(cr2) } else { None };
     if matches!(f.vector, 8 | 14) && crate::paging::is_stack_guard(cr2) {
         line.str(b"KERNEL STACK OVERFLOW  CR2=").hex(cr2);
+    } else if let Some(id) = task_overflow {
+        line.str(b"TASK STACK OVERFLOW  task ").dec(id as u64).str(b"  CR2=").hex(cr2);
     } else if f.vector == 14 {
         line.str(b"CR2=").hex(cr2).str(b"  (full report on COM1)");
     } else {

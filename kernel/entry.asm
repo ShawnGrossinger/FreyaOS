@@ -182,6 +182,39 @@ isr_common:
     iretq
 
 ; ---------------------------------------------------------------------------
+; switch_context(save_rsp: *mut u64 [rdi], load_rsp: u64 [rsi])
+;
+; The whole of a task switch. Push the callee-saved registers the SysV ABI
+; says a function call must preserve, store RSP into *save_rsp, load RSP
+; from load_rsp, pop the other task's callee-saved registers and `ret` into
+; wherever that task last called switch_context from. Everything else
+; (caller-saved registers, SSE state) is either already saved by the
+; caller per the ABI, or, for a task preempted by the timer, sits in the
+; interrupt frame isr_common built on that task's own stack.
+;
+; A new task's stack is prepared (sched.rs) to look as if it had called
+; switch_context from task_entry: six zero registers and task_entry's
+; address as the return address.
+; ---------------------------------------------------------------------------
+global switch_context
+switch_context:
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [rdi], rsp
+    mov rsp, rsi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ---------------------------------------------------------------------------
 ; isr_stub_table — addresses of the 32 stubs, read by idt.rs to fill gates.
 ; ---------------------------------------------------------------------------
 section .rodata

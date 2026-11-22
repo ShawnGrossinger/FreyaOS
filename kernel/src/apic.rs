@@ -166,10 +166,13 @@ pub fn init() -> Result<ApicInfo, &'static [u8]> {
     })
 }
 
-/// Timer interrupt (called from interrupt_dispatch).
+/// Timer interrupt (called from interrupt_dispatch). EOI goes first: the
+/// scheduler may switch to another task here, and the APIC delivers no
+/// more timer interrupts until this one is acknowledged.
 pub fn on_timer() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     write(REG_EOI, 0);
+    crate::sched::on_tick();
 }
 
 /// Spurious interrupt: count it, and do NOT send EOI.
@@ -197,7 +200,7 @@ fn disable_interrupts() {
 /// One unit of deterministic work that keeps integer and SSE registers
 /// busy. Run with interrupts on and off, it must give identical results.
 #[inline(never)]
-fn work(state: &mut (u64, f64), steps: u64) {
+pub(crate) fn work(state: &mut (u64, f64), steps: u64) {
     let (mut a, mut x) = *state;
     for i in 0..core::hint::black_box(steps) {
         a = a.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i | 1);

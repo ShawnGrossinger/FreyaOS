@@ -26,8 +26,11 @@
 //!
 //! Misuse halts with a message instead of corrupting memory: freeing a
 //! pointer outside the heap, freeing something already free (double free),
-//! or re-entering the allocator (e.g. allocating from an exception handler
-//! that interrupted an allocation).
+//! allocating or freeing inside a hardware interrupt handler, or
+//! re-entering the allocator.
+//!
+//! Concurrency: the allocator runs with interrupts disabled, so a task
+//! switch can never land in the middle of a free-list update.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -69,9 +72,13 @@ static mut HEAP: Heap = Heap {
     frees: 0,
 };
 
-/// Held for the duration of every alloc/free. With one CPU and interrupts
-/// off, finding it already held can only mean re-entry.
+/// Held for the duration of every alloc/free, with interrupts disabled.
+/// With one CPU, finding it already held can only mean re-entry (for
+/// example an exception raised inside the allocator, whose handler then
+/// allocates).
 static LOCK: AtomicBool = AtomicBool::new(false);
+/// Whether interrupts were enabled when the lock was taken.
+static LOCK_RESTORE_IF: AtomicBool = AtomicBool::new(false);
 
 fn fatal(msg: &[u8], value: u64) -> ! {
     crate::serial_write_str(b"[heap] FATAL: ");
@@ -82,13 +89,27 @@ fn fatal(msg: &[u8], value: u64) -> ! {
 }
 
 fn lock() {
+    // Interrupt handlers must not allocate: a tick can arrive at any
+    // instruction, including ones that hold this lock or that the
+    // scheduler is in the middle of.
+    if crate::idt::irq_depth() > 0 {
+        fatal(b"heap used inside a hardware interrupt handler, depth ", crate::idt::irq_depth());
+    }
+    let interrupts_were_on = crate::cpu::interrupts_enabled();
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
     if LOCK.swap(true, Ordering::Acquire) {
         fatal(b"allocator re-entered (allocating inside an exception handler?) ", 0);
     }
+    LOCK_RESTORE_IF.store(interrupts_were_on, Ordering::Relaxed);
+    crate::cpu::assert_interrupts_off(b"heap");
 }
 
 fn unlock() {
+    let restore = LOCK_RESTORE_IF.load(Ordering::Relaxed);
     LOCK.store(false, Ordering::Release);
+    if restore {
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    }
 }
 
 fn align_up(x: usize, align: usize) -> usize {
@@ -282,7 +303,7 @@ unsafe impl GlobalAlloc for KernelHeap {
 }
 
 #[global_allocator]
-static GLOBAL: KernelHeap = KernelHeap;
+pub(crate) static GLOBAL: KernelHeap = KernelHeap;
 
 // ===========================================================================
 // Stats

@@ -193,6 +193,13 @@ impl AddressSpace {
     /// The caller decides what `phys` is. Mapping a frame someone else owns,
     /// or device memory with KERNEL_DATA's caching, is not caught here.
     pub unsafe fn map(&mut self, virt: u64, phys: u64, flags: PageFlags) -> Result<(), MapError> {
+        // Interrupts off: a task switch mid-walk could let another task
+        // build a conflicting table under the same entry.
+        crate::cpu::without_interrupts(|| self.map_locked(virt, phys, flags))
+    }
+
+    unsafe fn map_locked(&mut self, virt: u64, phys: u64, flags: PageFlags) -> Result<(), MapError> {
+        crate::cpu::assert_interrupts_off(b"vmm map");
         if virt % PAGE_SIZE != 0 || phys % PAGE_SIZE != 0 {
             return Err(MapError::Misaligned);
         }
@@ -241,6 +248,11 @@ impl AddressSpace {
     /// # Safety
     /// Nothing may still be using the page through `virt`.
     pub unsafe fn unmap(&mut self, virt: u64) -> Result<u64, UnmapError> {
+        crate::cpu::without_interrupts(|| self.unmap_locked(virt))
+    }
+
+    unsafe fn unmap_locked(&mut self, virt: u64) -> Result<u64, UnmapError> {
+        crate::cpu::assert_interrupts_off(b"vmm unmap");
         if virt % PAGE_SIZE != 0 {
             return Err(UnmapError::Misaligned);
         }

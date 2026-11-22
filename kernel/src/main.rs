@@ -7,6 +7,7 @@ use core::panic::PanicInfo;
 
 mod apic;
 mod boot;
+mod cpu;
 mod disk_io;
 mod gdt;
 mod heap;
@@ -14,6 +15,7 @@ mod idt;
 mod paging;
 mod pic;
 mod pmm;
+mod sched;
 mod selftest;
 mod vmm;
 
@@ -342,6 +344,24 @@ pub extern "C" fn rust_start() -> ! {
         Err(why) => selftest::check(b"apic", why, false),
     };
 
+    // --- Scheduler: the boot thread becomes task 0 ---
+    // Only with a working timer: sleeping and preemption both run off it,
+    // and without ticks the sleep test would wait forever.
+    let sched_ok = if !irq_ok {
+        selftest::check(b"sched", b"scheduler not started: it needs the timer", false)
+    } else if sched::init().is_err() {
+        selftest::check(b"sched", b"scheduler not started: no memory for the idle task", false)
+    } else {
+        serial_write_str(b"[sched] scheduler on: ");
+        serial_write_u64(sched::MAX_TASKS as u64);
+        serial_write_str(b" task slots, ");
+        serial_write_u64(sched::STACK_SIZE / 1024);
+        serial_write_str(b" KiB stacks at ");
+        serial_write_hex(sched::TASK_STACKS_BASE);
+        serial_write_str(b", preempted every timer tick\n");
+        sched::selftest()
+    };
+
     // --- VGA status display (screen was cleared at entry) ---
     // Steps with no result value either succeed or end in an exception
     // report, so reaching this point means they passed.
@@ -356,23 +376,37 @@ pub extern "C" fn rust_start() -> ! {
     vga_status(8, b"Kernel heap:     ", heap_ok);
     vga_status(9, b"Sanitise check:  ", sanitize_ok);
     vga_status(10, b"Timer interrupt: ", irq_ok);
+    vga_status(11, b"Scheduler:       ", sched_ok);
 
     // --- One line that says whether everything is up ---
     let all_ok = selftest::summary();
     let (passed, failed) = selftest::counts();
-    vga_summary(11, passed, failed);
+    vga_summary(12, passed, failed);
 
     // Build-time fault demo, if one was requested (halts).
     run_requested_demo();
 
-    if all_ok {
-        vga_print(12, b"--- FreyaOS foundation ready ---", 0x0F);
-        serial_write_str(b"[kernel] init complete - idle, timer running\n");
-    } else {
-        vga_print(12, b"--- SELF-TEST FAILURE: see serial log ---", 0x0C);
-        serial_write_str(b"[kernel] init complete WITH FAILURES - idle\n");
+    // The uptime line is kept current by a task of its own.
+    if sched::is_enabled() && sched::spawn("clock", clock_task, 14).is_err() {
+        serial_write_str(b"[kernel] could not start the clock task\n");
     }
-    idle(13);
+
+    if all_ok {
+        vga_print(13, b"--- FreyaOS foundation ready ---", 0x0F);
+        serial_write_str(b"[kernel] init complete - boot thread done; scheduler and timer running\n");
+    } else {
+        vga_print(13, b"--- SELF-TEST FAILURE: see serial log ---", 0x0C);
+        serial_write_str(b"[kernel] init complete WITH FAILURES\n");
+    }
+
+    // Boot is done. With the scheduler running, the boot thread just ends:
+    // the idle task and the clock take over. Without it, idle right here.
+    if sched::is_enabled() {
+        sched::exit();
+    }
+    loop {
+        unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
+    }
 }
 
 /// "Self-tests:      N passed, M failed", green if none failed.
@@ -429,22 +463,21 @@ impl VgaLine {
     }
 }
 
-/// After boot: sleep until the next interrupt, forever, keeping the uptime
-/// line on screen current. `sti; hlt` as a pair cannot miss a wakeup: an
-/// interrupt is only taken after the instruction following `sti`, which is
-/// the `hlt` itself.
-fn idle(row: usize) -> ! {
-    let mut shown = u64::MAX;
+/// Task: keep the uptime line on screen current, waking once a second.
+fn clock_task(row: u64) {
     loop {
         let ticks = apic::ticks();
-        let seconds = ticks / apic::TIMER_HZ;
-        if seconds != shown {
-            shown = seconds;
-            let mut line = VgaLine::new();
-            line.put(b"Uptime:          ").num(seconds).put(b" s  (").num(ticks).put(b" timer ticks)");
-            vga_print(row, line.as_bytes(), 0x07);
-        }
-        unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
+        let mut line = VgaLine::new();
+        line.put(b"Uptime:          ")
+            .num(ticks / apic::TIMER_HZ)
+            .put(b" s  (")
+            .num(ticks)
+            .put(b" timer ticks, ")
+            .num(sched::switches())
+            .put(b" task switches)");
+        vga_print(row as usize, line.as_bytes(), 0x07);
+        // Wake at the start of the next second.
+        sched::sleep_ticks(apic::TIMER_HZ - ticks % apic::TIMER_HZ);
     }
 }
 
@@ -471,6 +504,8 @@ fn run_requested_demo() {
             "stack_overflow" => {
                 demo_stack_overflow(0);
             }
+            // The same, on a task's 16 KiB stack instead of the boot stack
+            "task_stack_overflow" => sched::demo_task_stack_overflow(),
             // #PF, instruction fetch: kernel code through its no-execute
             // physical-map alias
             "nx" => {
@@ -486,8 +521,8 @@ fn run_requested_demo() {
             // [kernel] PANIC with file and line
             "panic" => panic!("FREYA_DEMO=panic"),
             _ => {
-                serial_write_str(b"[demo] unknown; known: ud2 page_fault stack_overflow nx \
-                                   use_after_unmap write_read_only heap_double_free panic\n");
+                serial_write_str(b"[demo] unknown; known: ud2 page_fault stack_overflow \
+                                   task_stack_overflow nx use_after_unmap write_read_only heap_double_free panic\n");
                 return;
             }
         }
@@ -510,9 +545,9 @@ fn vga_status(row: usize, label: &[u8], ok: bool) {
     vga_print(row, &line[..len.min(line.len())], attr);
 }
 
-/// Demo only: recurse until the kernel stack runs into its guard page.
-/// Each frame keeps a 512-byte buffer alive so the 64 KiB stack is used up
-/// in ~120 calls. black_box stops the compiler from turning the recursion
+/// Demo only: recurse until the stack runs into its guard page. Each frame
+/// keeps a 512-byte buffer alive, so the 64 KiB boot stack is used up in
+/// ~120 calls and a 16 KiB task stack in ~30. black_box stops the compiler from turning the recursion
 /// into a loop or deleting the buffer.
 #[inline(never)]
 fn demo_stack_overflow(depth: u64) -> u64 {
@@ -536,7 +571,7 @@ fn halt() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // File, line and (for messages without {} arguments) the text. Printed
-    // without core::fmt, which would add ~10 KiB to the kernel.
+    // without core::fmt, which would add several KiB to the kernel.
     serial_write_str(b"\n[kernel] PANIC");
     if let Some(location) = info.location() {
         serial_write_str(b" at ");

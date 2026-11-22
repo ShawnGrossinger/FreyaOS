@@ -22,11 +22,12 @@ ROOT=out/test
 
 # name | FREYA_DEMO | RAM | patterns that must all appear, separated by ;;
 CASES=(
-  "boot-128M||128M|init complete - idle, timer running;;self-test [0-9]+ ticks in 100 ms"
-  "boot-4G||4G|physical map at 0xffff800000000000: 4096 MiB;;init complete - idle, timer running"
+  "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after"
+  "boot-4G||4G|physical map at 0xffff800000000000: 4096 MiB;;init complete - boot thread done; scheduler and timer running"
   "ud2|ud2|128M|vector 6 #UD Invalid Opcode"
   "page_fault|page_fault|128M|vector 14 #PF Page Fault;;cr2=0x0000000010000000;;page not present, read"
-  "stack_overflow|stack_overflow|128M|vector 8 #DF Double Fault;;KERNEL STACK OVERFLOW"
+  "stack_overflow|stack_overflow|128M|vector 8 #DF Double Fault;;KERNEL STACK OVERFLOW;;running task: 0 'boot'"
+  "task_stack_overflow|task_stack_overflow|128M|vector 8 #DF Double Fault;;TASK STACK OVERFLOW \(task [0-9]+ 'overflow-demo';;running task: [0-9]+ 'overflow-demo'"
   "nx|nx|128M|vector 14 #PF Page Fault;;protection violation, instruction fetch"
   "use_after_unmap|use_after_unmap|128M|vector 14 #PF Page Fault;;cr2=0xffffc00000100000;;page not present, read"
   "write_read_only|write_read_only|128M|vector 14 #PF Page Fault;;protection violation, write"
@@ -82,15 +83,15 @@ for entry in "${CASES[@]}"; do
   IFS='|' read -r name demo mem patterns <<< "$entry"
   selected "$name" || continue
   dir="$ROOT/$name"; mkdir -p "$dir"
-  printf '  %-18s building...' "$name"
+  printf '  %-19s building...' "$name"
 
   if ! make -s OUTDIR="$dir" FREYA_DEMO="$demo" all > "$dir/build.log" 2>&1; then
-    printf '\r  FAIL  %-18s build failed (see %s)\n' "$name" "$dir/build.log"
+    printf '\r  FAIL  %-19s build failed (see %s)\n' "$name" "$dir/build.log"
     tail -5 "$dir/build.log" | sed 's/^/          /'
     fail=$((fail + 1)); continue
   fi
 
-  printf '\r  %-18s booting... ' "$name"
+  printf '\r  %-19s booting... ' "$name"
   boot "$dir/freya-os.img" "$mem" "$dir/serial.log"
 
   missing=()
@@ -104,10 +105,10 @@ for entry in "${CASES[@]}"; do
   if [ "${#missing[@]}" -eq 0 ] && [ -z "$failed_lines" ]; then
     summary=$(grep -oE "$COMMON" "$dir/serial.log" | head -1)
     shown=$(grep -oE -- "${wanted[0]}" "$dir/serial.log" | head -1)
-    printf '\r  PASS  %-18s %s | %s\n' "$name" "$summary" "$shown"
+    printf '\r  PASS  %-19s %s | %s\n' "$name" "$summary" "$shown"
     pass=$((pass + 1))
   else
-    printf '\r  FAIL  %-18s (serial log: %s)\n' "$name" "$dir/serial.log"
+    printf '\r  FAIL  %-19s (serial log: %s)\n' "$name" "$dir/serial.log"
     for p in "${missing[@]}"; do echo "          missing: $p"; done
     [ -n "$failed_lines" ] && echo "$failed_lines" | sed 's/^/          /'
     echo "          last lines:"
