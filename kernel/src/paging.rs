@@ -59,15 +59,19 @@ pub const IDENTITY_MAP_BYTES: u64 = 8 * 1024 * 1024;
 // Bits 51:12 hold the physical address of the next table or the page.
 // The NX bit (63) is reserved until EFER.NXE is enabled, so it stays 0.
 
-const PRESENT: u64 = 1 << 0;
-const WRITABLE: u64 = 1 << 1;
-const HUGE: u64 = 1 << 7;
-const NO_EXECUTE: u64 = 1 << 63; // only legal once EFER.NXE = 1
+// pub(crate): vmm.rs builds entries with the same bits.
+pub(crate) const PRESENT: u64 = 1 << 0;
+pub(crate) const WRITABLE: u64 = 1 << 1;
+pub(crate) const HUGE: u64 = 1 << 7;
+pub(crate) const NO_EXECUTE: u64 = 1 << 63; // only legal once EFER.NXE = 1
 
 /// Bits 51:12 of an entry: the physical address it points to.
-const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+pub(crate) const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 const ENTRIES: usize = 512;
+
+/// CR0 bit 16.
+pub(crate) const CR0_WRITE_PROTECT: u64 = 1 << 16;
 
 /// One 4 KiB-aligned table of 512 entries. Every paging level uses this
 /// same shape; what an entry means depends on the level it's in.
@@ -82,6 +86,21 @@ static mut PML4: PageTable = PageTable([0; ENTRIES]);
 static mut PDPT: PageTable = PageTable([0; ENTRIES]);
 static mut PD: PageTable = PageTable([0; ENTRIES]);
 static mut PT_LOW: PageTable = PageTable([0; ENTRIES]); // first 2 MiB, 4 KiB pages
+
+/// Physical address of the kernel's PML4 (the root of its address space).
+/// The statics sit in the identity map, so their address is physical.
+pub(crate) fn kernel_root() -> u64 {
+    &raw const PML4 as u64
+}
+
+/// True for the four tables above, which live in the kernel image and must
+/// never be handed to the frame allocator, even when they become empty.
+pub(crate) fn is_boot_table(phys: u64) -> bool {
+    phys == &raw const PML4 as u64
+        || phys == &raw const PDPT as u64
+        || phys == &raw const PD as u64
+        || phys == &raw const PT_LOW as u64
+}
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -123,6 +142,16 @@ pub fn init() -> u64 {
         // so execution continues seamlessly.
         let cr3 = pml4 as u64;
         asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+
+        // --- CR0.WP: make ring 0 honour read-only pages ---
+        // With WP clear, the CPU only enforces read-only pages against user
+        // mode; kernel writes go straight through. Stage2 leaves it clear,
+        // so without this every read-only mapping is read-only in name only.
+        let mut cr0: u64;
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        cr0 |= CR0_WRITE_PROTECT;
+        asm!("mov cr0, {}", in(reg) cr0, options(nostack, preserves_flags));
+
         cr3
     }
 }
@@ -144,6 +173,12 @@ pub const PHYS_MAP_BASE: u64 = 0xFFFF_8000_0000_0000;
 pub const PHYS_MAP_MAX: u64 = 512 * 1024 * 1024 * 1024;
 
 static PHYS_MAP_READY: AtomicBool = AtomicBool::new(false);
+static NX_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// True once EFER.NXE is on, i.e. NO_EXECUTE may be set in an entry.
+pub(crate) fn nx_enabled() -> bool {
+    NX_ENABLED.load(Ordering::Acquire)
+}
 
 /// Kernel-virtual address for a physical address.
 ///
@@ -189,6 +224,7 @@ pub struct PhysMapStats {
 /// must hold at least physmap_table_bound(e820) frames.
 pub unsafe fn map_physical_memory(e820: &[E820Entry], early: &mut EarlyFrames) -> PhysMapStats {
     let nx = enable_no_execute();
+    NX_ENABLED.store(nx, Ordering::Release);
     let leaf_flags = PRESENT | WRITABLE | HUGE | if nx { NO_EXECUTE } else { 0 };
 
     let mut stats = PhysMapStats {

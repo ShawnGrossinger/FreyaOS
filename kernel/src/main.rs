@@ -9,6 +9,7 @@ mod gdt;
 mod idt;
 mod paging;
 mod pmm;
+mod vmm;
 
 use boot::read_e820_map;
 
@@ -293,6 +294,13 @@ pub extern "C" fn rust_start() -> ! {
     let pmm_ok = unsafe { pmm::selftest(e820) };
     let physmap_ok = unsafe { paging::selftest(e820) };
 
+    // --- Page mapping API: map/unmap/translate 4 KiB pages ---
+    let vmm_ok = unsafe { vmm::selftest() };
+
+    // Fault demos for the mapping API (each halts):
+    // unsafe { vmm::demo_use_after_unmap(); }  // #PF, not present
+    // unsafe { vmm::demo_write_read_only(); }  // #PF, protection violation on write
+
     // Fault demo for the physical map (halts): jump to the kernel's own
     // code through its physical-map alias. NX makes that an instruction-
     // fetch page fault even though the bytes are valid code.
@@ -341,13 +349,14 @@ pub extern "C" fn rust_start() -> ! {
     vga_status(4, b"Memory map:      ", true);
     vga_status(5, b"Frame allocator: ", pmm_ok);
     vga_status(6, b"Physical map:    ", physmap_ok);
-    vga_status(7, b"Sanitise check:  ", sanitize_ok);
+    vga_status(7, b"Page mapping:    ", vmm_ok);
+    vga_status(8, b"Sanitise check:  ", sanitize_ok);
 
-    if selftest_ok && pmm_ok && physmap_ok && sanitize_ok {
-        vga_print(8, b"--- FreyaOS foundation ready ---", 0x0F);
+    if selftest_ok && pmm_ok && physmap_ok && vmm_ok && sanitize_ok {
+        vga_print(9, b"--- FreyaOS foundation ready ---", 0x0F);
         serial_write_str(b"[kernel] init complete - halting\n");
     } else {
-        vga_print(8, b"--- SELF-TEST FAILURE: see serial log ---", 0x0C);
+        vga_print(9, b"--- SELF-TEST FAILURE: see serial log ---", 0x0C);
         serial_write_str(b"[kernel] init complete WITH FAILURES - halting\n");
     }
     halt();
