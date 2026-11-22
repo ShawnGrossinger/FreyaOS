@@ -24,9 +24,14 @@ SECTIONS
         *(.data .data.*)
     }
 
-    .bss : {
+    /* .bss is NOBITS: objcopy -O binary leaves it out of kernel.bin, so
+     * stage2 never loads it. _start zeroes [__bss_start, __bss_end). */
+    .bss : ALIGN(16) {
+        __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
+        . = ALIGN(16);
+        __bss_end = .;
     }
 
     /DISCARD/ : {

@@ -5,6 +5,7 @@ use core::panic::PanicInfo;
 
 mod boot;
 mod disk_io;
+mod idt;
 
 use boot::{read_e820_map, E820Entry};
 
@@ -310,6 +311,23 @@ pub extern "C" fn rust_start() -> ! {
     serial_init();
     serial_write_str(b"[kernel] FreyaOS kernel starting\n");
 
+    // --- Exceptions: install the IDT before anything else can fault ---
+    let cs = idt::init();
+    serial_write_str(b"[idt] loaded: 32 exception gates, code selector ");
+    serial_write_hex(cs as u64);
+    serial_write_str(b"\n");
+
+    if idt::selftest_breakpoint() {
+        serial_write_str(b"[idt] int3 self-test: PASS (handler returned, registers intact)\n");
+    } else {
+        serial_write_str(b"[idt] int3 self-test: FAIL\n");
+    }
+
+    // Fault-reporting demos. Uncomment ONE at a time: each one halts the
+    // kernel with a full report on serial and a summary on screen.
+    // unsafe { core::arch::asm!("ud2"); }                             // #UD, vector 6
+    // unsafe { core::ptr::read_volatile(0x1000_0000 as *const u8); } // #PF, vector 14, CR2=0x10000000
+
     // --- Read E820 memory map left by stage2 ---
     let e820 = unsafe { read_e820_map() };
 
@@ -375,7 +393,8 @@ pub extern "C" fn rust_start() -> ! {
     vga_print(5, b"Memory map:      OK", 0x0A);
     vga_print(6, b"Frame allocator: OK", 0x0A);
     vga_print(7, b"Sanitise check:  OK", 0x0A);
-    vga_print(8, b"--- FreyaOS foundation ready ---", 0x0F);
+    vga_print(8, b"Exception table: OK", 0x0A);
+    vga_print(9, b"--- FreyaOS foundation ready ---", 0x0F);
 
     serial_write_str(b"[kernel] init complete - halting\n");
     halt();
