@@ -23,7 +23,7 @@ ROOT=out/test
 # name | FREYA_DEMO | RAM | patterns that must all appear, separated by ;;
 #      | optional extra QEMU arguments
 CASES=(
-  "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!;;'probe' killed by vector 14 #PF"
+  "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!;;'probe' killed by vector 14 #PF;;\\[user [0-9]+ 'ipc'\\] printed for me by the log server;;driver handled 10"
   "boot-4G||4G|physical map at 0xffff800000000000: 4096 MiB;;init complete - boot thread done; scheduler and timer running"
   "ud2|ud2|128M|vector 6 #UD Invalid Opcode"
   "page_fault|page_fault|128M|vector 14 #PF Page Fault;;cr2=0x0000000010000000;;page not present, read"

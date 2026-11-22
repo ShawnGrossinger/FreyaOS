@@ -8,27 +8,66 @@
 //!
 //! Zero Ambient Authority: a process can do nothing by default. Each system
 //! call that acts on the world names a capability (a slot in the process's
-//! capability table, see process.rs), and the kernel refuses if that slot
-//! doesn't hold the right one. Today there is one such call, write, and one
-//! kind of capability, the console. exit and yield act only on the caller.
+//! capability table, see cap.rs), and the kernel refuses if that slot
+//! doesn't hold the right kind with the right rights. exit and yield act
+//! only on the caller; reply answers a call the caller received.
+//!
+//!   0 exit(code)                       -> never returns
+//!   1 yield()                          -> 0
+//!   2 write(console, ptr, len)         -> bytes written
+//!   3 send(endpoint, w0..w3, xfer)     -> 0                     (ipc.rs)
+//!   4 recv(endpoint)                   -> 0 + message registers
+//!   5 call(endpoint, w0..w3, xfer)     -> 0 + reply registers
+//!   6 reply(-, w0..w3, xfer)           -> 0
+//!   7 port_in(ports, port, width)      -> value                 (irq.rs)
+//!   8 port_out(ports, port, width, v)  -> 0
+//!   9 irq_wait(irq)                    -> 0 once the line has fired
+//!  10 irq_ack(irq)                     -> 0
+//!
+//! Message registers: send/call take the four words in RSI, RDX, R10, R8
+//! and in R9 the slot of a capability to pass along (-1 for none). recv and
+//! call return the badge in RDI, the words in RSI, RDX, R10, R8 and in R9
+//! the slot a received capability landed in (-1 for none).
 //!
 //! The kernel never trusts a pointer from a process. A buffer must lie in
 //! user space, and every page of it must be mapped for ring 3 in the
 //! caller's address space; the kernel then copies it through the physical
 //! map, never through the user address itself.
 
-use crate::process::Cap;
+use crate::cap::Cap;
+use crate::ipc::{self, Message};
 use crate::sched::{self, ExitStatus};
 use crate::vmm::{self, AddressSpace};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub const SYS_EXIT: u64 = 0; // exit(code) -> never returns
-pub const SYS_YIELD: u64 = 1; // yield() -> 0
-pub const SYS_WRITE: u64 = 2; // write(console cap, ptr, len) -> bytes written
+pub const SYS_EXIT: u64 = 0;
+pub const SYS_YIELD: u64 = 1;
+pub const SYS_WRITE: u64 = 2;
+pub const SYS_SEND: u64 = 3;
+pub const SYS_RECV: u64 = 4;
+pub const SYS_CALL: u64 = 5;
+pub const SYS_REPLY: u64 = 6;
+pub const SYS_PORT_IN: u64 = 7;
+pub const SYS_PORT_OUT: u64 = 8;
+pub const SYS_IRQ_WAIT: u64 = 9;
+pub const SYS_IRQ_ACK: u64 = 10;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
+/// write: the slot doesn't hold the console capability.
 pub const ERR_NO_CAPABILITY: i64 = -2;
 pub const ERR_BAD_ADDRESS: i64 = -3;
+/// The slot doesn't hold the kind of capability this call needs, or it
+/// lacks the right (or doesn't cover the port).
+pub const ERR_WRONG_CAPABILITY: i64 = -4;
+/// Passing a capability through an endpoint capability without GRANT.
+pub const ERR_NO_GRANT: i64 = -5;
+/// The process that was to answer ended first.
+pub const ERR_PEER_GONE: i64 = -6;
+/// Woken because the process was killed (it ends on the way out).
+pub const ERR_INTERRUPTED: i64 = -7;
+/// reply with no call to answer.
+pub const ERR_NO_REPLY: i64 = -8;
+pub const ERR_BAD_ARGUMENT: i64 = -9;
 
 /// Longest write in one call; longer ones are cut (the return value says
 /// how much was written).
@@ -47,6 +86,10 @@ const FMASK: u64 = (1 << 9) | (1 << 8) | (1 << 10) | (1 << 18) | (1 << 14);
 
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// Serialises processes' console output, so lines don't interleave. A
+/// sleeping lock: interrupts stay on while a line is printed.
+pub static CONSOLE: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 extern "C" {
     fn syscall_entry();
@@ -116,6 +159,7 @@ pub fn counts() -> (u64, u64) {
 extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
     crate::cpu::assert_kernel_mxcsr(b"syscall_entry");
     CALLS.fetch_add(1, Ordering::Relaxed);
+    let words = [f.rsi, f.rdx, f.r10, f.r8];
     let result = match f.rax {
         SYS_EXIT => sched::exit_with(ExitStatus::Code(f.rdi)),
         SYS_YIELD => {
@@ -123,6 +167,14 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
             0
         }
         SYS_WRITE => sys_write(f.rdi, f.rsi, f.rdx),
+        SYS_SEND => ipc::send(f.rdi, words, f.r9, false).0,
+        SYS_RECV => with_message(f, ipc::recv(f.rdi)),
+        SYS_CALL => with_message(f, ipc::send(f.rdi, words, f.r9, true)),
+        SYS_REPLY => ipc::reply(words, f.r9),
+        SYS_PORT_IN => crate::irq::port_io(f.rdi, f.rsi, f.rdx, 0, false),
+        SYS_PORT_OUT => crate::irq::port_io(f.rdi, f.rsi, f.rdx, f.r10, true),
+        SYS_IRQ_WAIT => crate::irq::wait(f.rdi),
+        SYS_IRQ_ACK => crate::irq::ack(f.rdi),
         _ => ERR_BAD_SYSCALL,
     };
     f.rax = result as u64;
@@ -130,6 +182,20 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
     if sched::kill_requested() {
         sched::exit_with(ExitStatus::Killed);
     }
+}
+
+/// A received message goes back in the message registers (only on success:
+/// on an error they keep what the process had).
+fn with_message(f: &mut SyscallFrame, (result, msg): (i64, Message)) -> i64 {
+    if result == 0 {
+        f.rdi = msg.badge;
+        f.rsi = msg.words[0];
+        f.rdx = msg.words[1];
+        f.r10 = msg.words[2];
+        f.r8 = msg.words[3];
+        f.r9 = msg.cap_slot;
+    }
+    result
 }
 
 /// write(handle, ptr, len): print `len` bytes at `ptr` on the console, if
@@ -174,12 +240,12 @@ fn sys_write(handle: u64, ptr: u64, len: u64) -> i64 {
 
 /// Print a process's text, every line prefixed with who wrote it, so a
 /// process can't pass its output off as the kernel's (a test harness reads
-/// this log). Unprintable bytes become '.'. Interrupts are off so the text
-/// isn't interleaved with other output (fine at QEMU speeds and 256 bytes;
-/// see the journal's open items for a real UART).
+/// this log). Unprintable bytes become '.'. The console mutex keeps
+/// processes' lines whole; interrupts stay on.
 fn print_from_process(buf: &[u8], len: usize) {
     use crate::{serial_write_byte as byte, serial_write_str as s, serial_write_u64 as dec};
-    crate::cpu::without_interrupts(|| {
+    let _console = CONSOLE.lock();
+    {
         let id = sched::current();
         let mut line_start = true;
         for &b in buf.iter().take(len) {
@@ -203,5 +269,5 @@ fn print_from_process(buf: &[u8], len: usize) {
         if !line_start {
             s(b"\n");
         }
-    });
+    }
 }

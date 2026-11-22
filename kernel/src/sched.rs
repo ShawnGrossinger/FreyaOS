@@ -45,7 +45,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::cpu::without_interrupts;
 use crate::pmm::{self, PAGE_SIZE};
-use crate::process::{Cap, Caps, NO_CAPS};
+use crate::cap::{self, Cap, Caps, NO_CAPS};
+use crate::ipc::{Message, EMPTY_MESSAGE};
 use crate::vmm::{AddressSpace, PageFlags};
 
 pub const MAX_TASKS: usize = 32;
@@ -60,7 +61,7 @@ pub const STACK_SIZE: u64 = STACK_PAGES * PAGE_SIZE; // 16 KiB
 pub type TaskId = usize;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum State {
+pub(crate) enum State {
     Free,
     /// Slot claimed by spawn(), stack not built yet. Never scheduled.
     Creating,
@@ -70,6 +71,16 @@ enum State {
     Sleeping(u64),
     /// Waiting in join() for this task to finish, or until this tick.
     Joining(TaskId, u64),
+    /// ipc.rs: offering a message on this endpoint.
+    Sending(u8),
+    /// ipc.rs: waiting for a message on this endpoint.
+    Receiving(u8),
+    /// ipc.rs: made a call that this task received; waiting for its reply.
+    AwaitingReply(TaskId),
+    /// sync.rs: waiting for the mutex with this key (its address).
+    MutexWait(usize),
+    /// irq.rs: waiting for this interrupt line.
+    IrqWait(u8),
     /// Returned or called exit(); its stack is freed by reap().
     Finished,
 }
@@ -86,9 +97,11 @@ pub enum ExitStatus {
 }
 
 #[derive(Clone, Copy)]
-struct Task {
-    state: State,
-    name: &'static str,
+pub(crate) struct Task {
+    pub(crate) state: State,
+    /// None only for a free slot. (An Option, not "", so an empty Task is
+    /// all zero bytes and the table lives in .bss, not in the kernel image.)
+    name: Option<&'static str>,
     /// Saved stack pointer while not running.
     rsp: u64,
     entry: Option<fn(u64)>,
@@ -101,8 +114,18 @@ struct Task {
     has_stack: bool,
     /// Root of its own address space; 0 for kernel tasks (kernel's).
     space: u64,
-    /// What the process may do (process.rs). Kernel tasks have none.
-    caps: Caps,
+    /// What the process may do (cap.rs). Kernel tasks have none.
+    pub(crate) caps: Caps,
+    /// ipc.rs: the message being sent, or the one received.
+    pub(crate) msg: Message,
+    /// ipc.rs: the message offered is a call (wants a reply).
+    pub(crate) calling: bool,
+    /// ipc.rs: who to answer: the caller of the last call received.
+    pub(crate) reply_to: Option<TaskId>,
+    /// Result handed to a task woken from a blocking system call.
+    pub(crate) result: i64,
+    /// When it started waiting: the oldest waiter goes first.
+    wait_seq: u64,
     /// Set when it finished.
     status: ExitStatus,
     /// kill() asked for it to stop; it does when next returning to ring 3.
@@ -111,7 +134,7 @@ struct Task {
 
 const EMPTY: Task = Task {
     state: State::Free,
-    name: "",
+    name: None,
     rsp: 0,
     entry: None,
     arg: 0,
@@ -120,6 +143,11 @@ const EMPTY: Task = Task {
     has_stack: false,
     space: 0,
     caps: NO_CAPS,
+    msg: EMPTY_MESSAGE,
+    calling: false,
+    reply_to: None,
+    result: 0,
+    wait_seq: 0,
     status: ExitStatus::Code(0),
     kill: false,
 };
@@ -129,6 +157,7 @@ static mut CURRENT: TaskId = 0;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static IDLE: AtomicU64 = AtomicU64::new(0); // the idle task's id, once init() ran
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
+static WAIT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 extern "C" {
     /// entry.asm: push callee-saved registers, store RSP to *save_rsp,
@@ -144,6 +173,30 @@ fn table() -> &'static mut [Task; MAX_TASKS] {
 
 fn current_id() -> TaskId {
     unsafe { *(&raw const CURRENT) }
+}
+
+/// Task `id`'s entry, for ipc.rs, sync.rs and irq.rs. Interrupts must be
+/// off while it is used, and it must not be held across a switch.
+pub(crate) fn task(id: TaskId) -> &'static mut Task {
+    &mut table()[id % MAX_TASKS]
+}
+
+/// The task that has waited longest among those matching `pred`.
+pub(crate) fn oldest(pred: impl Fn(&Task) -> bool) -> Option<TaskId> {
+    (0..MAX_TASKS).filter(|&i| pred(&table()[i])).min_by_key(|&i| table()[i].wait_seq)
+}
+
+/// Put the current task in waiting state `state` and run something else;
+/// returns once another task (or an interrupt) has made it Ready again.
+///
+/// # Safety
+/// Interrupts off. `state` must be one that something will end.
+pub(crate) unsafe fn block(state: State) {
+    let me = current_id();
+    let t = &mut table()[me];
+    t.state = state;
+    t.wait_seq = WAIT_SEQ.fetch_add(1, Ordering::Relaxed);
+    schedule();
 }
 
 fn slot_base(id: TaskId) -> u64 {
@@ -171,7 +224,7 @@ fn kernel_stack_top(id: TaskId) -> u64 {
 /// scheduling.
 pub fn init() -> Result<(), SpawnError> {
     without_interrupts(|| {
-        table()[0] = Task { state: State::Running, name: "boot", slices: 1, ..EMPTY };
+        table()[0] = Task { state: State::Running, name: Some("boot"), slices: 1, ..EMPTY };
         unsafe { *(&raw mut CURRENT) = 0 };
     });
     let idle = spawn("idle", idle_task, 0)?;
@@ -214,7 +267,7 @@ pub fn spawn_in(name: &'static str, entry: fn(u64), arg: u64, space: u64, caps: 
     let id = without_interrupts(|| {
         let t = table();
         let id = (1..MAX_TASKS).find(|&i| t[i].state == State::Free)?;
-        t[id] = Task { state: State::Creating, name, ..EMPTY };
+        t[id] = Task { state: State::Creating, name: Some(name), ..EMPTY };
         Some(id)
     })
     .ok_or(SpawnError::TableFull)?;
@@ -259,9 +312,10 @@ pub fn spawn_in(name: &'static str, entry: fn(u64), arg: u64, space: u64, caps: 
     }
 
     without_interrupts(|| {
+        cap::retain_all(&caps);
         table()[id] = Task {
             state: State::Ready,
-            name,
+            name: Some(name),
             rsp: top - 8 * 8,
             entry: Some(entry),
             arg,
@@ -318,6 +372,7 @@ pub fn exit_with(status: ExitStatus) -> ! {
             task.state = State::Ready;
         }
     }
+    crate::ipc::on_exit(me);
     unsafe { schedule() };
     // schedule() never picks a finished task, so this is unreachable.
     crate::halt();
@@ -343,6 +398,7 @@ pub fn reap() -> usize {
                     AddressSpace::from_root(task.space).destroy();
                 }
             }
+            cap::release_all(&task.caps);
             table()[id] = EMPTY;
             1
         });
@@ -479,6 +535,7 @@ pub fn kill(id: TaskId) -> bool {
         let alive = !matches!(task.state, State::Free | State::Finished | State::Creating);
         if id < MAX_TASKS && alive && task.space != 0 {
             task.kill = true;
+            crate::ipc::interrupt_wait(id); // if it's blocked, wake it
             true
         } else {
             false
@@ -493,10 +550,61 @@ pub fn kill_requested() -> bool {
 
 /// The current task's capability in slot `handle`, if it has one.
 pub fn current_cap(handle: u64) -> Cap {
+    if handle >= cap::MAX_CAPS as u64 {
+        return Cap::None;
+    }
     without_interrupts(|| {
         let caps = &table()[current_id()].caps;
         caps.get(handle as usize).copied().unwrap_or(Cap::None)
     })
+}
+
+/// The mutex with key `key` (its address) and owner word `owner`: take it,
+/// or wait in line for it. Ownership is handed straight to the oldest
+/// waiter on release, so nobody can barge in and nobody waits forever.
+pub(crate) fn mutex_acquire(key: usize, owner: &AtomicU64, contended: &AtomicU64) {
+    without_interrupts(|| unsafe {
+        if crate::idt::irq_depth() > 0 {
+            crate::cpu::fatal(b"mutex locked inside a hardware interrupt handler, key ", key as u64);
+        }
+        let me = current_id() as u64;
+        match owner.load(Ordering::Relaxed) {
+            FREE => owner.store(me, Ordering::Relaxed),
+            o if o == me => crate::cpu::fatal(b"mutex locked twice by the same task (deadlock), key ", key as u64),
+            _ => {
+                contended.fetch_add(1, Ordering::Relaxed);
+                block(State::MutexWait(key));
+                // Woken by mutex_release, which made us the owner.
+            }
+        }
+    });
+}
+
+pub(crate) fn mutex_release(key: usize, owner: &AtomicU64) {
+    without_interrupts(|| {
+        if owner.load(Ordering::Relaxed) != current_id() as u64 {
+            crate::cpu::fatal(b"mutex released by a task that doesn't hold it, key ", key as u64);
+        }
+        match oldest(|t| t.state == State::MutexWait(key)) {
+            Some(next) => {
+                owner.store(next as u64, Ordering::Relaxed);
+                table()[next].state = State::Ready;
+            }
+            None => owner.store(FREE, Ordering::Relaxed),
+        }
+    });
+}
+
+/// "Nobody" in a mutex's owner word.
+pub(crate) const FREE: u64 = u64::MAX;
+
+/// irq.rs, in interrupt context: wake whoever waits for `line`.
+pub(crate) fn wake_irq_waiter(line: u8) {
+    for t in table().iter_mut() {
+        if t.state == State::IrqWait(line) {
+            t.state = State::Ready;
+        }
+    }
 }
 
 /// The current task's address space root (the kernel's for kernel tasks).
@@ -514,7 +622,12 @@ pub fn current() -> TaskId {
 }
 
 pub fn name(id: TaskId) -> &'static str {
-    without_interrupts(|| table()[id].name)
+    without_interrupts(|| table()[id % MAX_TASKS].name.unwrap_or(""))
+}
+
+/// True while task `id` waits in IPC (sending, receiving, or for a reply).
+pub fn blocked_in_ipc(id: TaskId) -> bool {
+    without_interrupts(|| matches!(task(id).state, State::Sending(_) | State::Receiving(_) | State::AwaitingReply(_)))
 }
 
 /// Times task `id` has been switched in.

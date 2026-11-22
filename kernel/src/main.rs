@@ -7,17 +7,21 @@ use core::panic::PanicInfo;
 
 mod apic;
 mod boot;
+mod cap;
 mod cpu;
 mod disk_io;
 mod gdt;
 mod heap;
 mod idt;
+mod ipc;
+mod irq;
 mod paging;
 mod pic;
 mod pmm;
 mod process;
 mod sched;
 mod selftest;
+mod sync;
 mod syscall;
 mod vmm;
 
@@ -365,12 +369,14 @@ pub extern "C" fn rust_start() -> ! {
     };
 
     // --- User mode: system calls on, then processes ---
+    let mut user_mode_on = false;
     let user_ok = if !sched::is_enabled() {
         selftest::check(b"user", b"user mode not started: it needs the scheduler", false)
     } else {
         match syscall::init() {
             Err(why) => selftest::check(b"user", why, false),
             Ok(entry) => {
+                user_mode_on = true;
                 let (smep, smap) = cpu::enable_smep_smap();
                 serial_write_str(b"[user] system calls via SYSCALL at ");
                 serial_write_hex(entry);
@@ -383,6 +389,16 @@ pub extern "C" fn rust_start() -> ! {
                 process::selftest()
             }
         }
+    };
+
+    // --- Rest of Phase 4: a mutex, IPC, and the driver model ---
+    let ipc_ok = if !user_mode_on {
+        selftest::check(b"ipc", b"IPC and drivers not tested: they need user mode", false)
+    } else {
+        let mutex = sync::selftest();
+        let ipc = ipc::selftest();
+        let drivers = irq::selftest();
+        mutex && ipc && drivers
     };
 
     // --- VGA status display (screen was cleared at entry) ---
@@ -401,25 +417,26 @@ pub extern "C" fn rust_start() -> ! {
     vga_status(10, b"Timer interrupt: ", irq_ok);
     vga_status(11, b"Scheduler:       ", sched_ok);
     vga_status(12, b"User mode:       ", user_ok);
+    vga_status(13, b"IPC + drivers:   ", ipc_ok);
 
     // --- One line that says whether everything is up ---
     let all_ok = selftest::summary();
     let (passed, failed) = selftest::counts();
-    vga_summary(13, passed, failed);
+    vga_summary(14, passed, failed);
 
     // Build-time fault demo, if one was requested (halts).
     run_requested_demo();
 
     // The uptime line is kept current by a task of its own.
-    if sched::is_enabled() && sched::spawn("clock", clock_task, 15).is_err() {
+    if sched::is_enabled() && sched::spawn("clock", clock_task, 16).is_err() {
         serial_write_str(b"[kernel] could not start the clock task\n");
     }
 
     if all_ok {
-        vga_print(14, b"--- FreyaOS foundation ready ---", 0x0F);
+        vga_print(15, b"--- FreyaOS foundation ready ---", 0x0F);
         serial_write_str(b"[kernel] init complete - boot thread done; scheduler and timer running\n");
     } else {
-        vga_print(14, b"--- SELF-TEST FAILURE: see serial log ---", 0x0C);
+        vga_print(15, b"--- SELF-TEST FAILURE: see serial log ---", 0x0C);
         serial_write_str(b"[kernel] init complete WITH FAILURES\n");
     }
 

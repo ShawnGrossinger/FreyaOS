@@ -138,3 +138,12 @@ pub fn assert_kernel_mxcsr(who: &[u8]) {
         crate::halt();
     }
 }
+
+/// Print "[kernel] FATAL: <msg><value>" and halt: a kernel invariant broke.
+pub fn fatal(msg: &[u8], value: u64) -> ! {
+    crate::serial_write_str(b"[kernel] FATAL: ");
+    crate::serial_write_str(msg);
+    crate::serial_write_hex(value);
+    crate::serial_write_str(b"\n");
+    crate::halt();
+}

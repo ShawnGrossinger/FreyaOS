@@ -10,7 +10,8 @@
 //! kernel: one report line, then sched::exit_with(Fault(vector)).
 //!
 //! Two more gates carry hardware interrupts from the local APIC: the timer
-//! (apic::TIMER_VECTOR, 0x30) and spurious interrupts (0xFF).
+//! (apic::TIMER_VECTOR, 0x30) and spurious interrupts (0xFF). Vectors
+//! 0x40-0x50 are the interrupt lines user-space drivers wait on (irq.rs).
 //!
 //! Every other vector from 32 to 255 is deliberately left as an all-zero
 //! entry. If anything ever arrives on one, the CPU raises #GP (vector 13)
@@ -146,6 +147,8 @@ extern "C" {
     /// Hardware interrupt stubs (entry.asm).
     fn isr_stub_48();
     fn isr_stub_255();
+    /// entry.asm: stubs for vectors irq::VECTOR_BASE.. (one per line).
+    static irq_stub_table: [u64; crate::irq::LINES];
 }
 
 static BREAKPOINT_HITS: AtomicU64 = AtomicU64::new(0);
@@ -198,6 +201,9 @@ pub fn init() -> u16 {
             IdtEntry::interrupt_gate(isr_stub_48 as *const () as u64, cs);
         (*idt).0[crate::apic::SPURIOUS_VECTOR as usize] =
             IdtEntry::interrupt_gate(isr_stub_255 as *const () as u64, cs);
+        for (line, &stub) in (*(&raw const irq_stub_table)).iter().enumerate() {
+            (*idt).0[crate::irq::VECTOR_BASE as usize + line] = IdtEntry::interrupt_gate(stub, cs);
+        }
 
         // lidt copies base+limit into the IDTR register, so the Idtr value
         // itself can live on the stack. The table it points at cannot.
@@ -279,6 +285,15 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
             IRQ_DEPTH.fetch_sub(1, Ordering::Relaxed);
             if from_user(frame) {
                 crate::process::on_return_to_user(); // a killed process stops here
+            }
+        }
+        // Interrupt lines for user-space drivers: count, EOI, wake.
+        v if crate::irq::line_of(v).is_some() => {
+            IRQ_DEPTH.fetch_add(1, Ordering::Relaxed);
+            crate::irq::on_interrupt(v as u8 - crate::irq::VECTOR_BASE);
+            IRQ_DEPTH.fetch_sub(1, Ordering::Relaxed);
+            if from_user(frame) {
+                crate::process::on_return_to_user();
             }
         }
         v if v == crate::apic::SPURIOUS_VECTOR as u64 => {

@@ -31,7 +31,7 @@ fn main() {
     // include_bytes! (process.rs). No file system to load them from yet.
     let user_dir = PathBuf::from(&manifest_dir).join("../user");
     println!("cargo:rerun-if-changed=../user/freya.inc");
-    for program in ["hello", "probe"] {
+    for program in ["hello", "probe", "ipc", "driver"] {
         println!("cargo:rerun-if-changed=../user/{program}.asm");
         let status = Command::new("nasm")
             .args(["-f", "bin", "-I"])

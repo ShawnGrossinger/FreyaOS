@@ -5,9 +5,9 @@
 //! reaped like any other) plus:
 //!   - its own address space (vmm::AddressSpace::new_user), holding its
 //!     code, data and stack, and sharing the kernel half (kernel-only);
-//!   - a capability table: what it may do. It starts with exactly what its
-//!     creator hands it and nothing else (Zero Ambient Authority); today
-//!     the only capability there is, is the console.
+//!   - a capability table (cap.rs): what it may do. It starts with exactly
+//!     what its creator hands it and nothing else (Zero Ambient Authority),
+//!     and gains more only through IPC (ipc.rs).
 //!
 //! Its task starts in the kernel like every task (task_entry -> start)
 //! and drops to ring 3 with enter_user (entry.asm). From then on it comes
@@ -23,6 +23,7 @@
 //!   0x0000_0000_4010_0000  data, read + write, zeroed (USER_DATA_PAGES)
 //!   0x0000_7FFF_0000_0000  top of the stack, read + write (16 KiB below)
 
+use crate::cap::{Caps, CONSOLE_ONLY, NO_CAPS};
 use crate::pmm::{self, PAGE_SIZE};
 use crate::sched::{self, ExitStatus, SpawnError, TaskId};
 use crate::vmm::{AddressSpace, PageFlags};
@@ -33,25 +34,6 @@ pub const USER_DATA_BASE: u64 = USER_CODE_BASE + MAX_CODE_BYTES;
 pub const USER_DATA_PAGES: u64 = 1;
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_0000_0000;
 pub const USER_STACK_PAGES: u64 = 4;
-
-// ===========================================================================
-// Capabilities
-// ===========================================================================
-
-/// One entry in a process's capability table. A system call names a slot;
-/// the kernel checks what is in it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Cap {
-    None,
-    /// May write to the console (serial log).
-    Console,
-}
-
-pub const MAX_CAPS: usize = 4;
-pub type Caps = [Cap; MAX_CAPS];
-pub const NO_CAPS: Caps = [Cap::None; MAX_CAPS];
-/// The console capability in slot 0 (user/freya.inc: CONSOLE equ 0).
-pub const CONSOLE_ONLY: Caps = [Cap::Console, Cap::None, Cap::None, Cap::None];
 
 // ===========================================================================
 // Programs
@@ -67,6 +49,18 @@ pub struct Program {
 pub static HELLO: Program = Program {
     name: "hello",
     image: include_bytes!(concat!(env!("OUT_DIR"), "/hello.bin")),
+};
+
+/// IPC test program: its argument picks a role (user/ipc.asm).
+pub static IPC: Program = Program {
+    name: "ipc",
+    image: include_bytes!(concat!(env!("OUT_DIR"), "/ipc.bin")),
+};
+
+/// A user-space driver in miniature (user/driver.asm).
+pub static DRIVER: Program = Program {
+    name: "driver",
+    image: include_bytes!(concat!(env!("OUT_DIR"), "/driver.bin")),
 };
 
 /// Test program: its argument picks one thing to try (user/probe.asm).
@@ -295,6 +289,7 @@ fn fp_task(_: u64) {
 /// Runs on the boot thread with the scheduler going.
 pub fn selftest() -> bool {
     let mut ok = true;
+    sched::reap(); // so earlier tests' finished tasks don't skew the baseline
     let baseline = sched::free_frames_and_heap();
     let (_, bytes_before) = crate::syscall::counts();
 

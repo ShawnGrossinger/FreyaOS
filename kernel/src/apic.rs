@@ -175,6 +175,20 @@ pub fn on_timer() {
     crate::sched::on_tick();
 }
 
+/// End-Of-Interrupt for any other interrupt handled through the local APIC.
+pub fn end_of_interrupt() {
+    write(REG_EOI, 0);
+}
+
+/// Send this CPU an interrupt on `vector` (ICR, "self" shorthand, fixed
+/// delivery, edge). Used to raise irq.rs's test line.
+pub fn send_self_ipi(vector: u8) {
+    const REG_ICR_LOW: usize = 0x300;
+    const ICR_ASSERT: u32 = 1 << 14;
+    const ICR_TO_SELF: u32 = 0b01 << 18;
+    write(REG_ICR_LOW, vector as u32 | ICR_ASSERT | ICR_TO_SELF);
+}
+
 /// Spurious interrupt: count it, and do NOT send EOI.
 pub fn on_spurious() {
     SPURIOUS.fetch_add(1, Ordering::Relaxed);

@@ -120,6 +120,14 @@ global isr_stub_255
 ISR_NOERR 48    ;      APIC timer
 ISR_NOERR 255   ;      APIC spurious interrupt
 
+; Interrupt lines for user-space drivers (src/irq.rs): line n on vector
+; 0x40 + n. Lines 0-15 are the ISA interrupts, line 16 the test line.
+%assign v 0x40
+%rep 17
+ISR_NOERR v
+%assign v v+1
+%endrep
+
 ; ---------------------------------------------------------------------------
 ; isr_common — shared path for every exception and hardware interrupt.
 ;
@@ -376,6 +384,16 @@ align 8
 isr_stub_table:
 %assign i 0
 %rep 32
+    dq isr_stub_%+i
+%assign i i+1
+%endrep
+
+; Stubs for the driver interrupt lines, vectors 0x40-0x50, in order.
+global irq_stub_table
+align 8
+irq_stub_table:
+%assign i 0x40
+%rep 17
     dq isr_stub_%+i
 %assign i i+1
 %endrep
