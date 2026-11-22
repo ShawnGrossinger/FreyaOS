@@ -182,8 +182,11 @@ for entry in "${CASES[@]}"; do
     grep -qE -- "$p" "$dir/serial.log" || missing+=("$p")
   done
   failed_lines=$(grep -E ': FAIL$' "$dir/serial.log")
+  # A process's line starting in the middle of another line means two
+  # writers were interleaved (Entry 17). Every case checks for it.
+  interleaved=$(grep -nE '.\[user [0-9]+ ' "$dir/serial.log" | head -2)
 
-  if [ "${#missing[@]}" -eq 0 ] && [ -z "$failed_lines" ]; then
+  if [ "${#missing[@]}" -eq 0 ] && [ -z "$failed_lines" ] && [ -z "$interleaved" ]; then
     summary=$(grep -oE "$COMMON" "$dir/serial.log" | head -1)
     shown=$(grep -oE -- "${wanted[0]}" "$dir/serial.log" | head -1)
     printf '\r  PASS  %-19s %s | %s\n' "$name" "$summary" "$shown"
@@ -192,6 +195,7 @@ for entry in "${CASES[@]}"; do
     printf '\r  FAIL  %-19s (serial log: %s)\n' "$name" "$dir/serial.log"
     for p in "${missing[@]}"; do echo "          missing: $p"; done
     [ -n "$failed_lines" ] && echo "$failed_lines" | sed 's/^/          /'
+    [ -n "$interleaved" ] && echo "$interleaved" | sed 's/^/          interleaved output: /'
     echo "          last lines:"
     tail -4 "$dir/serial.log" | sed 's/^/            /'
     fail=$((fail + 1))

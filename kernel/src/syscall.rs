@@ -257,11 +257,13 @@ fn sys_write(handle: u64, ptr: u64, len: u64) -> i64 {
 /// Print a process's text, every line prefixed with who wrote it, so a
 /// process can't pass its output off as the kernel's (a test harness reads
 /// this log). Unprintable bytes become '.'. The console mutex keeps
-/// processes' lines whole; interrupts stay on.
+/// processes in turn; the printing itself runs with interrupts off (at most
+/// MAX_WRITE bytes), so no task, the kernel's boot thread included, can be
+/// switched in to print into the middle of it (Entry 17).
 fn print_from_process(buf: &[u8], len: usize) {
     use crate::{serial_write_byte as byte, serial_write_str as s, serial_write_u64 as dec};
     let _console = CONSOLE.lock();
-    {
+    crate::cpu::without_interrupts(|| {
         let id = sched::current();
         let mut line_start = true;
         for &b in buf.iter().take(len) {
@@ -285,5 +287,5 @@ fn print_from_process(buf: &[u8], len: usize) {
         if !line_start {
             s(b"\n");
         }
-    }
+    });
 }

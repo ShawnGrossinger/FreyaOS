@@ -231,18 +231,20 @@ fn vga_cell(row: usize, col: usize, ch: u8, attr: u8) {
 // Out of line on purpose: these are called from dozens of places, and
 // letting the compiler inline the UART polling loop at each one multiplied
 // the kernel's code size.
+//
+// One call is never split: it runs with interrupts off, so no other task
+// can be switched in halfway and print into the middle of it (Entry 17: the
+// keyboard driver's first line landed inside "init complete").
 #[inline(never)]
 fn serial_write_str(s: &[u8]) {
-
-    for &b in s {
-
-        if b == b'\n' {
-
-            serial_write_byte(b'\r');
+    cpu::without_interrupts(|| {
+        for &b in s {
+            if b == b'\n' {
+                serial_write_byte(b'\r');
+            }
+            serial_write_byte(b);
         }
-
-        serial_write_byte(b);
-    }
+    });
 }
 
 /// Write a u64 as decimal to serial.
