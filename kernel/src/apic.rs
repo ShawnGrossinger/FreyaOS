@@ -187,11 +187,31 @@ pub fn end_of_interrupt() {
 
 /// Send this CPU an interrupt on `vector` (ICR, "self" shorthand, fixed
 /// delivery, edge). Used to raise irq.rs's test line.
-pub fn send_self_ipi(vector: u8) {
+///
+/// On real hardware the send is asynchronous: the ICR's delivery-status bit
+/// stays set until the APIC has sent it, and Intel's manual says not to
+/// write the ICR again until it clears. (QEMU sends at once, so the T430 was
+/// the first machine to show this; see Entry 14.) Returns false if a send
+/// never completed.
+pub fn send_self_ipi(vector: u8) -> bool {
     const REG_ICR_LOW: usize = 0x300;
+    const ICR_SEND_PENDING: u32 = 1 << 12;
     const ICR_ASSERT: u32 = 1 << 14;
     const ICR_TO_SELF: u32 = 0b01 << 18;
+    let idle = || {
+        for _ in 0..1_000_000 {
+            if read(REG_ICR_LOW) & ICR_SEND_PENDING == 0 {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        false
+    };
+    if !idle() {
+        return false;
+    }
     write(REG_ICR_LOW, vector as u32 | ICR_ASSERT | ICR_TO_SELF);
+    idle()
 }
 
 /// Spurious interrupt: count it, and do NOT send EOI.

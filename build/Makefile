@@ -29,7 +29,7 @@ STAGE2    := $(OUTDIR)/stage2.bin
 KERNELELF := $(OUTDIR)/kernel.elf
 KERNELBIN := $(OUTDIR)/kernel.bin
 
-.PHONY: all clean run trace debug test rehearse usb
+.PHONY: all clean run trace debug test rehearse usb usb-clear
 
 all: $(IMG)
 
@@ -193,6 +193,12 @@ usb: $(IMG)
 	@[ -n "$(DEV)" ] || { echo "usage: make usb DEV=/dev/sdX"; ./write-usb.sh --list; exit 2; }
 	@[ -z "$(FREYA_DEMO)" ] || { echo "FREYA_DEMO=$(FREYA_DEMO) is set: that image crashes on purpose. Unset it first."; exit 2; }
 	./write-usb.sh $(IMG) $(DEV)
+
+# Turn the stick back into an empty FAT32 stick: make usb-clear DEV=/dev/sdX
+# (same checks as usb; LABEL=NAME to name it, default USB).
+usb-clear:
+	@[ -n "$(DEV)" ] || { echo "usage: make usb-clear DEV=/dev/sdX"; ./write-usb.sh --list; exit 2; }
+	./write-usb.sh --clear $(DEV)
 
 # Build and boot every test case headless, check each one's output, and
 # print a summary. Non-zero exit if anything failed. See test.sh.

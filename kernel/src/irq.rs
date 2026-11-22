@@ -167,8 +167,27 @@ pub fn line_of(vector: u64) -> Option<u8> {
 }
 
 /// Raise the test line (sends this CPU an interrupt on its vector).
-pub fn raise_test_line() {
-    crate::apic::send_self_ipi(VECTOR_BASE + TEST_LINE);
+/// Raise the test line and wait until the CPU has taken the interrupt.
+///
+/// An interrupt that is sent but not yet taken sits as one bit in the local
+/// APIC's request register, so a second send of the same vector before the
+/// CPU takes the first merges with it: two sends, one interrupt. Real
+/// hardware delivers a little after the send; QEMU delivers at once, which
+/// is why only the T430 showed it (Entry 14). Waiting here makes "raised"
+/// mean "delivered". Returns false if it wasn't delivered within the bound
+/// (or interrupts are off, when it can't be).
+pub fn raise_test_line() -> bool {
+    let before = total();
+    if !crate::apic::send_self_ipi(VECTOR_BASE + TEST_LINE) || !crate::cpu::interrupts_enabled() {
+        return false;
+    }
+    for _ in 0..10_000_000 {
+        if total() != before {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
 }
 
 /// Interrupts delivered on all lines so far.
@@ -335,25 +354,40 @@ pub fn selftest() -> bool {
     //    driver blocks in irq_wait; each interrupt wakes it. They come in
     //    back-to-back pairs, so the second of each pair arrives while the
     //    driver is still busy with the first: counted, not lost.
+    //    Each raise waits until the CPU has taken the interrupt (see
+    //    raise_test_line), so the pair is two interrupts, not one.
     let before = total();
     let driver = process::spawn(&DRIVER, IRQ_LOOP, table(&[Cap::None, TEST_IRQ])).ok();
     let mut handled = None;
+    let mut raised = 0u64;
     if let Some(id) = driver {
         for _ in 0..5 {
             sched::sleep_ticks(1);
-            raise_test_line();
-            raise_test_line();
+            raised += raise_test_line() as u64;
+            raised += raise_test_line() as u64;
         }
         handled = sched::join_timeout(id, 500);
     }
     crate::serial_write_str(b"[driver] self-test an interrupt line handed to a user-space driver, in back-to-back pairs: ");
+    crate::serial_write_u64(raised);
+    crate::serial_write_str(b" of 10 delivered, ");
     crate::serial_write_u64(total() as u64 - before as u64);
-    crate::serial_write_str(b" raised, driver handled ");
-    crate::serial_write_u64(match handled {
-        Some(ExitStatus::Code(n)) => n,
-        _ => 0,
-    });
-    ok &= verdict(handled == Some(ExitStatus::Code(10)) && PENDING[TEST_LINE as usize].load(Ordering::Relaxed) == 0);
+    crate::serial_write_str(b" counted, ");
+    match handled {
+        Some(ExitStatus::Code(n)) => {
+            crate::serial_write_str(b"driver handled ");
+            crate::serial_write_u64(n);
+        }
+        // The driver exits only after 10; anything else means it was still
+        // waiting when join gave up, and the count it had is unknown.
+        _ => crate::serial_write_str(b"driver still waiting after 5 s"),
+    }
+    ok &= verdict(
+        raised == 10
+            && total() - before == 10
+            && handled == Some(ExitStatus::Code(10))
+            && PENDING[TEST_LINE as usize].load(Ordering::Relaxed) == 0,
+    );
 
     ok
 }
