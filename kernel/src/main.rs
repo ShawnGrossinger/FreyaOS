@@ -8,8 +8,9 @@ mod disk_io;
 mod gdt;
 mod idt;
 mod paging;
+mod pmm;
 
-use boot::{read_e820_map, E820Entry};
+use boot::read_e820_map;
 
 // ------------------------------------------------------------------
 // Serial (COM1) - the external truth source
@@ -120,174 +121,6 @@ fn serial_write_hex(n: u64) {
     }
 }
 
-/// -----------------------------------------------------------------------
-///  Physical frame allocator - Phase 0 (bitmap, raw -> sanitized only)
-/// 
-///  Layout in physical memory (fixed, above kernel at 1 MiB):
-///    0x0030_0000 : bitmap (512 KB covers 16 GiB at 4 KB/frame)
-///    0x0040_0000 : frame metadata table (future - placeholder for now)
-/// 
-///  The bitmap uses 1 bit per 4 KiB frame. Bit = 0 -> free, 1 -> used.
-///  All frames start marked USED; the E820 pass marks usable regions free
-///  ----------------------------------------------------------------------
-
-const PAGE_SIZE:    usize = 4096;
-const BITMAP_BASE:  usize = 0x0030_0000;       // 3 MiB - safe above kernel
-const BITMAP_BYTES: usize = 512 * 1024;        // 512 KiB covers 16 GiB
-const TOTAL_FRAMES: usize = BITMAP_BYTES * 8;  // 4 194 304 frames
-
-/// Mark a physical frame as free in the bitmap.
-/// 'frame' is the frame index (physical_address / PAGE_SIZE).
-#[inline]
-unsafe fn bitmap_set_free(frame: usize) {
-
-    if frame >= TOTAL_FRAMES { return; }
-
-    let byte = BITMAP_BASE + frame / 8;
-    let bit = frame % 8;
-    let ptr = byte as *mut u8;
-
-    *ptr &= !(1u8 << bit);
-}
-
-/// Mark a physical frame as used in the bitmap
-#[inline]
-unsafe fn bitmap_set_used(frame: usize) {
-
-    if frame >= TOTAL_FRAMES { return; }
-
-    let byte = BITMAP_BASE + frame / 8;
-    let bit = frame % 8;
-    let ptr = byte as *mut u8;
-
-    *ptr |= 1u8 << bit;
-}
-
-/// Returns true if the frame is free
-#[inline]
-unsafe fn bitmap_is_free(frame: usize) -> bool {
-
-    if frame >= TOTAL_FRAMES { return false; }
-
-    let byte = BITMAP_BASE + frame / 8;
-    let bit = frame % 8;
-    let ptr = byte as *const u8;
-
-    (*ptr & (1u8 << bit)) == 0
-}
-
-/// Allocate the lowest free physical frame, zero it (Sanitized state), and
-/// return its physical address. Returns None if memory is exhausted.
-/// 
-/// This is the Raw -> Sanitized transition from the FreyaOS memory model.
-/// Typed allocation (Sanitized -> Typed) will be added with the capability
-/// system.
-#[inline(never)]
-pub unsafe fn alloc_frame() -> Option<usize> {
-
-    for i in 0..TOTAL_FRAMES {
-
-        if bitmap_is_free(i) {
-
-            bitmap_set_used(i);
-            let phys = i * PAGE_SIZE;
-            // Sanitize: zero the frame before handing it out.
-            // This is the required Raw -> Sanitized invariant.
-            // Through the physical map, so any frame works, not just
-            // those under the 8 MiB identity map.
-            let ptr = paging::phys_to_virt(phys as u64);
-
-            core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
-            return Some(phys);
-        }
-    }
-    None
-}
-
-/// Return a frame to the allocator (Sanitized/Typed -> Raw). It is zeroed
-/// again on its next allocation, not here.
-///
-/// # Safety
-/// The caller must own `phys` (it came from alloc_frame) and must not use
-/// it afterwards. The bitmap can't tell a returned frame from a reserved
-/// one, so freeing a frame you don't own corrupts the allocator.
-pub unsafe fn free_frame(phys: usize) {
-    bitmap_set_free(phys / PAGE_SIZE);
-}
-
-/// Initialise the frame allocator from an E820 map.
-/// 
-/// Strategy:
-///   1. Mark ALL frames used (conservative default - deny everything).
-///   2. Walk E820 entries; for each usable region, mark frames free.
-///   3. Re-mark frames used for regions we own: bitmap, page tables, kernel.
-unsafe fn init_frame_allocator(e820: &[E820Entry]) {
-
-    // Step 1 - pessimistic default: everything is used / reversed.
-    let bitmap = core::slice::from_raw_parts_mut(BITMAP_BASE as *mut u8, BITMAP_BYTES);
-
-    for b in bitmap.iter_mut() {
-
-        *b = 0xFF;
-    }
-
-    // Step 2 - mark usable E820 regions free.
-    let mut usable_bytes: u64 = 0;
-
-    for entry in e820.iter() {
-
-        if !entry.is_usable() {
-
-            continue;
-        }
-
-        let start = entry.base as usize;
-        let end = (entry.base + entry.length) as usize;
-        let first_frame = start / PAGE_SIZE;
-
-        // Round end down to avoid marking partially-covered frames free.
-        let last_frame = end / PAGE_SIZE;
-
-        for frame in first_frame..last_frame {
-
-            bitmap_set_free(frame);
-        }
-
-        usable_bytes += entry.length;
-    }
-
-    // Step 3 - re-protect regions we use ourselves.
-    // Conventional low memory (0..1 MiB): BDA, IVT, EBDA, VGA, ROM.
-    protect_range(0x0000_0000, 0x0010_0000);
-
-    // Kernel loaded at 1 MiB; reserve 2 MiB for it to be safe.
-    protect_range(0x0010_0000, 0x0030_0000);
-
-    // Our bitmap.
-    protect_range(BITMAP_BASE, BITMAP_BASE + BITMAP_BYTES);
-
-    // Page tables built by stage2.
-    protect_range(0x0020_0000, 0x0020_3000);
-
-    // E820 buffer written by stage2 (4 KiB is plenty).
-    protect_range(0x0000_0500, 0x0000_1000);
-
-    serial_write_str(b"[pmm] frame allocator ready. Usable RAM: ");
-    serial_write_u64(usable_bytes / (1024 * 1024));
-    serial_write_str(b" MiB\n");
-}
-
-/// Mark every frame in [start, end) as used.
-unsafe fn protect_range(start: usize, end: usize) {
-
-    let first = start / PAGE_SIZE;
-    let last = (end + PAGE_SIZE - 1) / PAGE_SIZE;
-
-    for frame in first..last {
-
-        bitmap_set_used(frame);
-    }
-}
 
 /// Blank the 80x25 text screen and hide the BIOS's blinking cursor, so the
 /// kernel's status lines aren't interleaved with leftover BIOS output.
@@ -416,13 +249,12 @@ pub extern "C" fn rust_start() -> ! {
         serial_write_str(b"\n");
     }
 
-    // --- Initialize the physical frame allocator ---
-    unsafe { init_frame_allocator(e820); }
-
     // --- Physical map: all RAM at PHYS_MAP_BASE + phys (higher half) ---
-    // From here on, phys_to_virt() works for any frame, and alloc_frame()
-    // zeroes frames through it.
-    let pm = unsafe { paging::map_physical_memory(e820) };
+    // Its page tables come from a small run of frames right after the
+    // kernel: the real allocator can't exist yet, because its bitmap is
+    // reached through this map.
+    let mut early = pmm::EarlyFrames::after_kernel(e820, paging::physmap_table_bound(e820));
+    let pm = unsafe { paging::map_physical_memory(e820, &mut early) };
     serial_write_str(b"[paging] physical map at ");
     serial_write_hex(paging::PHYS_MAP_BASE);
     serial_write_str(b": ");
@@ -435,6 +267,30 @@ pub extern "C" fn rust_start() -> ! {
     serial_write_hex(pm.highest_addr);
     serial_write_str(if pm.nx { b", no-execute\n" } else { b", NX unsupported\n" });
 
+    // --- Frame allocator: bitmap sized from E820, placed in RAM ---
+    let (kernel_start, kernel_end) = pmm::kernel_image();
+    let ps = unsafe { pmm::init(e820, early.used()) };
+    serial_write_str(b"[pmm] bitmap: ");
+    serial_write_u64(ps.bitmap_bytes / 1024);
+    serial_write_str(b" KiB at ");
+    serial_write_hex(ps.bitmap_phys);
+    serial_write_str(b", tracking ");
+    serial_write_u64(ps.frames);
+    serial_write_str(b" frames (to ");
+    serial_write_hex(ps.frames * pmm::PAGE_SIZE);
+    serial_write_str(b")\n[pmm] reserved: low 1 MiB, kernel ");
+    serial_write_hex(kernel_start);
+    serial_write_str(b"-");
+    serial_write_hex(kernel_end);
+    serial_write_str(b", ");
+    serial_write_u64((early.used().1 - early.used().0) / pmm::PAGE_SIZE);
+    serial_write_str(b" early page-table frames, the bitmap\n[pmm] usable RAM ");
+    serial_write_u64(ps.usable_bytes / (1024 * 1024));
+    serial_write_str(b" MiB, free ");
+    serial_write_u64(ps.free_frames * pmm::PAGE_SIZE / (1024 * 1024));
+    serial_write_str(b" MiB\n");
+
+    let pmm_ok = unsafe { pmm::selftest(e820) };
     let physmap_ok = unsafe { paging::selftest(e820) };
 
     // Fault demo for the physical map (halts): jump to the kernel's own
@@ -443,7 +299,7 @@ pub extern "C" fn rust_start() -> ! {
     // unsafe { let f: extern "C" fn() = core::mem::transmute(paging::phys_to_virt(0x10_0000)); f(); }
 
     // --- Smoke-test: allocate a frame and verify it is zeroed ---
-    let sanitize_ok = match unsafe { alloc_frame() } {
+    let sanitize_ok = match unsafe { pmm::alloc_frame() } {
 
         Some(phys) => {
 
@@ -454,7 +310,7 @@ pub extern "C" fn rust_start() -> ! {
             // Verify zeroed (Sanitized invariant check).
             let slice = unsafe {
 
-                core::slice::from_raw_parts(paging::phys_to_virt(phys as u64), PAGE_SIZE)
+                core::slice::from_raw_parts(paging::phys_to_virt(phys as u64), pmm::PAGE_SIZE as usize)
             };
 
             let all_zero = slice.iter().all(|&b| b == 0);
@@ -483,11 +339,11 @@ pub extern "C" fn rust_start() -> ! {
     vga_status(2, b"Exception table: ", selftest_ok);
     vga_status(3, b"Page tables:     ", true);
     vga_status(4, b"Memory map:      ", true);
-    vga_status(5, b"Frame allocator: ", true);
+    vga_status(5, b"Frame allocator: ", pmm_ok);
     vga_status(6, b"Physical map:    ", physmap_ok);
     vga_status(7, b"Sanitise check:  ", sanitize_ok);
 
-    if selftest_ok && physmap_ok && sanitize_ok {
+    if selftest_ok && pmm_ok && physmap_ok && sanitize_ok {
         vga_print(8, b"--- FreyaOS foundation ready ---", 0x0F);
         serial_write_str(b"[kernel] init complete - halting\n");
     } else {

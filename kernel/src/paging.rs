@@ -11,7 +11,7 @@
 //!   and faults (escalating to #DF on its IST stack, see gdt.rs) instead of
 //!   silently overwriting whatever lies below 0x70000.
 //!
-//! Second, once the frame allocator is up, `map_physical_memory()` maps all
+//! Second, `map_physical_memory()` maps all
 //! RAM a second time at `PHYS_MAP_BASE` in the higher half (the "physical
 //! map"): physical address P is reachable at virtual PHYS_MAP_BASE + P.
 //! This is how the kernel touches any frame, whatever its address, without
@@ -28,6 +28,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::boot::E820Entry;
+use crate::pmm::EarlyFrames;
 
 // ---------------------------------------------------------------------------
 // Layout
@@ -45,7 +46,7 @@ const PAGE_SIZE: u64 = 4096;
 const HUGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
 
 /// Same reach as stage2's map: 4 x 2 MiB.
-const IDENTITY_MAP_BYTES: u64 = 8 * 1024 * 1024;
+pub const IDENTITY_MAP_BYTES: u64 = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Entries
@@ -140,17 +141,17 @@ pub fn is_stack_guard(addr: u64) -> bool {
 pub const PHYS_MAP_BASE: u64 = 0xFFFF_8000_0000_0000;
 
 /// One PML4 entry covers 512 GiB, which is all the physical map uses.
-const PHYS_MAP_MAX: u64 = 512 * 1024 * 1024 * 1024;
+pub const PHYS_MAP_MAX: u64 = 512 * 1024 * 1024 * 1024;
 
 static PHYS_MAP_READY: AtomicBool = AtomicBool::new(false);
 
 /// Kernel-virtual address for a physical address.
 ///
 /// Before the physical map exists only the identity map is available, so
-/// this returns `phys` unchanged and refuses anything above 8 MiB. The only
-/// callers in that window are the allocator zeroing the frames that become
-/// the physical map's own tables, and the allocator hands out lowest frames
-/// first, so they are always low.
+/// this returns `phys` unchanged and refuses anything above 8 MiB. Nothing
+/// should call it in that window (the physical map's own tables come from
+/// pmm::EarlyFrames, which zeroes them through the identity map directly),
+/// so the refusal is a tripwire, not a code path.
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
     if PHYS_MAP_READY.load(Ordering::Acquire) {
         (PHYS_MAP_BASE + phys) as *mut u8
@@ -179,11 +180,14 @@ pub struct PhysMapStats {
 /// sharing a 2 MiB page with RAM get mapped too; firmware's memory-type
 /// ranges (MTRRs) keep device memory uncached regardless.
 ///
-/// Page-table frames come from the frame allocator (already zeroed).
+/// Page-table frames come from `early` (zeroed, identity-mapped): the real
+/// frame allocator can't exist yet, because its bitmap is reached through
+/// the physical map this function builds.
 ///
 /// # Safety
-/// Call once, after init_frame_allocator(), with the map stage2 collected.
-pub unsafe fn map_physical_memory(e820: &[E820Entry]) -> PhysMapStats {
+/// Call once, before pmm::init(), with the map stage2 collected. `early`
+/// must hold at least physmap_table_bound(e820) frames.
+pub unsafe fn map_physical_memory(e820: &[E820Entry], early: &mut EarlyFrames) -> PhysMapStats {
     let nx = enable_no_execute();
     let leaf_flags = PRESENT | WRITABLE | HUGE | if nx { NO_EXECUTE } else { 0 };
 
@@ -197,7 +201,7 @@ pub unsafe fn map_physical_memory(e820: &[E820Entry]) -> PhysMapStats {
 
     // PML4[256] -> one PDPT covering the whole physical map.
     let pml4 = &raw mut PML4;
-    let pdpt_phys = alloc_table(&mut stats);
+    let pdpt_phys = alloc_table(early, &mut stats);
     let pml4_index = ((PHYS_MAP_BASE >> 39) & 0x1FF) as usize;
     (*pml4).0[pml4_index] = pdpt_phys | PRESENT | WRITABLE;
     let pdpt = pdpt_phys as *mut u64; // identity view: table frames are < 8 MiB
@@ -218,7 +222,7 @@ pub unsafe fn map_physical_memory(e820: &[E820Entry]) -> PhysMapStats {
             // One PD per GiB of physical address space, created on demand.
             let pdpt_index = ((phys >> 30) & 0x1FF) as usize;
             let pd = if *pdpt.add(pdpt_index) & PRESENT == 0 {
-                let pd_phys = alloc_table(&mut stats);
+                let pd_phys = alloc_table(early, &mut stats);
                 *pdpt.add(pdpt_index) = pd_phys | PRESENT | WRITABLE;
                 pd_phys as *mut u64
             } else {
@@ -249,20 +253,35 @@ pub unsafe fn map_physical_memory(e820: &[E820Entry]) -> PhysMapStats {
     stats
 }
 
-/// Take a zeroed frame from the allocator for use as a page table. Runs
-/// before the physical map is ready, so the frame must be identity-mapped
-/// (phys_to_virt enforces that while zeroing it).
-unsafe fn alloc_table(stats: &mut PhysMapStats) -> u64 {
-    match crate::alloc_frame() {
+/// Take a zeroed, identity-mapped frame from the early run for use as a
+/// page table.
+fn alloc_table(early: &mut EarlyFrames, stats: &mut PhysMapStats) -> u64 {
+    match early.take() {
         Some(phys) => {
             stats.table_frames += 1;
-            phys as u64
+            phys
         }
         None => {
-            crate::serial_write_str(b"[paging] FATAL: out of frames for page tables\n");
+            crate::serial_write_str(b"[paging] FATAL: early page-table frames used up\n");
             crate::halt();
         }
     }
+}
+
+/// Upper bound on the page-table frames map_physical_memory() will take:
+/// one PDPT, plus one PD per GiB of physical address space up to the end
+/// of the highest region it maps.
+pub fn physmap_table_bound(e820: &[E820Entry]) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let mut top = 0u64;
+    for entry in e820.iter() {
+        let (base, length, kind) = (entry.base, entry.length, entry.region_type);
+        if length != 0 && matches!(kind, 1 | 3 | 4) {
+            top = top.max(base.saturating_add(length));
+        }
+    }
+    let top = top.min(PHYS_MAP_MAX);
+    1 + top.div_ceil(GIB)
 }
 
 /// Turn on EFER.NXE if the CPU supports no-execute (CPUID 0x80000001,
@@ -325,19 +344,20 @@ fn cpuid(leaf: u32) -> (u32, u32) {
 /// 3. Top of RAM: the last usable frame reads back what was written.
 ///
 /// # Safety
-/// Call after map_physical_memory(). Temporarily allocates ~4.5 MiB.
+/// Call after map_physical_memory() and pmm::init(). Temporarily
+/// allocates every free frame below 8 MiB (about 7 MiB).
 pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
     use crate::{serial_write_hex as hex, serial_write_str as s, serial_write_u64 as dec};
 
     let mut ok = true;
 
     // --- 1. alias ---
-    let alias_ok = match crate::alloc_frame() {
+    let alias_ok = match crate::pmm::alloc_frame() {
         Some(frame) => {
             let frame = frame as u64;
             phys_to_virt(frame).write_volatile(0x5A);
             let seen = (frame as *const u8).read_volatile(); // identity view
-            crate::free_frame(frame as usize);
+            crate::pmm::free_frame(frame as usize);
             seen == 0x5A
         }
         None => false,
@@ -351,7 +371,7 @@ pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
     let mut count: u64 = 0;
     let mut all_zeroed = true;
     let mut high_frame: u64 = 0;
-    while let Some(frame) = crate::alloc_frame() {
+    while let Some(frame) = crate::pmm::alloc_frame() {
         let frame = frame as u64;
         let words = phys_to_virt(frame) as *mut u64;
         for i in 0..(PAGE_SIZE as usize / 8) {
@@ -369,7 +389,7 @@ pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
     }
     while chain != 0 {
         let next = (phys_to_virt(chain) as *const u64).read_volatile();
-        crate::free_frame(chain as usize);
+        crate::pmm::free_frame(chain as usize);
         chain = next;
     }
     let alloc_ok = high_frame != 0 && all_zeroed;

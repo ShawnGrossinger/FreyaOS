@@ -5,6 +5,7 @@ ENTRY(_start)
 SECTIONS
 {
     . = 0x0000000000100000;
+    __kernel_start = .;   /* pmm reserves [__kernel_start, __kernel_end) */
 
     /* .entry contains the naked _start function via #[link_section = ".entry"].
      * This guarantees _start is the very first byte at 0x100000. */
@@ -33,6 +34,9 @@ SECTIONS
         . = ALIGN(16);
         __bss_end = .;
     }
+
+    . = ALIGN(4096);
+    __kernel_end = .;
 
     /DISCARD/ : {
         *(.comment)
