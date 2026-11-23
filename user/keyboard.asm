@@ -1,7 +1,8 @@
 ; ---------------------------------------------------------------------------
 ; keyboard.asm — the PS/2 keyboard driver, as a user process.
 ;
-; Capabilities it is given (and all it can touch):
+; Capabilities init gives it (and all it can touch; the kernel gave them
+; until Entry 21):
 ;   slot 0  Console        to print what is typed
 ;   slot 1  Irq line 1     the keyboard interrupt
 ;   slot 2  IoPorts 0x60   the controller's data port

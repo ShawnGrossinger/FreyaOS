@@ -29,6 +29,11 @@
 //!  13 map(memory, address)             -> 0                     (mem.rs)
 //!  14 note(console, ptr, len)          -> bytes: like write, to the serial
 //!                                         port only (test notes)
+//!  15 spawn(factory, program, arg, slots, exit_ep) -> the new process's id
+//!                                                          (factory.rs)
+//!  16 endpoint(factory)                -> slot of a new endpoint capability
+//!  17 mint(endpoint, rights, badge)    -> slot of a narrower copy  (cap.rs)
+//!  18 drop(slot)                       -> 0: the capability let go of
 //!
 //! Message registers: send/call take the four words in RSI, RDX, R10, R8
 //! and in R9 the slot of a capability to pass along (-1 for none). recv and
@@ -60,10 +65,15 @@ pub const SYS_IRQ_ACK: u64 = 10;
 pub const SYS_POWER: u64 = 11;
 pub const SYS_MAP: u64 = 13;
 pub const SYS_NOTE: u64 = 14;
+pub const SYS_SPAWN: u64 = 15;
+pub const SYS_ENDPOINT: u64 = 16;
+pub const SYS_MINT: u64 = 17;
+pub const SYS_DROP: u64 = 18;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
 /// write, note: the slot doesn't hold the console capability; map: it
-/// doesn't hold a Memory capability.
+/// doesn't hold a Memory capability; spawn, endpoint: not the Factory;
+/// drop: nothing there.
 pub const ERR_NO_CAPABILITY: i64 = -2;
 pub const ERR_BAD_ADDRESS: i64 = -3;
 /// The slot doesn't hold the kind of capability this call needs, or it
@@ -80,8 +90,11 @@ pub const ERR_NO_REPLY: i64 = -8;
 /// An argument outside what the call accepts: a port width, an interrupt
 /// line the machine doesn't have, a power action that doesn't exist.
 pub const ERR_BAD_ARGUMENT: i64 = -9;
-/// No frame left for a page table (map).
+/// No frame left for a page table (map), or no room for a new process or
+/// endpoint (spawn, endpoint).
 pub const ERR_NO_MEMORY: i64 = -10;
+/// Every capability slot is taken (endpoint, mint).
+pub const ERR_NO_SLOT: i64 = -11;
 
 /// Longest write in one call; longer ones are cut (the return value says
 /// how much was written).
@@ -192,6 +205,10 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
         SYS_POWER => sys_power(f.rdi, f.rsi),
         SYS_MAP => crate::mem::map(f.rdi, f.rsi),
         SYS_NOTE => sys_note(f.rdi, f.rsi, f.rdx),
+        SYS_SPAWN => crate::factory::spawn(f.rdi, f.rsi, f.rdx, f.r10, f.r8),
+        SYS_ENDPOINT => crate::factory::endpoint(f.rdi),
+        SYS_MINT => crate::cap::mint(f.rdi, f.rsi, f.rdx),
+        SYS_DROP => crate::cap::drop_cap(f.rdi),
         _ => ERR_BAD_SYSCALL,
     };
     f.rax = result as u64;
@@ -288,11 +305,21 @@ fn console_text(handle: u64, ptr: u64, len: u64, buf: &mut [u8; MAX_WRITE as usi
     if len == 0 {
         return Ok(0);
     }
+    copy_from_user(ptr, &mut buf[..len as usize])?;
+    Ok(len as usize)
+}
+
+/// Fill `buf` from the caller's memory at `ptr`, page by page, checking
+/// each page is the caller's to read (and not memory it only borrows:
+/// vmm::user_page). Through the physical map, never the user address.
+pub fn copy_from_user(ptr: u64, buf: &mut [u8]) -> Result<(), i64> {
+    let len = buf.len() as u64;
+    if len == 0 {
+        return Ok(());
+    }
     if !vmm::is_user_range(ptr, len) {
         return Err(ERR_BAD_ADDRESS);
     }
-
-    // Copy it out page by page, checking each page is the caller's to read.
     let space = unsafe { AddressSpace::from_root(sched::current_space()) };
     let mut done = 0;
     while done < len {
@@ -311,7 +338,7 @@ fn console_text(handle: u64, ptr: u64, len: u64, buf: &mut [u8; MAX_WRITE as usi
         }
         done += n;
     }
-    Ok(len as usize)
+    Ok(())
 }
 
 /// Print a process's text, every line prefixed with who wrote it, so a

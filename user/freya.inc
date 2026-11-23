@@ -29,6 +29,18 @@ SYS_POWER    equ 11                 ; power(cap, action): never returns if allow
                                     ; 12 was console_scroll (retired in Entry 20)
 SYS_MAP      equ 13                 ; map(memory, address): map a Memory capability
 SYS_NOTE     equ 14                 ; note(cap, ptr, len): like write, serial only
+SYS_SPAWN    equ 15                 ; spawn(factory, program, arg, slots, exit_ep): new process id
+SYS_ENDPOINT equ 16                 ; endpoint(factory): slot of a new endpoint capability
+SYS_MINT     equ 17                 ; mint(endpoint, rights, badge): slot of a narrower copy
+SYS_DROP     equ 18                 ; drop(slot): let go of a capability
+
+; Programs spawn can start (kernel/src/factory.rs), and endpoint rights.
+PROGRAM_HELLO    equ 0
+PROGRAM_CONSOLE  equ 1
+PROGRAM_KEYBOARD equ 2
+RIGHT_SEND   equ 1
+RIGHT_RECV   equ 2
+RIGHT_GRANT  equ 4
 
 POWER_RESTART  equ 0
 POWER_SHUTDOWN equ 1
@@ -55,6 +67,7 @@ ERR_INTERRUPTED      equ -7
 ERR_NO_REPLY         equ -8
 ERR_BAD_ARGUMENT     equ -9
 ERR_NO_MEMORY        equ -10
+ERR_NO_SLOT          equ -11
 
 ; Capability slots. A process gets only what its creator hands it; the
 ; kernel's tests use these slots.

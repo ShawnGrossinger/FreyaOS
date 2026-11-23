@@ -8,9 +8,8 @@
 //! the sender may do only through an endpoint capability with GRANT.
 //!
 //! Kinds of capability:
-//!   - Console: may write to the kernel's log (serial and the screen) and
-//!     scroll the screen's view of it. A bootstrap convenience until there
-//!     is a console driver process.
+//!   - Console: may write to the system log (log.rs), which the console
+//!     driver shows, and leave notes on serial (system call note).
 //!   - Endpoint: may send to and/or receive from an IPC endpoint (ipc.rs),
 //!     with rights SEND, RECV, GRANT. The badge is fixed when the capability
 //!     is made and is delivered with every message sent through it, so a
@@ -24,10 +23,20 @@
 //!     and caching `flags` say: a framebuffer, or pages the kernel shares
 //!     read-only, such as the system log (Entry 20). The pages stay
 //!     whoever's they were; the process only borrows them.
+//!   - Factory: may create processes from the programs built into the
+//!     kernel and new endpoints (system calls spawn and endpoint,
+//!     factory.rs). Held by init (Entry 21), which builds the rest of the
+//!     system with it.
 //!
 //! Capabilities are values; copying one into another table (spawn, or a
 //! transfer in a message) copies the authority. Endpoints are reference
 //! counted by the capabilities that name them (ipc::retain / release).
+//!
+//! An endpoint capability can be copied with less authority (system call
+//! mint, Entry 21): fewer rights, and a badge if it had none yet. That is
+//! how init gives the console driver only RECV on its endpoint and the
+//! keyboard driver only SEND, with a badge that names it. And a process
+//! can let go of a capability (system call drop).
 
 pub const MAX_CAPS: usize = 16;
 
@@ -48,6 +57,8 @@ pub enum Cap {
     Power,
     /// May map physical [base, base + pages * 4 KiB) (mem.rs).
     Memory { base: u64, pages: u32, flags: u8 },
+    /// May create processes and endpoints (factory.rs).
+    Factory,
 }
 
 /// Memory capability flags.
@@ -97,6 +108,45 @@ pub fn release(cap: Cap) {
             crate::ipc::release_receiver(ep);
         }
         crate::ipc::release(ep);
+    }
+}
+
+/// mint(slot, rights, badge): a copy of the caller's endpoint capability in
+/// `slot`, with `rights` (which it must already have; at least one) and
+/// `badge`, in the caller's first free slot. A capability without a badge
+/// (0) can be given one; one with a badge keeps it, and asking for another
+/// is refused. No capability ever gets the signal badge. Returns the slot.
+pub fn mint(slot: u64, rights: u64, badge: u64) -> i64 {
+    use crate::syscall::{ERR_BAD_ARGUMENT, ERR_NO_SLOT, ERR_WRONG_CAPABILITY};
+    let Cap::Endpoint { ep, badge: old, rights: have } = crate::sched::current_cap(slot) else {
+        return ERR_WRONG_CAPABILITY;
+    };
+    let all = (SEND | RECV | GRANT) as u64;
+    if rights == 0 || rights & !all != 0 || rights & !(have as u64) != 0 {
+        return ERR_BAD_ARGUMENT; // none, unknown, or more than it has
+    }
+    if badge == crate::ipc::SIGNAL_BADGE || (old != 0 && badge != old) {
+        return ERR_BAD_ARGUMENT;
+    }
+    let copy = Cap::Endpoint { ep, badge, rights: rights as u8 };
+    match crate::sched::store_cap(copy) {
+        Some(slot) => slot as i64,
+        None => ERR_NO_SLOT,
+    }
+}
+
+/// drop(slot): let go of the capability in the caller's `slot` (Entry 21).
+/// What it held is released as if the process had ended: an endpoint loses
+/// a reference, and with it maybe its last possible receiver, which wakes
+/// whoever waits to send there with ERR_PEER_GONE. Init uses it when it
+/// stops starting a driver again, so that nobody waits for that driver.
+pub fn drop_cap(slot: u64) -> i64 {
+    match crate::sched::take_cap(slot) {
+        Cap::None => crate::syscall::ERR_NO_CAPABILITY,
+        cap => {
+            release(cap);
+            0
+        }
     }
 }
 

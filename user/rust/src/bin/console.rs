@@ -1,15 +1,19 @@
 //! console — the console driver: draws the screen, as a process (Entry 20).
 //!
-//! The kernel lends it, through capabilities (kernel/src/console.rs):
+//! The kernel lends it, through capabilities that init passes on
+//! (kernel/src/console.rs; init started it since Entry 21):
 //!
 //!   slot 0  Console    to write to the log, and leave notes for test.sh
 //!   slot 1  Endpoint   its own (RECV): the kernel's signals, and calls
 //!   slot 2  Memory     the screen: a framebuffer, or VGA text memory
 //!   slot 3  Memory     the system log, read-only (kernel/src/log.rs)
 //!   slot 4  Memory     the kernel's status rows, read-only (display.rs)
+//!   slot 5  Memory     the screen's description, read-only: graphics or
+//!                      text, the cell grid, the 16 colours in the mode's
+//!                      own pixel format, and the ROM font
 //!
-//! and tells it in its start block how to draw: graphics or text, the cell
-//! grid, the 16 colours in the mode's own pixel format, and the ROM font.
+//! The kernel stops drawing the moment it maps the screen, so it maps that
+//! last, just before it draws.
 //!
 //! The screen is the kernel's status rows (0 to 17) as they are, then the
 //! log: everything in the system log, wrapped at the screen's width, the
@@ -47,6 +51,7 @@ const ENDPOINT: u64 = 1;
 const SCREEN: u64 = 2;
 const LOG: u64 = 3;
 const PANEL: u64 = 4;
+const DESCRIPTION: u64 = 5;
 
 const SIGNAL_LOG: u64 = 1 << 0;
 const SIGNAL_PANEL: u64 = 1 << 1;
@@ -75,7 +80,7 @@ struct StartInfo {
     _reserved: u32,
 }
 
-const FONT: *const u8 = (freya::START_BLOCK + 0x1000) as *const u8;
+const FONT: *const u8 = (DESCRIPTION_AT + 0x1000) as *const u8;
 const GLYPH_W: usize = 8;
 const GLYPH_H: usize = 16;
 
@@ -83,6 +88,7 @@ const GLYPH_H: usize = 16;
 const SCREEN_AT: u64 = MAP_BASE;
 const LOG_AT: u64 = MAP_BASE + 0x1_0000_0000;
 const PANEL_AT: u64 = MAP_BASE + 0x2_0000_0000;
+const DESCRIPTION_AT: u64 = MAP_BASE + 0x3_0000_0000;
 const LOG_DATA_OFFSET: u64 = 4096;
 
 // ---------------------------------------------------------------------------
@@ -131,10 +137,13 @@ fn state() -> &'static mut Console {
 
 fn main(_arg: u64) -> u64 {
     let c = state();
-    c.info = unsafe { (freya::START_BLOCK as *const StartInfo).read() };
+    if !map_all(&[(DESCRIPTION, DESCRIPTION_AT), (LOG, LOG_AT), (PANEL, PANEL_AT)]) {
+        return 2;
+    }
+    c.info = unsafe { (DESCRIPTION_AT as *const StartInfo).read() };
     let info = c.info;
     if &info.magic != b"FREYACON" || info.version != 1 {
-        freya::write(CONSOLE, b"console: no usable start block\n");
+        freya::write(CONSOLE, b"console: no usable screen description\n");
         return 1;
     }
     c.cols = (info.cols as usize).min(MAX_COLS);
@@ -142,14 +151,8 @@ fn main(_arg: u64) -> u64 {
     c.log_top = (info.log_top as usize).min(c.rows.saturating_sub(2));
     c.total = 1;
     c.history[0] = [b' '; MAX_COLS];
-    for (slot, at) in [(SCREEN, SCREEN_AT), (LOG, LOG_AT), (PANEL, PANEL_AT)] {
-        let result = freya::map(slot, at);
-        if result != 0 {
-            let mut line = Line::<64>::new();
-            line.str(b"console: couldn't map capability ").dec(slot).str(b"\n");
-            freya::write(CONSOLE, line.as_bytes());
-            return 2;
-        }
+    if !map_all(&[(SCREEN, SCREEN_AT)]) {
+        return 2;
     }
 
     // Everything the log holds so far, then the whole screen.
@@ -331,6 +334,19 @@ fn row_text(c: &Console, line: &mut Line<256>, row: Option<&[u8; MAX_COLS]>) {
         let end = row.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
         line.str(&row[..end]);
     }
+}
+
+/// Map each (slot, address); say which one failed, if one does.
+fn map_all(list: &[(u64, u64)]) -> bool {
+    for &(slot, at) in list {
+        if freya::map(slot, at) != 0 {
+            let mut line = Line::<64>::new();
+            line.str(b"console: couldn't map capability ").dec(slot).str(b"\n");
+            freya::write(CONSOLE, line.as_bytes());
+            return false;
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------

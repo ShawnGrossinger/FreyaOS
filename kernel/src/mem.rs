@@ -56,5 +56,6 @@ pub fn map(slot: u64, address: u64) -> i64 {
             return if e == MapError::OutOfMemory { ERR_NO_MEMORY } else { ERR_BAD_ADDRESS };
         }
     }
+    crate::console::on_map(base); // the screen: this process draws now (Entry 21)
     0
 }

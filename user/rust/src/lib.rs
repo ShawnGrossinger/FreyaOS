@@ -22,8 +22,8 @@ use core::arch::asm;
 // short jump skips the header, which the kernel reads before it maps the
 // program (kernel/src/process.rs, Program::data_pages): "FREYAPRG" at byte
 // 8, then how many data pages from 0x4010_0000 the program needs (its
-// start block and .bss), computed by user.ld. NASM programs have no header
-// and get one page.
+// .bss), computed by user.ld. NASM programs have no header and get one
+// page.
 core::arch::global_asm!(
     ".section .text.start, \"ax\"",
     ".global _start",
@@ -58,9 +58,6 @@ macro_rules! entry {
 // Layout (kernel/src/process.rs)
 // ===========================================================================
 
-/// The start block: two pages the kernel may fill before the program runs.
-pub const START_BLOCK: usize = 0x4010_0000;
-pub const START_BLOCK_BYTES: usize = 0x2000;
 /// Where memory capabilities may be mapped (system call map): from 4 GiB up
 /// to the bottom of the stack's region.
 pub const MAP_BASE: u64 = 0x0000_0001_0000_0000;
@@ -86,6 +83,10 @@ pub const SYS_POWER: u64 = 11;
 // 12 was console_scroll (Entry 18); the console process scrolls now.
 pub const SYS_MAP: u64 = 13;
 pub const SYS_NOTE: u64 = 14;
+pub const SYS_SPAWN: u64 = 15;
+pub const SYS_ENDPOINT: u64 = 16;
+pub const SYS_MINT: u64 = 17;
+pub const SYS_DROP: u64 = 18;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
 pub const ERR_NO_CAPABILITY: i64 = -2;
@@ -97,6 +98,21 @@ pub const ERR_INTERRUPTED: i64 = -7;
 pub const ERR_NO_REPLY: i64 = -8;
 pub const ERR_BAD_ARGUMENT: i64 = -9;
 pub const ERR_NO_MEMORY: i64 = -10;
+pub const ERR_NO_SLOT: i64 = -11;
+
+/// Capability slots per process.
+pub const MAX_CAPS: usize = 16;
+/// Endpoint rights (mint).
+pub const SEND: u64 = 1 << 0;
+pub const RECV: u64 = 1 << 1;
+pub const GRANT: u64 = 1 << 2;
+
+/// The programs spawn can start (kernel/src/factory.rs: PROGRAMS).
+pub const PROGRAM_HELLO: u64 = 0;
+pub const PROGRAM_CONSOLE: u64 = 1;
+pub const PROGRAM_KEYBOARD: u64 = 2;
+/// "No capability here" in spawn's slot list.
+pub const NO_SLOT: u8 = 0xFF;
 
 /// No capability to pass along with a message.
 pub const NO_CAP: u64 = u64::MAX;
@@ -148,6 +164,75 @@ pub fn note(slot: u64, bytes: &[u8]) -> i64 {
 /// [MAP_BASE, MAP_END)).
 pub fn map(slot: u64, addr: u64) -> i64 {
     syscall3(SYS_MAP, slot, addr, 0)
+}
+
+/// Start built-in program `program` with `arg`, using the Factory
+/// capability in `factory`. `slots[i]` is the caller's slot to copy into
+/// the new process's slot i (NO_SLOT for none). If `exit_ep` is an
+/// endpoint capability (not NO_CAP), it is signalled with bit (1 << id)
+/// when the new process ends. Returns its id.
+pub fn spawn(factory: u64, program: u64, arg: u64, slots: &[u8; MAX_CAPS], exit_ep: u64) -> i64 {
+    spawn_raw(factory, program, arg, slots.as_ptr() as u64, exit_ep)
+}
+
+/// spawn, with the slot list at any address (the self-tests pass bad ones).
+pub fn spawn_raw(factory: u64, program: u64, arg: u64, slots: u64, exit_ep: u64) -> i64 {
+    let result: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") SYS_SPAWN => result,
+            in("rdi") factory,
+            in("rsi") program,
+            in("rdx") arg,
+            in("r10") slots,
+            in("r8") exit_ep,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    result
+}
+
+/// A new endpoint (SEND, RECV and GRANT, no badge), made with the Factory
+/// capability in `factory`. Returns the slot it landed in.
+pub fn endpoint(factory: u64) -> i64 {
+    syscall3(SYS_ENDPOINT, factory, 0, 0)
+}
+
+/// A copy of the endpoint capability in `slot` with `rights` (a subset of
+/// its own) and `badge` (settable only on one without a badge). Returns
+/// the slot it landed in.
+pub fn mint(slot: u64, rights: u64, badge: u64) -> i64 {
+    syscall3(SYS_MINT, slot, rights, badge)
+}
+
+/// Let go of the capability in `slot`.
+pub fn drop_cap(slot: u64) -> i64 {
+    syscall3(SYS_DROP, slot, 0, 0)
+}
+
+/// Send `words` through `slot` (and the capability in `xfer`, or NO_CAP);
+/// returns once someone has received it.
+pub fn send(slot: u64, words: [u64; 4], xfer: u64) -> i64 {
+    let result: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") SYS_SEND => result,
+            in("rdi") slot,
+            in("rsi") words[0],
+            in("rdx") words[1],
+            in("r10") words[2],
+            in("r8") words[3],
+            in("r9") xfer,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    result
 }
 
 #[derive(Clone, Copy, Default)]

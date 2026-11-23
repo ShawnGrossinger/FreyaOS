@@ -130,6 +130,10 @@ pub(crate) struct Task {
     status: ExitStatus,
     /// kill() asked for it to stop; it does when next returning to ring 3.
     kill: bool,
+    /// An endpoint to signal with bit (1 << id) when it ends: how init
+    /// learns that a driver it started has gone (Entry 21). Holds a
+    /// reference to the endpoint until reaped.
+    exit_signal: Option<u8>,
 }
 
 const EMPTY: Task = Task {
@@ -150,7 +154,11 @@ const EMPTY: Task = Task {
     wait_seq: 0,
     status: ExitStatus::Code(0),
     kill: false,
+    exit_signal: None,
 };
+
+// A task's exit signal is bit (1 << id) of one 64-bit word.
+const _: () = assert!(MAX_TASKS <= 64);
 
 static mut TASKS: [Task; MAX_TASKS] = [EMPTY; MAX_TASKS];
 static mut CURRENT: TaskId = 0;
@@ -264,6 +272,19 @@ pub fn spawn(name: &'static str, entry: fn(u64), arg: u64) -> Result<TaskId, Spa
 /// kernel's) with capabilities `caps`. The task takes over the address
 /// space: reap() destroys it when the task is gone. process.rs uses this.
 pub fn spawn_in(name: &'static str, entry: fn(u64), arg: u64, space: u64, caps: Caps) -> Result<TaskId, SpawnError> {
+    spawn_in_signalling(name, entry, arg, space, caps, None)
+}
+
+/// spawn_in(), and when the task ends, signal endpoint `exit_signal` with
+/// bit (1 << its id) (factory.rs: spawn).
+pub fn spawn_in_signalling(
+    name: &'static str,
+    entry: fn(u64),
+    arg: u64,
+    space: u64,
+    caps: Caps,
+    exit_signal: Option<u8>,
+) -> Result<TaskId, SpawnError> {
     let id = without_interrupts(|| {
         let t = table();
         let id = (1..MAX_TASKS).find(|&i| t[i].state == State::Free)?;
@@ -313,6 +334,9 @@ pub fn spawn_in(name: &'static str, entry: fn(u64), arg: u64, space: u64, caps: 
 
     without_interrupts(|| {
         cap::retain_all(&caps);
+        if let Some(ep) = exit_signal {
+            crate::ipc::retain(ep);
+        }
         table()[id] = Task {
             state: State::Ready,
             name: Some(name),
@@ -322,6 +346,7 @@ pub fn spawn_in(name: &'static str, entry: fn(u64), arg: u64, space: u64, caps: 
             has_stack: true,
             space,
             caps,
+            exit_signal,
             ..EMPTY
         };
     });
@@ -374,6 +399,9 @@ pub fn exit_with(status: ExitStatus) -> ! {
     }
     crate::ipc::on_exit(me);
     crate::console::on_exit(me);
+    if let Some(ep) = t[me].exit_signal {
+        crate::ipc::signal(ep, 1 << me);
+    }
     unsafe { schedule() };
     // schedule() never picks a finished task, so this is unreachable.
     crate::halt();
@@ -400,6 +428,9 @@ pub fn reap() -> usize {
                 }
             }
             cap::release_all(&task.caps);
+            if let Some(ep) = task.exit_signal {
+                crate::ipc::release(ep);
+            }
             table()[id] = EMPTY;
             1
         });
@@ -558,6 +589,27 @@ pub fn current_cap(handle: u64) -> Cap {
         let caps = &table()[current_id()].caps;
         caps.get(handle as usize).copied().unwrap_or(Cap::None)
     })
+}
+
+/// Put `cap` in the current task's first free slot (and count it, as any
+/// capability stored in a table is). None if every slot is taken.
+pub fn store_cap(cap: Cap) -> Option<usize> {
+    without_interrupts(|| {
+        let caps = &mut table()[current_id()].caps;
+        let slot = cap::free_slot(caps)?;
+        caps[slot] = cap;
+        cap::retain(cap);
+        Some(slot)
+    })
+}
+
+/// Empty the current task's slot `handle`, returning what was there (not
+/// yet released: the caller does that).
+pub fn take_cap(handle: u64) -> Cap {
+    if handle >= cap::MAX_CAPS as u64 {
+        return Cap::None;
+    }
+    without_interrupts(|| core::mem::replace(&mut table()[current_id()].caps[handle as usize], Cap::None))
 }
 
 /// The mutex with key `key` (its address) and owner word `owner`: take it,

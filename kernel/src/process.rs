@@ -24,8 +24,7 @@
 //!   0x0000_0000_4000_0000  code, read + execute (at most 1 MiB)
 //!   0x0000_0000_4010_0000  data, read + write, zeroed: one page for a NASM
 //!                          program; for a Rust one as many as its header
-//!                          asks (Program::data_pages), the first two being
-//!                          its start block, which spawn_with may fill
+//!                          asks (Program::data_pages)
 //!   0x0000_0001_0000_0000  where memory capabilities may be mapped
 //!   to 0x0000_7F00_0000_0000  (system call map, mem.rs)
 //!   0x0000_7FFF_0000_0000  top of the stack, read + write (16 KiB below)
@@ -41,8 +40,6 @@ pub const USER_DATA_BASE: u64 = USER_CODE_BASE + MAX_CODE_BYTES;
 pub const USER_DATA_PAGES: u64 = 1;
 /// Most data pages a program may ask for (1 MiB).
 const MAX_DATA_PAGES: u64 = 256;
-/// The start block: the first two data pages, which the creator may fill.
-pub const START_BLOCK_BYTES: usize = 0x2000;
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_0000_0000;
 pub const USER_STACK_PAGES: u64 = 4;
 
@@ -66,7 +63,7 @@ impl Program {
         }
     }
 
-    /// A Rust program's header, which also means it has a start block.
+    /// A Rust program's header.
     fn has_header(&self) -> bool {
         matches!(self.image.get(8..16), Some(magic) if magic == b"FREYAPRG")
     }
@@ -109,6 +106,18 @@ pub static CONSOLE: Program = Program {
     image: include_bytes!(concat!(env!("OUT_DIR"), "/console.bin")),
 };
 
+/// The first process, which starts the rest (user/rust/src/bin/init.rs).
+pub static INIT: Program = Program {
+    name: "init",
+    image: include_bytes!(concat!(env!("OUT_DIR"), "/init.bin")),
+};
+
+/// Test program for spawn, endpoint and mint (user/rust/src/bin/captest.rs).
+pub static CAPTEST: Program = Program {
+    name: "captest",
+    image: include_bytes!(concat!(env!("OUT_DIR"), "/captest.bin")),
+};
+
 // ===========================================================================
 // Creating a process
 // ===========================================================================
@@ -122,39 +131,32 @@ extern "C" {
 /// Start `program` as a new process with argument `arg` (in RDI) and
 /// capability table `caps`. It runs when the scheduler picks it.
 pub fn spawn(program: &Program, arg: u64, caps: Caps) -> Result<TaskId, SpawnError> {
-    spawn_with(program, arg, caps, &[])
+    spawn_signalling(program, arg, caps, None)
 }
 
-/// spawn, with `start_block` copied to the beginning of its data (the start
-/// block: what a program needs to know at once, such as the console's
-/// screen mode and font). At most START_BLOCK_BYTES, and only for a program
-/// with a start block (a Rust one).
-pub fn spawn_with(program: &Program, arg: u64, caps: Caps, start_block: &[u8]) -> Result<TaskId, SpawnError> {
+/// spawn, and when the process ends signal endpoint `exit_signal` with bit
+/// (1 << its id) (factory.rs).
+pub fn spawn_signalling(program: &Program, arg: u64, caps: Caps, exit_signal: Option<u8>) -> Result<TaskId, SpawnError> {
     let data_pages = program.data_pages();
-    let start_pages = if program.has_header() { (START_BLOCK_BYTES as u64) / PAGE_SIZE } else { 0 };
-    if program.image.len() as u64 > MAX_CODE_BYTES
-        || data_pages == 0
-        || data_pages > MAX_DATA_PAGES
-        || data_pages < start_pages
-        || start_block.len() as u64 > start_pages * PAGE_SIZE
-    {
+    // A Rust program with no zeroed statics asks for no data pages at all.
+    if program.image.len() as u64 > MAX_CODE_BYTES || data_pages > MAX_DATA_PAGES {
         return Err(SpawnError::OutOfMemory);
     }
     let mut space = AddressSpace::new_user().map_err(|_| SpawnError::OutOfMemory)?;
-    if unsafe { load(&mut space, program.image, data_pages, start_block) }.is_err() {
+    if unsafe { load(&mut space, program.image, data_pages) }.is_err() {
         unsafe { space.destroy() };
         return Err(SpawnError::OutOfMemory);
     }
     // The task owns the address space from here; reap() destroys it.
-    sched::spawn_in(program.name, start, arg, space.root(), caps).inspect_err(|_| unsafe {
+    sched::spawn_in_signalling(program.name, start, arg, space.root(), caps, exit_signal).inspect_err(|_| unsafe {
         AddressSpace::from_root(space.root()).destroy();
     })
 }
 
-/// Map code (copied in), data (zeroed, `start` copied to its beginning),
-/// and a stack. Every frame mapped belongs to the address space: if this
-/// fails part-way, destroy() frees what was mapped.
-unsafe fn load(space: &mut AddressSpace, image: &[u8], data_pages: u64, start: &[u8]) -> Result<(), ()> {
+/// Map code (copied in), data (zeroed) and a stack. Every frame mapped
+/// belongs to the address space: if this fails part-way, destroy() frees
+/// what was mapped.
+unsafe fn load(space: &mut AddressSpace, image: &[u8], data_pages: u64) -> Result<(), ()> {
     let mut map_new = |va: u64, flags: PageFlags, src: &[u8]| -> Result<(), ()> {
         let frame = pmm::alloc_frame().ok_or(())? as u64; // arrives zeroed
         core::ptr::copy_nonoverlapping(src.as_ptr(), crate::paging::phys_to_virt(frame), src.len());
@@ -164,8 +166,7 @@ unsafe fn load(space: &mut AddressSpace, image: &[u8], data_pages: u64, start: &
         map_new(USER_CODE_BASE + i as u64 * PAGE_SIZE, PageFlags::USER_CODE, chunk)?;
     }
     for i in 0..data_pages {
-        let chunk = start.chunks(PAGE_SIZE as usize).nth(i as usize).unwrap_or(&[]);
-        map_new(USER_DATA_BASE + i * PAGE_SIZE, PageFlags::USER_DATA, chunk)?;
+        map_new(USER_DATA_BASE + i * PAGE_SIZE, PageFlags::USER_DATA, &[])?;
     }
     for i in 1..=USER_STACK_PAGES {
         map_new(USER_STACK_TOP - i * PAGE_SIZE, PageFlags::USER_DATA, &[])?;
@@ -233,7 +234,7 @@ pub fn demo_kernel_touches_user(execute: bool) {
         return;
     }
     let Ok(mut space) = AddressSpace::new_user() else { return };
-    if unsafe { load(&mut space, HELLO.image, USER_DATA_PAGES, &[]) }.is_err() {
+    if unsafe { load(&mut space, HELLO.image, USER_DATA_PAGES) }.is_err() {
         unsafe { space.destroy() };
         return;
     }

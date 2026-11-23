@@ -13,6 +13,7 @@ mod console;
 mod cpu;
 mod disk_io;
 mod display;
+mod factory;
 mod gdt;
 mod heap;
 mod idt;
@@ -616,8 +617,9 @@ pub extern "C" fn rust_start() -> ! {
     } else {
         let mutex = sync::selftest();
         let ipc = ipc::selftest();
+        let factory = factory::selftest();
         let drivers = irq::selftest();
-        mutex && ipc && drivers
+        mutex && ipc && factory && drivers
     };
 
     // --- VGA status display (screen was cleared at entry) ---
@@ -665,49 +667,23 @@ pub extern "C" fn rust_start() -> ! {
         serial_write_str(b"[kernel] could not start the clock task\n");
     }
 
-    // The console driver (Entry 20): a process that draws the screen from
-    // here on, with the framebuffer, the log and the status rows lent to it.
-    let console_ep = if user_mode_on { console::start() } else { None };
+    // Init (Entry 21): the first process, which starts the rest. The kernel
+    // hands it what it used to hand out itself, and the Factory capability
+    // to make processes and endpoints with.
+    let init = user_mode_on && start_init(ioapic_ready);
 
     // Build-time demo, if one was requested. The fault demos halt; they run
-    // once the console driver has drawn, so their crash screens show the
+    // once init's console driver has drawn, so their crash screens show the
     // kernel taking the screen back (Entry 20).
-    if option_env!("FREYA_DEMO").is_some_and(|d| !d.is_empty()) && console_ep.is_some() && sched::is_enabled() {
+    if option_env!("FREYA_DEMO").is_some_and(|d| !d.is_empty()) && init {
         sched::sleep_ticks(20);
     }
     run_requested_demo();
 
-    // The keyboard driver: a user process with exactly the capabilities it
-    // needs, including Power, so the person at the keyboard can restart or
-    // switch off cleanly, and the console driver's endpoint to ask it to
-    // scroll.
-    let console_cap = console_ep.map_or(cap::Cap::None, |ep| cap::Cap::Endpoint { ep, badge: 1, rights: cap::SEND });
-    let keyboard = ioapic_ready
-        && user_mode_on
-        && process::spawn(
-            &process::KEYBOARD,
-            0,
-            cap::table(&[
-                cap::Cap::Console,
-                cap::Cap::Irq { line: 1 },
-                cap::Cap::IoPorts { base: 0x60, count: 1 },
-                cap::Cap::IoPorts { base: 0x64, count: 1 },
-                cap::Cap::Power,
-                console_cap,
-            ]),
-        )
-        .is_ok();
-    if let Some(ep) = console_ep {
-        ipc::release_created(ep);
-    }
-    if !keyboard {
-        serial_write_str(b"[kernel] no keyboard driver: to switch off, hold the power button (safe: nothing is written to disk)\n");
-    }
-
     if all_ok {
         vga_print(
             16,
-            match (keyboard, display::cols() >= 110) {
+            match (init, display::cols() >= 110) {
                 (true, true) => b"--- FreyaOS ready ---  Ctrl+Alt+Del: restart   Ctrl+Alt+End: switch off   PageUp/PageDown: scroll the log",
                 (true, false) => b"--- FreyaOS ready ---  Ctrl+Alt+Del restart  Ctrl+Alt+End off  PgUp/PgDn scroll",
                 (false, _) => b"--- FreyaOS foundation ready ---",
@@ -727,6 +703,65 @@ pub extern "C" fn rust_start() -> ! {
     }
     loop {
         unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
+    }
+}
+
+/// Init's task id, once it runs (for the demos).
+static INIT_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Start init with everything the drivers it starts will need. Its slots
+/// (user/rust/src/bin/init.rs says the same):
+///
+///   0 Console        1 Factory        2 its own endpoint (exit signals)
+///   3 the console driver's endpoint (every right)
+///   4 the screen     5 the system log 6 the status rows 7 the screen's
+///                                                         description
+///   8 Irq 1 (the keyboard)            9 IoPorts 0x60   10 IoPorts 0x64
+///  11 Power
+///
+/// A slot is left empty if the kernel has nothing to put there (no screen
+/// to lend, interrupts not routed); init then can't start what needs it,
+/// and says so. Returns whether init started.
+fn start_init(ioapic_ready: bool) -> bool {
+    use cap::{Cap, RECV, SEND};
+    let console = console::prepare();
+    let own = ipc::create();
+    let console_cap = |pick: fn(&console::ConsoleCaps) -> Cap| console.as_ref().map_or(Cap::None, pick);
+    let caps = cap::table(&[
+        Cap::Console,
+        Cap::Factory,
+        own.map_or(Cap::None, |ep| Cap::Endpoint { ep, badge: 0, rights: SEND | RECV }),
+        console_cap(|c| c.endpoint),
+        console_cap(|c| c.screen),
+        console_cap(|c| c.log),
+        console_cap(|c| c.panel),
+        console_cap(|c| c.description),
+        if ioapic_ready { Cap::Irq { line: 1 } } else { Cap::None },
+        Cap::IoPorts { base: 0x60, count: 1 },
+        Cap::IoPorts { base: 0x64, count: 1 },
+        Cap::Power,
+    ]);
+    let started = process::spawn(&process::INIT, 0, caps);
+    // init's table holds the endpoints now (or nothing does, and they go).
+    if let Some(ep) = own {
+        ipc::release_created(ep);
+    }
+    if let Some(Cap::Endpoint { ep, .. }) = console.as_ref().map(|c| c.endpoint) {
+        ipc::release_created(ep);
+    }
+    match started {
+        Ok(id) => {
+            INIT_TASK.store(id, core::sync::atomic::Ordering::Relaxed);
+            // One call: init may already be running and printing (Entry 17).
+            let mut line = idt::Line::new();
+            line.str(b"[kernel] init (process ").dec(id as u64).str(b") starts the drivers\n");
+            serial_write_str(line.as_bytes());
+            true
+        }
+        Err(_) => {
+            serial_write_str(b"[kernel] couldn't start init, so no drivers: to switch off, hold the power button (safe: nothing is written to disk)\n");
+            false
+        }
     }
 }
 
@@ -845,12 +880,23 @@ fn run_requested_demo() {
             "heap_double_free" => heap::demo_double_free(),
             // [kernel] PANIC with file and line
             "panic" => panic!("FREYA_DEMO=panic"),
-            // Not faults (Entry 20): the console driver killed, so the
-            // kernel must take the screen back and the keyboard driver
-            // must carry on without it; and the log flooded past the
-            // console's 400 rows, then a line every quarter second.
+            // Not faults (Entries 20 and 21): the console driver killed, so
+            // init must start it again; init and then the console driver
+            // killed, or the console driver killed more often than init
+            // starts it again, so the kernel must take the screen back and
+            // the keyboard driver must carry on without it; and the log
+            // flooded past the console's 400 rows, then a line every
+            // quarter second.
             "kill_console" => {
                 demo_kill_console();
+                return;
+            }
+            "kill_init" => {
+                demo_kill_init();
+                return;
+            }
+            "kill_console_often" => {
+                demo_kill_console_often();
                 return;
             }
             "log_flood" => {
@@ -860,7 +906,7 @@ fn run_requested_demo() {
             _ => {
                 serial_write_str(b"[demo] unknown; known: ud2 page_fault stack_overflow \
                                    task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free panic \
-                                   kill_console log_flood\n");
+                                   kill_console kill_init kill_console_often log_flood\n");
                 return;
             }
         }
@@ -868,14 +914,55 @@ fn run_requested_demo() {
     serial_write_str(b"[demo] returned without faulting\n");
 }
 
-/// Demo: kill the console driver and wait until it has ended.
+/// The process drawing the screen, waiting (up to 3 s) for one to start.
+fn console_task() -> Option<sched::TaskId> {
+    for _ in 0..300 {
+        if console::task().is_some() {
+            break;
+        }
+        sched::sleep_ticks(1);
+    }
+    console::task()
+}
+
+/// Demo: kill the console driver once it draws, and wait until it has
+/// ended.
 fn demo_kill_console() {
-    let Some(id) = console::task() else {
+    let Some(id) = console_task() else {
         serial_write_str(b"[demo] no console driver to kill\n");
         return;
     };
     let ended = sched::kill(id) && sched::join_timeout(id, 200).is_some();
     serial_write_str(if ended { b"[demo] console driver killed\n" } else { b"[demo] the console driver didn't end\n" });
+}
+
+/// Demo: kill the console driver four times, each time once init has
+/// started it again: after the third restart init leaves it stopped, and
+/// lets go of its endpoint, so the keyboard driver isn't left waiting.
+fn demo_kill_console_often() {
+    for n in 1..=4u64 {
+        // The kernel forgets who drew when that process ends, so this
+        // waits for the next one to take the screen, whatever its id.
+        let Some(id) = console_task() else {
+            serial_write_str(b"[demo] no console driver to kill\n");
+            return;
+        };
+        let ended = sched::kill(id) && sched::join_timeout(id, 200).is_some();
+        let mut line = idt::Line::new();
+        line.str(if ended { b"[demo] console driver killed (" } else { b"[demo] the console driver didn't end (" });
+        line.dec(n).str(b" of 4)\n");
+        serial_write_str(line.as_bytes());
+    }
+}
+
+/// Demo: once the console driver draws, kill init, then the console
+/// driver: nobody starts it again.
+fn demo_kill_init() {
+    console_task();
+    let id = INIT_TASK.load(core::sync::atomic::Ordering::Relaxed);
+    let ended = id != usize::MAX && sched::kill(id) && sched::join_timeout(id, 200).is_some();
+    serial_write_str(if ended { b"[demo] init killed\n" } else { b"[demo] init didn't end\n" });
+    demo_kill_console();
 }
 
 /// Demo: 600 numbered lines at once, then one every 25 ticks for ever (a

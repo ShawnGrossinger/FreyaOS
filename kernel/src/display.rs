@@ -24,7 +24,8 @@
 //! boots, or if the image was built with TEXT_MODE=1.
 //!
 //! Since Entry 20 the screen belongs to the console driver, a process,
-//! once boot is done (console.rs): hand_over() stops the kernel drawing,
+//! from the moment it maps the screen (console.rs, Entry 21): hand_over()
+//! stops the kernel drawing,
 //! and the driver draws instead, from the system log (log.rs) and from the
 //! kernel's status rows, which it reads in `cells` (PANEL_ROWS of them, lent
 //! read-only). The kernel keeps `cells` up to date all the same, so that
@@ -367,7 +368,7 @@ pub fn panel_memory() -> crate::cap::Cap {
 }
 
 /// What the console driver needs to know to draw (console.rs puts it in
-/// its start block).
+/// the screen's description).
 pub struct Geometry {
     pub graphics: bool,
     pub cols: u32,

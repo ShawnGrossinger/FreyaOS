@@ -38,7 +38,7 @@ ROOT=out/test
 #        "keyboard ready", or for a crash report to end.
 CASES=(
   "image||||"   # not booted: checks the disk image's layout (see check_image)
-  "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;\\[display\\] VESA graphics [0-9]+x[0-9]+, 32-bit;;reads back pixel for pixel \\(128 pixels, [0-9]+ lit, 0 wrong\\); framebuffer mapped write-combining \\(PAT entry 4\\): PASS;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!;;'probe' killed by vector 14 #PF;;\\[user [0-9]+ 'ipc'\\] printed for me by the log server;;driver handled 10"
+  "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;\\[user [0-9]+ 'init'\\] started the console driver \\(process [0-9]+\\) and the keyboard driver \\(process [0-9]+\\);;\\[console\\] process [0-9]+ \\('console'\\) draws the screen from here on;;\\[display\\] VESA graphics [0-9]+x[0-9]+, 32-bit;;reads back pixel for pixel \\(128 pixels, [0-9]+ lit, 0 wrong\\); framebuffer mapped write-combining \\(PAT entry 4\\): PASS;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!;;'probe' killed by vector 14 #PF;;\\[user [0-9]+ 'ipc'\\] printed for me by the log server;;driver handled 10"
   "bios-if-on|bios-if-on|128M|BIOS had left them ON after its disk calls; stage 2 turned them off\\): PASS;;self-tests: [0-9]+ passed, 0 failed"
   "dirty-ram||128M-dirty|self-tests: [0-9]+ passed, 0 failed;;init complete"
   "boot-4G||4G|physical map at 0xffff800000000000: 4096 MiB;;init complete - boot thread done; scheduler and timer running"
@@ -66,8 +66,10 @@ CASES=(
   "heap_double_free|heap_double_free|128M|\[heap\] FATAL: double free"
   "panic|panic|128M|\[kernel\] PANIC at src/main.rs:[0-9]+: FREYA_DEMO=panic;;crash screen: red at the top||crashdump"
   "vbe-lies|vbe-lies|128M|display's own resolution 1280x800 \\(EDID\\);;VESA graphics 800x600, 32-bit;;screendump matches the mode: 800x600, and the colour swatch is the VGA palette|-vga none -device VGA,xres=1280,yres=800|screendump"
-  "kill-console|kill_console|128M|\\[demo\\] console driver killed;;the console driver ended: the kernel draws the screen again;;typed: hi;;no console notes after it ended;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette;;the screen changed since the last screendump||screendump pgup h i ret pause screendiff"
-  "log-flood|log_flood|128M|flood 600;;tick 1;;flood checked: ;;screendump matches the mode: 1280x800, and the colour swatch is the VGA palette;;the log below the bar did not change||pgup screendump pause logsame pgdn pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup"
+  "kill-console|kill_console|128M|\\[demo\\] console driver killed;;ended: the kernel draws the screen again;;\\[user [0-9]+ 'init'\\] the console driver \\(process [0-9]+\\) ended: started it again as process [0-9]+ \\(1 of 3\\);;started again: it draws and scrolls;;typed: hi;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette||screendump pause pgup h i ret"
+  "kill-console-often|kill_console_often|128M|\\[demo\\] console driver killed \\(4 of 4\\);;started it again as process [0-9]+ \\(3 of 3\\);;started again 3 times already, so it stays stopped;;typed: hi;;no console notes after it stayed stopped;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette;;the screen changed since the last screendump||screendump pause pause pgup h i ret pause screendiff"
+  "kill-init|kill_init|128M|\\[demo\\] init killed;;\\[demo\\] console driver killed;;ended: the kernel draws the screen again;;typed: hi;;no console notes after it ended;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette;;the screen changed since the last screendump||screendump pause pgup h i ret pause screendiff"
+  "log-flood|log_flood|128M|flood 600;;tick 1;;flood checked: ;;screendump matches the mode: 1280x800, and the colour swatch is the VGA palette;;the log below the bar did not change||pause pgup screendump pause logsame pgdn pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup"
 )
 COMMON="self-tests: [0-9]+ passed, 0 failed"
 
@@ -460,8 +462,19 @@ for entry in "${CASES[@]}"; do
   boot "$dir/freya-os.img" "$mem" "$dir/serial.log" "$keys" $extra
   [ "$name" = scroll ] && check_scroll "$dir/serial.log"
   [ "$name" = log-flood ] && check_flood "$dir/serial.log"
-  if [ "$name" = kill-console ] && [ -z "$(sed -n '/console driver killed/,$ p' "$dir/serial.log" | grep '^\[console note\] view')" ]; then
+  # After the console driver is killed: init starts it again (kill-console),
+  # or, with init gone too, nothing does (kill-init).
+  after=$(sed -n '/console driver killed/,$ p' "$dir/serial.log" | grep '^\[console note\] ')
+  if [ "$name" = kill-console ] && echo "$after" | grep -q '^\[console note\] started' \
+      && echo "$after" | sed -n '/started/,$ p' | grep -q '^\[console note\] view [1-9]'; then
+    echo "[test.sh] started again: it draws and scrolls" >> "$dir/serial.log"
+  fi
+  if [ "$name" = kill-init ] && [ -z "$after" ]; then
     echo "[test.sh] no console notes after it ended" >> "$dir/serial.log"
+  fi
+  if [ "$name" = kill-console-often ] && grep -q 'stays stopped' "$dir/serial.log" \
+      && [ -z "$(sed -n '/stays stopped/,$ p' "$dir/serial.log" | grep '^\[console note\] ')" ]; then
+    echo "[test.sh] no console notes after it stayed stopped" >> "$dir/serial.log"
   fi
 
   missing=()
