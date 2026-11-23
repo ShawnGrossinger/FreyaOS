@@ -26,7 +26,13 @@
 //!   - Factory: may create processes from the programs built into the
 //!     kernel and new endpoints (system calls spawn and endpoint,
 //!     factory.rs). Held by init (Entry 21), which builds the rest of the
-//!     system with it.
+//!     system with it. Since Entry 24 it has rights: which programs it may
+//!     start (bit n: program n) and whether it may make endpoints, so init
+//!     can hand the shell one that starts only a few test programs.
+//!   - Process (Entry 24): names one process (its task slot, and which of
+//!     the tasks that slot has held), and may ask how it is doing and stop
+//!     it (system calls status and kill). spawn hands one back on request,
+//!     so whoever starts a program, and nobody else, can stop it.
 //!   - Info: may read the system's state: how long it has been up, how
 //!     much memory is free, and every task with its state (system call
 //!     info, info.rs). Read-only; what the shell's ps, uptime and mem show
@@ -39,8 +45,9 @@
 //! An endpoint capability can be copied with less authority (system call
 //! mint, Entry 21): fewer rights, and a badge if it had none yet. That is
 //! how init gives the console driver only RECV on its endpoint and the
-//! keyboard driver only SEND, with a badge that names it. And a process
-//! can let go of a capability (system call drop).
+//! keyboard driver only SEND, with a badge that names it. A Factory can be
+//! copied with fewer rights too (Entry 24). And a process can let go of a
+//! capability (system call drop).
 
 pub const MAX_CAPS: usize = 32;
 
@@ -61,8 +68,13 @@ pub enum Cap {
     Power,
     /// May map physical [base, base + pages * 4 KiB) (mem.rs).
     Memory { base: u64, pages: u32, flags: u8 },
-    /// May create processes and endpoints (factory.rs).
-    Factory,
+    /// May create processes and endpoints (factory.rs): `rights` says
+    /// which programs (bit n: program n) and whether endpoints
+    /// (FACTORY_ENDPOINTS).
+    Factory { rights: u32 },
+    /// Names task slot `id`'s `generation`th task, a process; may ask how
+    /// it is doing and stop it (Entry 24).
+    Process { id: u8, generation: u32 },
     /// May read the system's state: uptime, memory, tasks (info.rs).
     Info,
 }
@@ -73,6 +85,12 @@ pub const MEM_WRITE: u8 = 1 << 0;
 pub const MEM_WRITE_COMBINING: u8 = 1 << 1;
 /// Uncached: for device memory that must see every access (VGA text).
 pub const MEM_UNCACHED: u8 = 1 << 2;
+
+/// Factory rights (Entry 24): bits 0 to 15 are programs (factory.rs:
+/// PROGRAMS), this one making endpoints.
+pub const FACTORY_ENDPOINTS: u32 = 1 << 16;
+/// Every program and endpoints: the Factory the kernel gives init.
+pub const FACTORY_ALL: u32 = 0xFFFF | FACTORY_ENDPOINTS;
 
 pub type Caps = [Cap; MAX_CAPS];
 pub const NO_CAPS: Caps = [Cap::None; MAX_CAPS];
@@ -122,10 +140,24 @@ pub fn release(cap: Cap) {
 /// `badge`, in the caller's first free slot. A capability without a badge
 /// (0) can be given one; one with a badge keeps it, and asking for another
 /// is refused. No capability ever gets the signal badge. Returns the slot.
+///
+/// For a Factory (Entry 24), `rights` are its rights (FACTORY_ENDPOINTS and
+/// program bits), again a subset of what it has and at least one, and
+/// there is no badge (0).
 pub fn mint(slot: u64, rights: u64, badge: u64) -> i64 {
     use crate::syscall::{ERR_BAD_ARGUMENT, ERR_NO_SLOT, ERR_WRONG_CAPABILITY};
-    let Cap::Endpoint { ep, badge: old, rights: have } = crate::sched::current_cap(slot) else {
-        return ERR_WRONG_CAPABILITY;
+    let (ep, old, have) = match crate::sched::current_cap(slot) {
+        Cap::Endpoint { ep, badge, rights } => (ep, badge, rights),
+        Cap::Factory { rights: have } => {
+            if rights == 0 || rights & !(have as u64) != 0 || badge != 0 {
+                return ERR_BAD_ARGUMENT; // none, more than it has, or a badge
+            }
+            return match crate::sched::store_cap(Cap::Factory { rights: rights as u32 }) {
+                Some(slot) => slot as i64,
+                None => ERR_NO_SLOT,
+            };
+        }
+        _ => return ERR_WRONG_CAPABILITY,
     };
     let all = (SEND | RECV | GRANT) as u64;
     if rights == 0 || rights & !all != 0 || rights & !(have as u64) != 0 {

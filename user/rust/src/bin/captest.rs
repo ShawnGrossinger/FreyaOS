@@ -58,6 +58,29 @@
 //!          own code, which it may read but not write
 //!   bit 4  cap_info: slot 0 the console, 1 Info, 2 the endpoint with SEND
 //!          + RECV and badge 0x2A, 3 empty; slot 32 refused
+//!
+//! PROCESS (6, Entry 24), with slot 0 Console, 1 Factory (every right), 2
+//! an endpoint (SEND + RECV), 3 a stale Process capability: one for the
+//! task before the spinning process the kernel has in that slot now
+//! (kernel/src/factory.rs checks it exits with 0xFF, and that the spinning
+//! process is still running):
+//!   bit 0  hello with a Process capability (and no console, so it ends at
+//!          once): its exit signal comes, and status says it exited with
+//!          its code (write's refusal)
+//!   bit 1  spin with a Process capability: running; kill stops it; its
+//!          exit signal comes; status says killed; kill again: peer-gone
+//!   bit 2  a Factory minted to start only hello: spin refused, endpoint
+//!          refused, hello started
+//!   bit 3  minting from that one: another program, a badge, no rights:
+//!          refused
+//!   bit 4  the stale Process capability: kill and status say peer-gone
+//!   bit 5  kill and status on what isn't a Process capability, and an
+//!          unknown spawn flag: refused
+//!   bit 6  cap_info: the narrowed Factory's rights; spin's capability:
+//!          its id and a generation
+//!   bit 7  every slot taken, then spin asked for with a Process
+//!          capability: refused (no slot), and not started (the kernel's
+//!          check that nothing is left over would see it running)
 
 #![no_std]
 #![no_main]
@@ -75,6 +98,7 @@ const MINT: u64 = 2;
 const BIND: u64 = 3;
 const SIGNAL: u64 = 4;
 const INFO: u64 = 5;
+const PROCESS: u64 = 6;
 const TEST_LINE: u64 = 16;
 
 fn main(arg: u64) -> u64 {
@@ -84,6 +108,7 @@ fn main(arg: u64) -> u64 {
         BIND => bind_tests(),
         SIGNAL => signal_tests(),
         INFO => info_tests(),
+        PROCESS => process_tests(),
         _ => 0,
     }
 }
@@ -109,7 +134,7 @@ fn spawn_tests() -> u64 {
     let bad_slots = spawn(FACTORY, PROGRAM_HELLO, 0, &empty, NO_CAP) == ERR_BAD_ARGUMENT
         && spawn(FACTORY, PROGRAM_HELLO, 0, &past, NO_CAP) == ERR_BAD_ARGUMENT;
 
-    let kernel_list = spawn_raw(FACTORY, PROGRAM_HELLO, 0, 0xFFFF_8000_0000_0000, NO_CAP) == ERR_BAD_ADDRESS;
+    let kernel_list = spawn_raw(FACTORY, PROGRAM_HELLO, 0, 0xFFFF_8000_0000_0000, NO_CAP, 0).0 == ERR_BAD_ADDRESS;
     let exit_not_endpoint = spawn(FACTORY, PROGRAM_HELLO, 0, &list, CONSOLE_SLOT) == ERR_WRONG_CAPABILITY;
 
     bit(0, signalled) | bit(1, no_factory) | bit(2, no_program) | bit(3, bad_slots) | bit(4, kernel_list) | bit(5, exit_not_endpoint)
@@ -219,4 +244,69 @@ fn info_tests() -> u64 {
         && cap_info(3) == Ok((KIND_NONE, 0, 0, 0))
         && cap_info(32) == Err(ERR_BAD_ARGUMENT);
     bit(0, mine) | bit(1, header_only) | bit(2, refused) | bit(3, bad_address) | bit(4, caps)
+}
+
+/// Wait (a few signals at most) for process `id`'s exit signal on EP.
+fn wait_exit(id: u64) -> bool {
+    for _ in 0..8 {
+        match recv(EP) {
+            Ok(m) if m.badge == SIGNAL_BADGE && m.words[0] & (1 << id) != 0 => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+fn process_tests() -> u64 {
+    const STALE: u64 = 3;
+    let none = [NO_SLOT; MAX_CAPS];
+
+    let ended = match spawn_process(FACTORY, PROGRAM_HELLO, 0, &none, EP) {
+        Ok((id, cap)) => wait_exit(id) && status(cap) == Ok((STATUS_EXITED, ERR_NO_CAPABILITY as u64)),
+        Err(_) => false,
+    };
+
+    let mut spin = None;
+    let stopped = match spawn_process(FACTORY, PROGRAM_SPIN, 0, &none, EP) {
+        Ok((id, cap)) => {
+            spin = Some((id, cap));
+            status(cap) == Ok((STATUS_RUNNING, 0))
+                && kill(cap) == 0
+                && wait_exit(id)
+                && status(cap) == Ok((STATUS_KILLED, 0))
+                && kill(cap) == ERR_PEER_GONE
+        }
+        Err(_) => false,
+    };
+
+    let narrow = mint(FACTORY, 1 << PROGRAM_HELLO, 0);
+    let narrowed = narrow >= 0
+        && spawn(narrow as u64, PROGRAM_SPIN, 0, &none, NO_CAP) == ERR_WRONG_CAPABILITY
+        && endpoint(narrow as u64) == ERR_WRONG_CAPABILITY
+        && spawn(narrow as u64, PROGRAM_HELLO, 0, &none, NO_CAP) >= 0;
+    let refused = narrow >= 0
+        && mint(narrow as u64, 1 << PROGRAM_SPIN, 0) == ERR_BAD_ARGUMENT
+        && mint(narrow as u64, 1 << PROGRAM_HELLO, 5) == ERR_BAD_ARGUMENT
+        && mint(narrow as u64, 0, 0) == ERR_BAD_ARGUMENT;
+
+    let stale = kill(STALE) == ERR_PEER_GONE && status(STALE) == Err(ERR_PEER_GONE);
+
+    let wrong = kill(CONSOLE_SLOT) == ERR_WRONG_CAPABILITY
+        && status(EP) == Err(ERR_WRONG_CAPABILITY)
+        && spawn_raw(FACTORY, PROGRAM_HELLO, 0, none.as_ptr() as u64, NO_CAP, 1 << 1).0 == ERR_BAD_ARGUMENT;
+
+    let described = narrow >= 0
+        && cap_info(narrow as u64) == Ok((KIND_FACTORY, 1 << PROGRAM_HELLO, 0, 0))
+        && matches!(spin, Some((id, cap)) if matches!(cap_info(cap), Ok((KIND_PROCESS, i, g, 0)) if i == id && g > 0));
+
+    // Last, as it fills the table.
+    let mut filled = 0;
+    while filled < MAX_CAPS && mint(EP, SEND, 0) >= 0 {
+        filled += 1;
+    }
+    let no_room = spawn_process(FACTORY, PROGRAM_SPIN, 0, &none, NO_CAP) == Err(ERR_NO_SLOT);
+
+    bit(0, ended) | bit(1, stopped) | bit(2, narrowed) | bit(3, refused) | bit(4, stale) | bit(5, wrong) | bit(6, described)
+        | bit(7, no_room)
 }

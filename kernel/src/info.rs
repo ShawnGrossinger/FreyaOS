@@ -22,8 +22,9 @@
 //!
 //!   cap_info(slot): what the caller's own slot holds: its kind, and up to
 //!   three numbers (an endpoint's number, rights and badge; a port range's
-//!   base and count; a line; a memory capability's pages and flags; never
-//!   a physical address). It needs no capability: it shows a process only
+//!   base and count; a line; a memory capability's pages and flags, never
+//!   a physical address; a Factory's rights and a process's slot and
+//!   generation, Entry 24). It needs no capability: it shows a process only
 //!   what it already holds, and nothing outside it.
 //!
 //! An Info capability lets its holder see every task's name and state, so
@@ -50,6 +51,7 @@ pub const KIND_POWER: i64 = 5;
 pub const KIND_MEMORY: i64 = 6;
 pub const KIND_FACTORY: i64 = 7;
 pub const KIND_INFO: i64 = 8;
+pub const KIND_PROCESS: i64 = 9;
 
 /// info(slot, ptr, len): the snapshot, if `slot` holds Info and `len` has
 /// room for the header at least.
@@ -114,8 +116,9 @@ pub fn cap_info(slot: u64) -> (i64, u64, u64, u64) {
         Cap::Irq { line } => (KIND_IRQ, line as u64, 0, 0),
         Cap::Power => (KIND_POWER, 0, 0, 0),
         Cap::Memory { pages, flags, .. } => (KIND_MEMORY, pages as u64, flags as u64, 0),
-        Cap::Factory => (KIND_FACTORY, 0, 0, 0),
+        Cap::Factory { rights } => (KIND_FACTORY, rights as u64, 0, 0),
         Cap::Info => (KIND_INFO, 0, 0, 0),
+        Cap::Process { id, generation } => (KIND_PROCESS, id as u64, generation as u64, 0),
     }
 }
 

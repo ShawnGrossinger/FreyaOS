@@ -13,10 +13,21 @@
 //!                      on Enter (SCROLL)
 //!   slot 4  Info       uptime, memory and the tasks (ps, uptime, mem)
 //!   slot 5  Power      restart and off
+//!   slot 6  Factory    (Entry 24) starts hello, spin and crash, nothing else
+//!   slot 7  Endpoint   its own again (SEND): where the programs it starts
+//!                      signal when they end (bit 1 << id)
 //!
-//! No port, no interrupt, no screen, no Factory: it can't start anything
-//! or reach a device, and a fault in it ends only it (init starts it
-//! again). The keyboard's own keys stay with the PS/2 driver
+//! No port, no interrupt, no screen: it can't reach a device, and a fault
+//! in it ends only it (init starts it again). Its Factory starts only the
+//! three test programs; run anything else and the kernel refuses.
+//!
+//! Programs (Entry 24): run starts one in the background, with the console
+//! in its slot 0 and nothing else, and keeps the Process capability spawn
+//! hands back (up to MAX_JOBS at once). jobs lists them; kill stops one,
+//! through that capability, and nothing else: a process this shell didn't
+//! start, it holds no capability for. When one ends, the kernel signals
+//! the shell's endpoint, and the shell asks how (status), says so, and
+//! lets the capability go. The keyboard's own keys stay with the PS/2 driver
 //! (Ctrl+Alt+Del, Ctrl+Alt+End, PageUp, PageDown), so they work with no
 //! shell at all.
 //!
@@ -40,6 +51,19 @@ const PS2: u64 = 2;
 const CONSOLE_EP: u64 = 3;
 const INFO: u64 = 4;
 const POWER_SLOT: u64 = 5;
+const FACTORY: u64 = 6;
+const EXITS: u64 = 7;
+
+/// Programs running from this shell at once, at most.
+const MAX_JOBS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct Job {
+    id: u64,
+    /// The slot of its Process capability.
+    cap: u64,
+    program: u64,
+}
 
 const PROMPT: &[u8] = b"freya> ";
 const MAX_LINE: usize = 64;
@@ -58,6 +82,7 @@ struct Shell {
     back: usize,
     draft: [u8; MAX_LINE],
     draft_len: usize,
+    jobs: [Option<Job>; MAX_JOBS],
 }
 
 static mut STATE: Shell = unsafe { core::mem::zeroed() };
@@ -84,6 +109,11 @@ fn main(_arg: u64) -> u64 {
         }
         if msg.words[0] & SIGNAL_KEYS != 0 {
             sh.read_keys();
+        }
+        // Every other bit is a process that ended: bit (1 << its id).
+        let ended = msg.words[0] & !(SIGNAL_KEYS | SIGNAL_REDRAW);
+        if ended != 0 {
+            sh.ended(ended);
         }
     }
 }
@@ -199,7 +229,7 @@ impl Shell {
         }
         self.show();
         if len > 0 {
-            run(&line[..len]);
+            self.run(&line[..len]);
         }
     }
 }
@@ -216,37 +246,193 @@ const HELP: &[&[u8]] = &[
     b"  caps       the capabilities this shell holds: all it may do\n",
     b"  uptime     time since the timer started\n",
     b"  mem        memory free\n",
+    b"  run NAME   start a program: hello, spin (runs until stopped), crash (writes to the kernel)\n",
+    b"  jobs       the programs started here that are still running\n",
+    b"  kill ID    stop one of them (or kill NAME: every one of that name)\n",
     b"  restart    restart the machine\n",
     b"  off        switch the machine off\n",
     b"keys: Up/Down earlier lines, Esc clears the line, PgUp/PgDn scroll the log\n",
 ];
 
-fn run(line: &[u8]) {
-    let line = trim(line);
-    let (name, rest) = match line.iter().position(|&b| b == b' ') {
-        Some(i) => (&line[..i], trim(&line[i + 1..])),
-        None => (line, &line[line.len()..]),
-    };
-    match name {
-        b"help" => HELP.iter().for_each(|l| say(l)),
-        b"echo" => {
-            let mut l = Line::<80>::new();
-            l.str(rest).str(b"\n");
+impl Shell {
+    fn run(&mut self, line: &[u8]) {
+        let line = trim(line);
+        let (name, rest) = match line.iter().position(|&b| b == b' ') {
+            Some(i) => (&line[..i], trim(&line[i + 1..])),
+            None => (line, &line[line.len()..]),
+        };
+        match name {
+            b"help" => HELP.iter().for_each(|l| say(l)),
+            b"echo" => {
+                let mut l = Line::<80>::new();
+                l.str(rest).str(b"\n");
+                say(l.as_bytes());
+            }
+            b"ps" => ps(),
+            b"caps" => self.caps(),
+            b"uptime" => uptime(),
+            b"mem" => mem(),
+            b"run" => self.start(rest),
+            b"jobs" => self.list_jobs(),
+            b"kill" => self.stop(rest),
+            b"restart" => power_off_or_restart(POWER_RESTART, b"restarting\n"),
+            b"off" => power_off_or_restart(POWER_OFF, b"switching off\n"),
+            b"" => {}
+            _ => {
+                let mut l = Line::<120>::new();
+                l.str(name).str(b": no such command (help lists them)\n");
+                say(l.as_bytes());
+            }
+        }
+    }
+
+    /// run NAME: start it, with the console and nothing else, and keep its
+    /// Process capability.
+    fn start(&mut self, name: &[u8]) {
+        let Some(program) = PROGRAM_NAMES.iter().position(|&n| n == name) else {
+            let mut l = Line::<120>::new();
+            if name.is_empty() {
+                l.str(b"run what?");
+            } else {
+                l.str(name).str(b": no such program");
+            }
+            l.str(b" (programs: ");
+            for (i, n) in PROGRAM_NAMES.iter().enumerate() {
+                l.str(if i > 0 { b", " } else { b"" }).str(n);
+            }
+            l.str(b")\n");
+            return say(l.as_bytes());
+        };
+        let Some(free) = self.jobs.iter().position(|j| j.is_none()) else {
+            let mut l = Line::<120>::new();
+            l.dec(MAX_JOBS as u64).str(b" programs are running from this shell already: stop one first (kill)\n");
+            return say(l.as_bytes());
+        };
+        let mut slots = [NO_SLOT; MAX_CAPS];
+        slots[0] = CONSOLE as u8;
+        let mut l = Line::<120>::new();
+        match spawn_process(FACTORY, program as u64, 0, &slots, EXITS) {
+            Ok((id, cap)) => {
+                self.jobs[free] = Some(Job { id, cap, program: program as u64 });
+                l.str(b"started ").str(name).str(b" as process ").dec(id);
+            }
+            Err(ERR_WRONG_CAPABILITY) => {
+                l.str(name).str(b": this shell's Factory capability doesn't cover it (caps shows what it does)");
+            }
+            Err(e) => {
+                l.str(b"couldn't start ").str(name).str(b" (error -").dec(e.unsigned_abs()).str(b")");
+            }
+        }
+        l.str(b"\n");
+        say(l.as_bytes());
+    }
+
+    fn list_jobs(&self) {
+        let mut any = false;
+        for j in self.jobs.iter().flatten() {
+            if !any {
+                say(b" id  program\n");
+                any = true;
+            }
+            let mut l = Line::<120>::new();
+            right(&mut l, j.id, 3);
+            l.str(b"  ").str(PROGRAM_NAMES[j.program as usize]).str(b"\n");
             say(l.as_bytes());
         }
-        b"ps" => ps(),
-        b"caps" => caps(),
-        b"uptime" => uptime(),
-        b"mem" => mem(),
-        b"restart" => power_off_or_restart(POWER_RESTART, b"restarting\n"),
-        b"off" => power_off_or_restart(POWER_OFF, b"switching off\n"),
-        b"" => {}
-        _ => {
+        if !any {
+            say(b"no programs started from this shell are running\n");
+        }
+    }
+
+    /// kill ID, or kill NAME: through the Process capabilities it holds,
+    /// and only those.
+    fn stop(&mut self, what: &[u8]) {
+        if what.is_empty() {
+            return say(b"kill what? a process number or a program's name (jobs lists them)\n");
+        }
+        let number = parse(what);
+        let mut found = false;
+        for j in self.jobs.iter().flatten() {
+            let name = PROGRAM_NAMES[j.program as usize];
+            if number != Some(j.id) && name != what {
+                continue;
+            }
+            found = true;
             let mut l = Line::<120>::new();
-            l.str(name).str(b": no such command (help lists them)\n");
+            match kill(j.cap) {
+                0 => l.str(b"stopping "),
+                _ => l.str(b"already ended: "), // its exit signal is on its way
+            };
+            l.str(name).str(b" (process ").dec(j.id).str(b")\n");
+            say(l.as_bytes());
+        }
+        if !found {
+            let mut l = Line::<160>::new();
+            match number {
+                Some(id) => l
+                    .str(b"process ")
+                    .dec(id)
+                    .str(b": this shell holds no capability for it, so it can't stop it (only what it started)\n"),
+                None => l.str(b"no ").str(what).str(b" started from this shell is running\n"),
+            };
             say(l.as_bytes());
         }
     }
+
+    /// The processes with these bits (1 << id) ended: say how, and let
+    /// their capabilities go.
+    fn ended(&mut self, bits: u64) {
+        for slot in self.jobs.iter_mut() {
+            let Some(j) = *slot else { continue };
+            if j.id >= 64 || bits & (1 << j.id) == 0 {
+                continue;
+            }
+            let mut l = Line::<120>::new();
+            l.str(PROGRAM_NAMES[j.program as usize]).str(b" (process ").dec(j.id).str(b") ended: ");
+            match status(j.cap) {
+                Ok((STATUS_EXITED, code)) => {
+                    l.str(b"exit code ");
+                    if (code as i64) < 0 {
+                        l.str(b"-").dec((code as i64).unsigned_abs());
+                    } else {
+                        l.dec(code);
+                    }
+                }
+                Ok((STATUS_FAULT, vector)) => {
+                    l.str(b"stopped by the CPU: exception ").dec(vector).str(exception_name(vector));
+                }
+                Ok((STATUS_KILLED, _)) => {
+                    l.str(b"stopped (kill)");
+                }
+                Ok((STATUS_RUNNING, _)) => continue, // not this one after all
+                _ => {
+                    l.str(b"how is no longer known");
+                }
+            }
+            l.str(b"\n");
+            say(l.as_bytes());
+            drop_cap(j.cap);
+            *slot = None;
+        }
+    }
+}
+
+fn exception_name(vector: u64) -> &'static [u8] {
+    match vector {
+        0 => b" (divide error)",
+        6 => b" (invalid opcode)",
+        13 => b" (general protection)",
+        14 => b" (page fault)",
+        _ => b"",
+    }
+}
+
+/// A decimal number, if `s` is one.
+fn parse(s: &[u8]) -> Option<u64> {
+    if s.is_empty() || s.len() > 9 || !s.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(s.iter().fold(0, |n, &b| n * 10 + (b - b'0') as u64))
 }
 
 fn trim(s: &[u8]) -> &[u8] {
@@ -330,7 +516,8 @@ fn ps() {
     say(l.as_bytes());
 }
 
-fn caps() {
+impl Shell {
+fn caps(&self) {
     let mut held = 0;
     for slot in 0..MAX_CAPS as u64 {
         let (kind, a, b, c) = match cap_info(slot) {
@@ -364,8 +551,31 @@ fn caps() {
             KIND_IRQ => l.str(b"Irq: interrupt line ").dec(a),
             KIND_POWER => l.str(b"Power: restarts, switches off"),
             KIND_MEMORY => l.str(b"Memory: ").dec(a).str(if b & 1 != 0 { b" pages, writable" } else { b" pages, read-only" }),
-            KIND_FACTORY => l.str(b"Factory: starts programs, makes endpoints"),
+            KIND_FACTORY => {
+                l.str(b"Factory: starts");
+                let mut first = true;
+                for (n, name) in PROGRAM_NAMES.iter().enumerate() {
+                    if a & (1 << n) != 0 {
+                        l.str(if first { b" " } else { b", " }).str(name);
+                        first = false;
+                    }
+                }
+                if first {
+                    l.str(b" nothing");
+                }
+                if a & FACTORY_ENDPOINTS != 0 {
+                    l.str(b"; makes endpoints");
+                }
+                &mut l
+            }
             KIND_INFO => l.str(b"Info: reads uptime, memory, the tasks"),
+            KIND_PROCESS => {
+                l.str(b"Process ").dec(a);
+                if let Some(j) = self.jobs.iter().flatten().find(|j| j.id == a) {
+                    l.str(b" (").str(PROGRAM_NAMES[j.program as usize]).str(b")");
+                }
+                l.str(b": asks how it is doing, stops it")
+            }
             _ => l.str(b"(a kind this shell doesn't know)"),
         };
         l.str(b"\n");
@@ -374,6 +584,7 @@ fn caps() {
     let mut l = Line::<120>::new();
     l.dec(held).str(b" of ").dec(MAX_CAPS as u64).str(b" slots hold a capability; nothing else is allowed\n");
     say(l.as_bytes());
+}
 }
 
 fn uptime() {

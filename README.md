@@ -26,12 +26,12 @@ Bridge, 16 GB), booted from a USB stick.
 | Capabilities and IPC | 32 capability slots per process; synchronous call/reply IPC that can pass capabilities (with GRANT) and badges; signals, from the kernel or from a process holding a badged capability; memory lent through Memory capabilities; narrower copies (mint) and letting go (drop) |
 | Init | The only process the kernel starts: it holds the drivers' capabilities and a Factory capability, starts each driver and the shell with exactly what it needs, and starts one again if it ends |
 | Drivers | I/O-port, interrupt-line and memory capabilities, and interrupts delivered as signals; a console driver, a PS/2 driver (keyboard and controller) and a mouse driver, all in Rust, running as user processes, started by init |
-| Shell | A first shell in Rust: line editing with history, and built-in commands (help, echo, ps, caps, uptime, mem, restart, off), holding six capabilities and nothing else |
+| Shell | A first shell in Rust: line editing with history, built-in commands (help, echo, ps, caps, uptime, mem, restart, off), and programs started and stopped (run, jobs, kill), holding eight capabilities and nothing else |
 | Power | Restart and switch-off through ACPI, behind a Power capability (Ctrl+Alt+Del, Ctrl+Alt+End, or the shell's restart and off) |
-| Not yet | UEFI boot, disk, network, file system, starting programs from the shell, multiple CPUs |
+| Not yet | UEFI boot, disk, network, file system, memory that grows as a program runs, multiple CPUs |
 
-Every boot runs **90 self-tests** and shows the result on screen. `make test`
-checks the disk image and boots **36 configurations** headless, checking each
+Every boot runs **91 self-tests** and shows the result on screen. `make test`
+checks the disk image and boots **37 configurations** headless, checking each
 one.
 
 ## Design in brief
@@ -42,11 +42,15 @@ one.
   the log), `Endpoint` (rights SEND, RECV, GRANT, plus a badge), `IoPorts` (a
   port range), `Irq` (an interrupt line), `Power`, `Memory` (physical
   pages a process may map: writable or not, write-combining or uncached),
-  `Factory` (may start built-in programs and make endpoints), and `Info` (may
-  read uptime, memory and every task's state). Authority only
+  `Factory` (may start the built-in programs its rights name, and make
+  endpoints if they say so), `Info` (may read uptime, memory and every
+  task's state), and `Process` (names one process; may ask how it is doing
+  and stop it). spawn hands back a `Process` capability on request, so only
+  whoever started a process can stop it. Authority only
   moves by being copied into a process its holder starts, or passed in an IPC
   message through an endpoint with GRANT. An endpoint capability can be copied
-  with fewer rights and a badge (mint), and any capability let go of (drop).
+  with fewer rights and a badge, and a Factory with fewer rights (mint); any
+  capability can be let go of (drop).
 - **Init decides, the kernel enforces.** At the end of boot the kernel starts
   one process, init, with every capability the drivers will need. Init mints
   narrower copies, starts the console, PS/2 and mouse drivers and the shell
@@ -78,14 +82,16 @@ one.
   | 12 | (retired: was console_scroll) | |
   | 13 | map(cap, address) | Memory |
   | 14 | note(cap, buf, len): a line on serial only | Console |
-  | 15 | spawn(cap, program, arg, slots, exit_ep): start a built-in program | Factory |
-  | 16 | endpoint(cap): a new endpoint | Factory |
-  | 17 | mint(cap, rights, badge): a narrower copy | Endpoint |
+  | 15 | spawn(cap, program, arg, slots, exit_ep, flags): start a built-in program, and on request get a Process capability for it | Factory covering the program |
+  | 16 | endpoint(cap): a new endpoint | Factory with the endpoints right |
+  | 17 | mint(cap, rights, badge): a narrower copy | Endpoint or Factory |
   | 18 | drop(slot): let go of a capability | anything |
   | 19 | irq_bind(irq, endpoint): the line's interrupts become signals there | Irq, Endpoint with RECV |
   | 20 | signal(endpoint): set the capability's badge as signal bits there, without waiting | Endpoint with SEND and a badge |
   | 21 | info(cap, buf, len): uptime, memory and every task, into the caller's buffer | Info |
   | 22 | cap_info(slot): what one of the caller's own slots holds | nothing |
+  | 23 | kill(cap): stop a process | Process |
+  | 24 | status(cap): running, or how it ended | Process |
 
 ## Repository layout
 
@@ -94,7 +100,7 @@ bootloader/BIOS/   stage1.asm (MBR), stage2.asm (loader, E820, VESA mode, long m
 bootloader/UEFI/   placeholder for a later UEFI loader
 kernel/            Rust kernel: entry.asm, kernel.ld, src/*.rs
 user/              user programs in NASM (test programs)
-user/rust/         user programs in Rust (init; the console, PS/2 and mouse drivers; the shell) and their library
+user/rust/         user programs in Rust (init; the console, PS/2 and mouse drivers; the shell; spin and crash) and their library
 build/             Makefile, test.sh, write-usb.sh
 docs/              development journal, roadmap and design notes
 ```
@@ -114,7 +120,7 @@ Then, from `build/`:
 ```bash
 make            # builds out/freya-os.img (1 MiB disk image); "make build" too
 make run        # boots it in QEMU, serial output in the terminal
-make test       # every test case, headless; expect "36 passed, 0 failed"
+make test       # every test case, headless; expect "37 passed, 0 failed"
 TEXT_MODE=1 make   # an image that stays in 80x25 text mode
 ```
 
@@ -163,7 +169,15 @@ command runs. **Backspace** deletes, **Esc** clears the line, **Up** and
 | `caps` | the shell's own capabilities: everything it may do |
 | `uptime` | time since the timer started, task switches, system calls |
 | `mem` | memory free |
+| `run NAME` | start a program in the background: `hello`, `spin` (runs until stopped) or `crash` (writes to the kernel's memory, and is stopped) |
+| `jobs` | the programs started from the shell that are still running |
+| `kill ID`, `kill NAME` | stop one of them, or every one of that name |
 | `restart`, `off` | restart or switch off the machine |
+
+The shell's Factory capability covers only those three programs: `run
+console` is refused by the kernel. When a program ends, the shell says how
+(its exit code, the CPU exception that stopped it, or `kill`). It can stop
+only what it started: `kill 5` gets "this shell holds no capability for it".
 
 The shell's lines are shown in white, without the "[user 7 'shell']" the
 kernel puts in front of every line a process writes (serial keeps it).
@@ -191,6 +205,9 @@ headless and checks its serial log:
 - `shell`: the shell's commands and editing keys (Backspace, Esc, Up twice),
   `ps` and `caps` checked line by line, and a screenshot of the line being
   typed and of the shell's last line
+- `programs`: `run spin`, the shell still answering while it spins, `kill`
+  by number and by name, `kill 5` refused, `hello`'s exit code, `crash`
+  stopped by a page fault, `run console` refused
 - `scroll`: PageUp and PageDown, checked step by step, and a screenshot whose
   size and colours must match the mode the kernel reported
 - `edid-1366`, `edid-1440`, `no-edid`, `cirrus-24bit`: the mode stage 2
@@ -260,7 +277,7 @@ why. `TEXT_MODE=1 make usb DEV=/dev/sdX` writes a stick that always does.
 
 ## Next
 
-The shell on the T430. Then one of: the shell starting programs (with a
-Factory narrowed to just those), the capability layer (revoking what was
-handed out; capabilities for memory and address spaces), or read-only disks
-on a spare machine.
+Programs from the shell on the T430. Then one of: memory for programs (a
+heap through a capability), the capability layer (revoking what was handed
+out; capabilities for memory and address spaces), arguments and output for
+programs, or read-only disks on a spare machine.

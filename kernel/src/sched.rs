@@ -272,11 +272,27 @@ pub fn spawn(name: &'static str, entry: fn(u64), arg: u64) -> Result<TaskId, Spa
 /// kernel's) with capabilities `caps`. The task takes over the address
 /// space: reap() destroys it when the task is gone. process.rs uses this.
 pub fn spawn_in(name: &'static str, entry: fn(u64), arg: u64, space: u64, caps: Caps) -> Result<TaskId, SpawnError> {
-    spawn_in_signalling(name, entry, arg, space, caps, None)
+    spawn_in_signalling(name, entry, arg, space, caps, None).map(|(id, _)| id)
+}
+
+/// Per task slot (Entry 24): how many tasks it has held, the current one
+/// included, so that a Process capability naming an earlier one can be
+/// told apart from whoever holds the slot now; and how the last one ended,
+/// kept after it is reaped, until the slot is used again.
+static mut GENERATIONS: [u32; MAX_TASKS] = [0; MAX_TASKS];
+static mut ENDINGS: [Option<ExitStatus>; MAX_TASKS] = [None; MAX_TASKS];
+
+fn generations() -> &'static mut [u32; MAX_TASKS] {
+    unsafe { &mut *(&raw mut GENERATIONS) }
+}
+
+fn endings() -> &'static mut [Option<ExitStatus>; MAX_TASKS] {
+    unsafe { &mut *(&raw mut ENDINGS) }
 }
 
 /// spawn_in(), and when the task ends, signal endpoint `exit_signal` with
-/// bit (1 << its id) (factory.rs: spawn).
+/// bit (1 << its id) (factory.rs: spawn). Returns its id and its slot's
+/// generation (Entry 24).
 pub fn spawn_in_signalling(
     name: &'static str,
     entry: fn(u64),
@@ -284,12 +300,14 @@ pub fn spawn_in_signalling(
     space: u64,
     caps: Caps,
     exit_signal: Option<u8>,
-) -> Result<TaskId, SpawnError> {
-    let id = without_interrupts(|| {
+) -> Result<(TaskId, u32), SpawnError> {
+    let (id, generation) = without_interrupts(|| {
         let t = table();
         let id = (1..MAX_TASKS).find(|&i| t[i].state == State::Free)?;
         t[id] = Task { state: State::Creating, name: Some(name), ..EMPTY };
-        Some(id)
+        generations()[id] = generations()[id].wrapping_add(1);
+        endings()[id] = None;
+        Some((id, generations()[id]))
     })
     .ok_or(SpawnError::TableFull)?;
 
@@ -350,7 +368,7 @@ pub fn spawn_in_signalling(
             ..EMPTY
         };
     });
-    Ok(id)
+    Ok((id, generation))
 }
 
 /// Unmap and free the first `pages` stack pages of task `id`.
@@ -392,6 +410,7 @@ pub fn exit_with(status: ExitStatus) -> ! {
     let t = table();
     t[me].state = State::Finished;
     t[me].status = status;
+    endings()[me] = Some(status);
     for task in t.iter_mut() {
         if matches!(task.state, State::Joining(id, _) if id == me) {
             task.state = State::Ready;
@@ -575,6 +594,28 @@ pub fn kill(id: TaskId) -> bool {
     })
 }
 
+/// What became of the task that was slot `id`'s `generation`th (Entry 24:
+/// Process capabilities): Some(None) while it runs, Some(Some(how)) once
+/// it has ended; None if the slot has held another task since, and then
+/// nothing is known about it any more.
+pub fn process_state(id: TaskId, generation: u32) -> Option<Option<ExitStatus>> {
+    if id >= MAX_TASKS {
+        return None;
+    }
+    without_interrupts(|| {
+        if generations()[id] != generation {
+            return None;
+        }
+        Some(endings()[id])
+    })
+}
+
+/// kill(), only if slot `id` still holds its `generation`th task: a
+/// Process capability for one that has gone never stops its successor.
+pub fn kill_numbered(id: TaskId, generation: u32) -> bool {
+    without_interrupts(|| process_state(id, generation) == Some(None) && kill(id))
+}
+
 /// True if the current task has been asked to stop.
 pub fn kill_requested() -> bool {
     without_interrupts(|| table()[current_id()].kill)
@@ -601,6 +642,12 @@ pub fn store_cap(cap: Cap) -> Option<usize> {
         cap::retain(cap);
         Some(slot)
     })
+}
+
+/// Empty slots in the current task's table (spawn checks for room for a
+/// Process capability before it starts anything: Entry 24).
+pub fn free_cap_slots() -> usize {
+    without_interrupts(|| table()[current_id()].caps.iter().filter(|&&c| c == Cap::None).count())
 }
 
 /// Empty the current task's slot `handle`, returning what was there (not

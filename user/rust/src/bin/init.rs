@@ -22,6 +22,16 @@
 //! (SIGNAL_KEYS), and its own to tell the shell the console driver started
 //! again (SIGNAL_REDRAW), so it sends the line being typed again.
 //!
+//! For the shell (Entry 24) it also mints a Factory that can start only
+//! hello, spin and crash, and makes no endpoints, and a SEND copy of the
+//! shell's own endpoint, where the programs the shell starts signal when
+//! they end. Then it lets go of the full copies of the four endpoints it
+//! has minted from: it won't mint again, and every RECV it still holds is
+//! a minted one, so letting go of that is enough to stop anyone waiting
+//! for a driver it has given up on. That leaves it 27 of its 32 slots in
+//! use: the kernel's 14, three endpoints and fourteen copies made, less
+//! the four let go of (29 at Entry 23).
+//!
 //! Then it starts each with exactly the slots it needs, asking the kernel
 //! to signal its own
 //! endpoint with bit (1 << id) when one ends, and waits there. A driver
@@ -112,9 +122,10 @@ fn couldnt_start(d: &Driver, error: i64, again: bool) {
     say(line.as_bytes());
 }
 
-/// A copy of the endpoint capability in `slot` with `rights` and `badge`,
-/// in a slot spawn's list can name; NO_SLOT if it couldn't be made (and
-/// then spawning a driver that needs it fails, and says so).
+/// A copy of the capability in `slot` (an endpoint's or, since Entry 24,
+/// a Factory) with `rights` and `badge`, in a slot spawn's list can name;
+/// NO_SLOT if it couldn't be made (and then spawning a driver that needs
+/// it fails, and says so).
 fn minted(slot: u8, rights: u64, badge: u64) -> u8 {
     if slot == NO_SLOT {
         return NO_SLOT;
@@ -123,7 +134,7 @@ fn minted(slot: u8, rights: u64, badge: u64) -> u8 {
         copy if copy >= 0 => copy as u8,
         error => {
             let mut line = Line::<96>::new();
-            line.str(b"couldn't copy an endpoint capability (error -").dec(error.unsigned_abs()).str(b")\n");
+            line.str(b"couldn't copy a capability (error -").dec(error.unsigned_abs()).str(b")\n");
             say(line.as_bytes());
             NO_SLOT
         }
@@ -160,6 +171,16 @@ fn main(_arg: u64) -> u64 {
     let shell_recv = minted(shell_ep, RECV, 0);
     let keys_for_shell = minted(shell_ep, SEND, SIGNAL_KEYS);
     let redraw_for_shell = minted(shell_ep, SEND, SIGNAL_REDRAW);
+    let exits_for_shell = minted(shell_ep, SEND, 0);
+    let programs_for_shell =
+        (1 << freya::PROGRAM_HELLO) | (1 << freya::PROGRAM_SPIN) | (1 << freya::PROGRAM_CRASH);
+    let factory_for_shell = minted(FACTORY as u8, programs_for_shell, 0);
+    // Everything is minted: the full copies go (see the top of this file).
+    for full in [CONSOLE_EP as u8, ps2_ep, mouse_ep, shell_ep] {
+        if full != NO_SLOT {
+            freya::drop_cap(full as u64);
+        }
+    }
 
     let mut drivers = [
         Driver {
@@ -168,7 +189,7 @@ fn main(_arg: u64) -> u64 {
             slots: slots(&[CONSOLE, console_recv, SCREEN, LOG, PANEL, DESCRIPTION]),
             id: None,
             restarts: 0,
-            drop_when_stopped: [CONSOLE_EP as u8, console_recv],
+            drop_when_stopped: [console_recv, NO_SLOT],
             without: b"the kernel keeps drawing the screen",
         },
         Driver {
@@ -188,7 +209,7 @@ fn main(_arg: u64) -> u64 {
             ]),
             id: None,
             restarts: 0,
-            drop_when_stopped: [ps2_ep, ps2_recv],
+            drop_when_stopped: [ps2_recv, NO_SLOT],
             without: b"no keyboard: to switch off, hold the power button (safe: nothing is written to disk)",
         },
         Driver {
@@ -197,16 +218,16 @@ fn main(_arg: u64) -> u64 {
             slots: slots(&[CONSOLE, mouse_to_ps2, mouse_to_console, mouse_recv]),
             id: None,
             restarts: 0,
-            drop_when_stopped: [mouse_ep, mouse_recv],
+            drop_when_stopped: [mouse_recv, NO_SLOT],
             without: b"no pointer",
         },
         Driver {
             name: b"shell",
             program: freya::PROGRAM_SHELL,
-            slots: slots(&[CONSOLE, shell_recv, shell_to_ps2, shell_to_console, INFO, POWER]),
+            slots: slots(&[CONSOLE, shell_recv, shell_to_ps2, shell_to_console, INFO, POWER, factory_for_shell, exits_for_shell]),
             id: None,
             restarts: 0,
-            drop_when_stopped: [shell_ep, shell_recv],
+            drop_when_stopped: [shell_recv, NO_SLOT],
             without: b"no shell: Ctrl+Alt+Del still restarts and Ctrl+Alt+End switches off",
         },
     ];

@@ -580,9 +580,14 @@ pub fn selftest() -> bool {
     while waiter.is_some_and(|id| !sched::blocked_in_ipc(id)) && crate::apic::ticks() < deadline {
         sched::sleep_ticks(1);
     }
-    signal(ep, 0x01);
-    signal(ep, 0x02);
-    signal(ep, 0x04);
+    // As one step, with interrupts off (Entry 24): a timer tick between the
+    // first and the second let the receiver take the first and wait again,
+    // so the second reached it directly (0x0201); seen once in boot-4G.
+    without_interrupts(|| {
+        signal(ep, 0x01);
+        signal(ep, 0x02);
+        signal(ep, 0x04);
+    });
     done(ep);
     ok &= check(
         b"ipc",

@@ -13,12 +13,27 @@
 //!       capability (a mistake is refused, not passed on as an empty slot).
 //!       `exit_ep` is an endpoint capability with SEND, or -1: when the new
 //!       process ends, that endpoint is signalled with bit (1 << its id).
-//!       Returns the new process's id.
+//!       Returns the new process's id. With `flags` bit 0 (Entry 24), a
+//!       Process capability for it lands in the caller's first free slot
+//!       (its slot comes back in R9): the caller can then ask how it is
+//!       doing (status) and stop it (kill).
 //!
 //!   endpoint(factory)
 //!       A new endpoint, as a capability with SEND, RECV and GRANT and no
 //!       badge, in the caller's first free slot. Returns the slot. mint
 //!       (cap.rs) makes narrower copies to hand out.
+//!
+//!   kill(process), status(process)   (Entry 24)
+//!       Stop the process a Process capability names, or ask how it is
+//!       doing: running, or how it ended (an exit code, a CPU exception, or
+//!       killed). The capability names a task slot and which of its tasks,
+//!       so once the slot holds another process it is stale: both answer
+//!       peer-gone, and nothing is stopped.
+//!
+//! A Factory's rights (Entry 24) say which programs it may start (bit n:
+//! program n) and whether it may make endpoints; mint makes copies with
+//! fewer. Init holds one with every right and gives the shell one that
+//! starts only hello, spin and crash.
 //!
 //! Copying a capability into a process the caller creates needs nothing
 //! more than holding it: the caller could use it itself. Giving one to a
@@ -32,33 +47,66 @@ use crate::syscall::{copy_from_user, ERR_BAD_ARGUMENT, ERR_NO_CAPABILITY, ERR_NO
 /// The programs spawn can start, by number (user/freya.inc and
 /// user/rust/src/lib.rs: PROGRAM_*). The kernel's test programs aren't
 /// among them: only its own self-tests start those.
-pub static PROGRAMS: [&Program; 5] = [&process::HELLO, &process::CONSOLE, &process::PS2, &process::MOUSE, &process::SHELL];
+pub static PROGRAMS: [&Program; 7] =
+    [&process::HELLO, &process::CONSOLE, &process::PS2, &process::MOUSE, &process::SHELL, &process::SPIN, &process::CRASH];
+const _: () = assert!(PROGRAMS.len() <= 16, "a Factory's rights have 16 program bits");
+
+/// spawn's flags: a Process capability for the new process, please.
+pub const SPAWN_PROCESS_CAP: u64 = 1 << 0;
 
 /// "No capability here" in spawn's slot list.
 pub const NO_SLOT_BYTE: u8 = 0xFF;
 
-fn has_factory(slot: u64) -> bool {
-    sched::current_cap(slot) == Cap::Factory
+/// The rights of the Factory in `slot`, if it holds one.
+fn factory_rights(slot: u64) -> Option<u32> {
+    match sched::current_cap(slot) {
+        Cap::Factory { rights } => Some(rights),
+        _ => None,
+    }
 }
 
-pub fn spawn(factory: u64, program: u64, arg: u64, slots: u64, exit_ep: u64) -> i64 {
-    if !has_factory(factory) {
-        return ERR_NO_CAPABILITY;
-    }
-    let Some(&program) = PROGRAMS.get(program as usize) else {
-        return ERR_BAD_ARGUMENT;
+/// spawn; returns the new process's id, and the slot its Process
+/// capability landed in (NO_SLOT if none was asked for).
+pub fn spawn(factory: u64, program: u64, arg: u64, slots: u64, exit_ep: u64, flags: u64) -> (i64, u64) {
+    let no_cap = crate::ipc::NO_SLOT;
+    let Some(rights) = factory_rights(factory) else {
+        return (ERR_NO_CAPABILITY, no_cap);
     };
-    let mut list = [0u8; MAX_CAPS];
-    if let Err(e) = copy_from_user(slots, &mut list) {
-        return e;
+    let Some(&image) = PROGRAMS.get(program as usize) else {
+        return (ERR_BAD_ARGUMENT, no_cap);
+    };
+    if rights & (1 << program) == 0 {
+        return (ERR_WRONG_CAPABILITY, no_cap); // a Factory that doesn't cover it
     }
+    if flags & !SPAWN_PROCESS_CAP != 0 {
+        return (ERR_BAD_ARGUMENT, no_cap);
+    }
+    let want_cap = flags & SPAWN_PROCESS_CAP != 0;
+    // Room for the Process capability first: once the process runs, there
+    // is no taking it back.
+    if want_cap && sched::free_cap_slots() == 0 {
+        return (ERR_NO_SLOT, no_cap);
+    }
+    match start(image, arg, slots, exit_ep) {
+        Ok((id, generation)) if want_cap => match sched::store_cap(Cap::Process { id: id as u8, generation }) {
+            Some(slot) => (id as i64, slot as u64),
+            None => (id as i64, no_cap), // can't happen: the caller's table only changes in its own calls
+        },
+        Ok((id, _)) => (id as i64, no_cap),
+        Err(e) => (e, no_cap),
+    }
+}
+
+fn start(program: &Program, arg: u64, slots: u64, exit_ep: u64) -> Result<(sched::TaskId, u32), i64> {
+    let mut list = [0u8; MAX_CAPS];
+    copy_from_user(slots, &mut list)?;
     let mut caps: Caps = cap::NO_CAPS;
     for (i, &from) in list.iter().enumerate() {
         if from == NO_SLOT_BYTE {
             continue;
         }
         match sched::current_cap(from as u64) {
-            Cap::None => return ERR_BAD_ARGUMENT, // an empty slot, or past the last
+            Cap::None => return Err(ERR_BAD_ARGUMENT), // an empty slot, or past the last
             c => caps[i] = c,
         }
     }
@@ -66,18 +114,18 @@ pub fn spawn(factory: u64, program: u64, arg: u64, slots: u64, exit_ep: u64) -> 
         crate::ipc::NO_SLOT => None,
         slot => match sched::current_cap(slot) {
             Cap::Endpoint { ep, rights, .. } if rights & SEND != 0 => Some(ep),
-            _ => return ERR_WRONG_CAPABILITY,
+            _ => return Err(ERR_WRONG_CAPABILITY),
         },
     };
-    match process::spawn_signalling(program, arg, caps, exit_signal) {
-        Ok(id) => id as i64,
-        Err(_) => ERR_NO_MEMORY,
-    }
+    process::spawn_signalling(program, arg, caps, exit_signal).map_err(|_| ERR_NO_MEMORY)
 }
 
 pub fn endpoint(factory: u64) -> i64 {
-    if !has_factory(factory) {
+    let Some(rights) = factory_rights(factory) else {
         return ERR_NO_CAPABILITY;
+    };
+    if rights & cap::FACTORY_ENDPOINTS == 0 {
+        return ERR_WRONG_CAPABILITY;
     }
     let Some(ep) = crate::ipc::create() else {
         return ERR_NO_MEMORY;
@@ -89,6 +137,47 @@ pub fn endpoint(factory: u64) -> i64 {
     match stored {
         Some(slot) => slot as i64,
         None => ERR_NO_SLOT,
+    }
+}
+
+/// What status returns (Entry 24): the process runs, or how it ended (its
+/// exit code, or the CPU exception's vector, goes in the second value).
+pub const STATUS_RUNNING: i64 = 0;
+pub const STATUS_EXITED: i64 = 1;
+pub const STATUS_FAULT: i64 = 2;
+pub const STATUS_KILLED: i64 = 3;
+
+/// The Process capability in `slot`, if that is what it holds.
+fn process_cap(slot: u64) -> Result<(usize, u32), i64> {
+    match sched::current_cap(slot) {
+        Cap::Process { id, generation } => Ok((id as usize, generation)),
+        _ => Err(ERR_WRONG_CAPABILITY),
+    }
+}
+
+/// kill(process): stop it. Peer-gone if it has ended (or its slot holds
+/// another process since).
+pub fn kill(slot: u64) -> i64 {
+    match process_cap(slot) {
+        Ok((id, generation)) if sched::kill_numbered(id, generation) => 0,
+        Ok(_) => crate::syscall::ERR_PEER_GONE,
+        Err(e) => e,
+    }
+}
+
+/// status(process): (STATUS_*, the exit code or vector). Peer-gone once
+/// its slot holds another process: how it ended isn't kept any longer.
+pub fn status(slot: u64) -> (i64, u64) {
+    let (id, generation) = match process_cap(slot) {
+        Ok(p) => p,
+        Err(e) => return (e, 0),
+    };
+    match sched::process_state(id, generation) {
+        None => (crate::syscall::ERR_PEER_GONE, 0),
+        Some(None) => (STATUS_RUNNING, 0),
+        Some(Some(sched::ExitStatus::Code(code))) => (STATUS_EXITED, code),
+        Some(Some(sched::ExitStatus::Fault(vector))) => (STATUS_FAULT, vector as u64),
+        Some(Some(sched::ExitStatus::Killed)) => (STATUS_KILLED, 0),
     }
 }
 
@@ -104,6 +193,8 @@ const CAPTEST_SPAWN: u64 = 1;
 const CAPTEST_SPAWN_ALL: u64 = 0x3F;
 const CAPTEST_MINT: u64 = 2;
 const CAPTEST_MINT_ALL: u64 = 0xFF;
+const CAPTEST_PROCESS: u64 = 6;
+const CAPTEST_PROCESS_ALL: u64 = 0xFF;
 /// user/ipc.asm's collector: receive `value` messages, exit with their
 /// badges.
 const IPC_COLLECTOR: u64 = 11;
@@ -123,7 +214,7 @@ pub fn selftest() -> bool {
     // 1. spawn, and the signal when what it started ends.
     let spawn_ok = match ipc::create() {
         Some(own) => {
-            let caps = cap::table(&[Cap::Console, Cap::Factory, Cap::Endpoint { ep: own, badge: 0, rights: SEND | RECV }]);
+            let caps = cap::table(&[Cap::Console, Cap::Factory { rights: cap::FACTORY_ALL }, Cap::Endpoint { ep: own, badge: 0, rights: SEND | RECV }]);
             let started = process::spawn(&process::CAPTEST, CAPTEST_SPAWN, caps);
             ipc::release_created(own);
             started.ok().and_then(|id| sched::join_timeout(id, WAIT_TICKS)) == code(CAPTEST_SPAWN_ALL)
@@ -143,7 +234,7 @@ pub fn selftest() -> bool {
             let tester = process::spawn(
                 &process::CAPTEST,
                 CAPTEST_MINT,
-                cap::table(&[Cap::Console, Cap::Factory, Cap::Endpoint { ep, badge: 0, rights: SEND | RECV | GRANT }]),
+                cap::table(&[Cap::Console, Cap::Factory { rights: cap::FACTORY_ALL }, Cap::Endpoint { ep, badge: 0, rights: SEND | RECV | GRANT }]),
             );
             ipc::release_created(ep);
             let t = tester.ok().and_then(|id| sched::join_timeout(id, WAIT_TICKS));
@@ -158,7 +249,43 @@ pub fn selftest() -> bool {
         minted && badge,
     );
 
-    // 3. Nothing left behind: the processes, their endpoints, their frames.
+    // 3. Process capabilities and narrowed Factories (Entry 24). Beside
+    //    captest the kernel runs a spinning process, and hands captest a
+    //    Process capability for the task its slot held before: a stale one,
+    //    which must stop nothing.
+    let spin = process::spawn_signalling(&process::SPIN, 0, cap::NO_CAPS, None).ok();
+    let (tested, spared) = match (ipc::create(), spin) {
+        (Some(ep), Some((spin_id, generation))) => {
+            let stale = Cap::Process { id: spin_id as u8, generation: generation.wrapping_sub(1) };
+            let tester = process::spawn(
+                &process::CAPTEST,
+                CAPTEST_PROCESS,
+                cap::table(&[
+                    Cap::Console,
+                    Cap::Factory { rights: cap::FACTORY_ALL },
+                    Cap::Endpoint { ep, badge: 0, rights: SEND | RECV },
+                    stale,
+                ]),
+            );
+            ipc::release_created(ep);
+            let t = tester.ok().and_then(|id| sched::join_timeout(id, WAIT_TICKS));
+            (t == code(CAPTEST_PROCESS_ALL), sched::process_state(spin_id, generation) == Some(None))
+        }
+        (ep, _) => {
+            if let Some(ep) = ep {
+                ipc::release_created(ep);
+            }
+            (false, false)
+        }
+    };
+    let spin_stopped = spin.is_some_and(|(id, _)| sched::kill(id) && sched::join_timeout(id, WAIT_TICKS) == Some(sched::ExitStatus::Killed));
+    ok &= check(
+        b"factory",
+        b"Process capabilities: hello's exit code and spin's kill reported by status, kill again peer-gone; a Factory minted to start only hello refuses spin and endpoints; a stale Process capability stops nothing (the spinning process in its slot still runs); no slot for the capability: refused, nothing started",
+        tested && spared && spin_stopped,
+    );
+
+    // 4. Nothing left behind: the processes, their endpoints, their frames.
     sched::reap();
     let leaked = baseline as i64 - sched::free_frames_and_heap() as i64;
     ok &= check(

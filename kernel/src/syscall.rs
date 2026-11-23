@@ -42,6 +42,13 @@
 //!                                                             (info.rs)
 //!  22 cap_info(slot)                   -> kind, and in RDI, RSI, RDX what
 //!                                         the caller's own slot holds
+//!  23 kill(process)                    -> 0: the process stops (factory.rs,
+//!                                         Entry 24)
+//!  24 status(process)                  -> 0 running, or how it ended, the
+//!                                         code or vector in RDI
+//!
+//! spawn's R9 (Entry 24): flags in (bit 0: hand back a Process capability)
+//! and that capability's slot out (-1 for none).
 //!
 //! Message registers: send/call take the four words in RSI, RDX, R10, R8
 //! and in R9 the slot of a capability to pass along (-1 for none). recv and
@@ -83,6 +90,8 @@ pub const SYS_IRQ_BIND: u64 = 19;
 pub const SYS_SIGNAL: u64 = 20;
 pub const SYS_INFO: u64 = 21;
 pub const SYS_CAP_INFO: u64 = 22;
+pub const SYS_KILL: u64 = 23;
+pub const SYS_STATUS: u64 = 24;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
 /// write, note: the slot doesn't hold the console capability; map: it
@@ -219,7 +228,11 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
         SYS_POWER => sys_power(f.rdi, f.rsi),
         SYS_MAP => crate::mem::map(f.rdi, f.rsi),
         SYS_NOTE => sys_note(f.rdi, f.rsi, f.rdx),
-        SYS_SPAWN => crate::factory::spawn(f.rdi, f.rsi, f.rdx, f.r10, f.r8),
+        SYS_SPAWN => {
+            let (id, slot) = crate::factory::spawn(f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
+            f.r9 = slot;
+            id
+        }
         SYS_ENDPOINT => crate::factory::endpoint(f.rdi),
         SYS_MINT => crate::cap::mint(f.rdi, f.rsi, f.rdx),
         SYS_DROP => crate::cap::drop_cap(f.rdi),
@@ -232,6 +245,14 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
                 (f.rdi, f.rsi, f.rdx) = (a, b, c);
             }
             kind
+        }
+        SYS_KILL => crate::factory::kill(f.rdi),
+        SYS_STATUS => {
+            let (how, value) = crate::factory::status(f.rdi);
+            if how >= 0 {
+                f.rdi = value;
+            }
+            how
         }
         _ => ERR_BAD_SYSCALL,
     };

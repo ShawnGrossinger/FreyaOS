@@ -737,7 +737,7 @@ fn start_init(ioapic_ready: bool) -> bool {
     let console_cap = |pick: fn(&console::ConsoleCaps) -> Cap| console.as_ref().map_or(Cap::None, pick);
     let caps = cap::table(&[
         Cap::Console,
-        Cap::Factory,
+        Cap::Factory { rights: cap::FACTORY_ALL },
         own.map_or(Cap::None, |ep| Cap::Endpoint { ep, badge: 0, rights: SEND | RECV }),
         console_cap(|c| c.endpoint),
         console_cap(|c| c.screen),

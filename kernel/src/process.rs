@@ -107,6 +107,21 @@ pub static SHELL: Program = Program {
     image: include_bytes!(concat!(env!("OUT_DIR"), "/shell.bin")),
 };
 
+/// Runs until stopped (user/rust/src/bin/spin.rs, Entry 24): what the
+/// shell's kill is for, and proof that a process that never yields can't
+/// hold up the rest.
+pub static SPIN: Program = Program {
+    name: "spin",
+    image: include_bytes!(concat!(env!("OUT_DIR"), "/spin.bin")),
+};
+
+/// Tries to write into the kernel (user/rust/src/bin/crash.rs, Entry 24):
+/// the CPU refuses, and only it ends.
+pub static CRASH: Program = Program {
+    name: "crash",
+    image: include_bytes!(concat!(env!("OUT_DIR"), "/crash.bin")),
+};
+
 /// Test program: its argument picks one thing to try (user/probe.asm).
 pub static PROBE: Program = Program {
     name: "probe",
@@ -144,12 +159,13 @@ extern "C" {
 /// Start `program` as a new process with argument `arg` (in RDI) and
 /// capability table `caps`. It runs when the scheduler picks it.
 pub fn spawn(program: &Program, arg: u64, caps: Caps) -> Result<TaskId, SpawnError> {
-    spawn_signalling(program, arg, caps, None)
+    spawn_signalling(program, arg, caps, None).map(|(id, _)| id)
 }
 
 /// spawn, and when the process ends signal endpoint `exit_signal` with bit
-/// (1 << its id) (factory.rs).
-pub fn spawn_signalling(program: &Program, arg: u64, caps: Caps, exit_signal: Option<u8>) -> Result<TaskId, SpawnError> {
+/// (1 << its id) (factory.rs). Returns its id and its slot's generation
+/// (sched.rs; Entry 24).
+pub fn spawn_signalling(program: &Program, arg: u64, caps: Caps, exit_signal: Option<u8>) -> Result<(TaskId, u32), SpawnError> {
     let data_pages = program.data_pages();
     // A Rust program with no zeroed statics asks for no data pages at all.
     if program.image.len() as u64 > MAX_CODE_BYTES || data_pages > MAX_DATA_PAGES {
@@ -297,7 +313,7 @@ const PORT_IO: u64 = 7;
 const WRITE_KERNEL_POINTER: u64 = 8;
 const WRITE_PAST_END: u64 = 9;
 const BAD_SYSCALL: u64 = 10;
-const SPIN: u64 = 11;
+const PROBE_SPIN: u64 = 11;
 const ISOLATE: u64 = 12;
 const MXCSR: u64 = 13;
 const MAP_READ: u64 = 14;
@@ -488,7 +504,7 @@ pub fn selftest() -> bool {
 
     // 8. A process that never gives up the CPU is preempted anyway, and can
     //    be stopped.
-    let spin = started(spawn(&PROBE, SPIN, NO_CAPS));
+    let spin = started(spawn(&PROBE, PROBE_SPIN, NO_CAPS));
     let (slices, killed, status) = match spin {
         Some(id) => {
             let deadline = crate::apic::ticks() + 200;

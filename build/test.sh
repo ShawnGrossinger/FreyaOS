@@ -78,7 +78,8 @@ CASES=(
   "kill-console-often|kill_console_often|128M|\\[demo\\] console driver killed \\(4 of 4\\);;started it again as process [0-9]+ \\(3 of 3\\);;started again 3 times already, so it stays stopped;;'shell'\\] hi$;;no console notes after it stayed stopped;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette;;the screen changed since the last screendump||screendump pause pause pgup e c h o spc h i ret pause screendiff"
   "kill-init|kill_init|128M|\\[demo\\] init killed;;\\[demo\\] console driver killed;;ended: the kernel draws the screen again;;'shell'\\] hi$;;no console notes after it ended;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette;;the screen changed since the last screendump||screendump pause pgup e c h o spc h i ret pause screendiff"
   "mouse||128M|mouse ready: 4-byte packets, with a wheel;;mouse checked: ;;'shell'\\] hi$;;the pointer is drawn where the console says||pause mouse:80:48 button:1 button:0 wheel:1 wheel:-1 button:4 mouse:0:-64 button:0 mouse:0:64 mouse:127:127 mouse:127:127 mouse:127:127 mouse:127:127 mouse:127:127 mouse:-40:-30 e c h o spc h i ret pointerdump"
-  "shell||128M|shell ready: type help;;'shell'\\]   echo TEXT  print TEXT$;;'shell'\\] freya> echo two$;;'shell'\\]   3  init          29  waiting for a message on endpoint [0-9]+$;;'shell'\\]   4  console        6  waiting for a message on endpoint [0-9]+$;;'shell'\\]   5  ps2           10  waiting for a message on endpoint [0-9]+$;;'shell'\\]   6  mouse          4  waiting for a message on endpoint [0-9]+$;;'shell'\\]   7  shell          6  running$;;'shell'\\] [0-9]+ tasks: 5 processes, [0-9]+ in the kernel$;;'shell'\\] slot  0  Console: writes to the log$;;'shell'\\] slot  1  Endpoint [0-9]+: receive$;;'shell'\\] slot  2  Endpoint [0-9]+: send, badge 4$;;'shell'\\] slot  3  Endpoint [0-9]+: send, badge 4$;;'shell'\\] slot  4  Info: reads uptime, memory, the tasks$;;'shell'\\] slot  5  Power: restarts, switches off$;;'shell'\\] 6 of 32 slots hold a capability;;'shell'\\] up 0 h 0 min [0-9]+ s \\([0-9]+ timer ticks, 100 a second\\);;'shell'\\] memory: [0-9]+ MiB free of 127 MiB usable;;'shell'\\] foo: no such command \\(help lists them\\)$;;shell checked: ;;the line being typed is on the last row||h e l p ret e c h o o backspace spc o n e ret x y z esc e c h o spc t w o ret up up ret p s ret c a p s ret u p t i m e ret m e m ret f o o ret e c h o shelldump"
+  "shell||128M|shell ready: type help;;'shell'\\]   echo TEXT  print TEXT$;;'shell'\\] freya> echo two$;;'shell'\\]   3  init          27  waiting for a message on endpoint [0-9]+$;;'shell'\\]   4  console        6  waiting for a message on endpoint [0-9]+$;;'shell'\\]   5  ps2           10  waiting for a message on endpoint [0-9]+$;;'shell'\\]   6  mouse          4  waiting for a message on endpoint [0-9]+$;;'shell'\\]   7  shell          8  running$;;'shell'\\] [0-9]+ tasks: 5 processes, [0-9]+ in the kernel$;;'shell'\\] slot  0  Console: writes to the log$;;'shell'\\] slot  1  Endpoint [0-9]+: receive$;;'shell'\\] slot  2  Endpoint [0-9]+: send, badge 4$;;'shell'\\] slot  3  Endpoint [0-9]+: send, badge 4$;;'shell'\\] slot  4  Info: reads uptime, memory, the tasks$;;'shell'\\] slot  5  Power: restarts, switches off$;;'shell'\\] slot  6  Factory: starts hello, spin, crash$;;'shell'\\] slot  7  Endpoint [0-9]+: send$;;'shell'\\] 8 of 32 slots hold a capability;;'shell'\\] up 0 h 0 min [0-9]+ s \\([0-9]+ timer ticks, 100 a second\\);;'shell'\\] memory: [0-9]+ MiB free of 127 MiB usable;;'shell'\\] foo: no such command \\(help lists them\\)$;;shell checked: ;;the line being typed is on the last row||h e l p ret e c h o o backspace spc o n e ret x y z esc e c h o spc t w o ret up up ret p s ret c a p s ret u p t i m e ret m e m ret f o o ret e c h o shelldump"
+  "programs||128M|'shell'\\] started spin as process 8$;;'shell'\\]   8  spin           1  ready to run$;;'shell'\\] process 5: this shell holds no capability for it;;'shell'\\] stopping spin \\(process 8\\)$;;'shell'\\] spin \\(process 8\\) ended: stopped \\(kill\\)$;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!$;;'shell'\\] hello \\(process [0-9]+\\) ended: exit code 19$;;\\[user\\] task [0-9]+ 'crash' killed by vector 14 #PF Page Fault .*cr2=0xffff800000100000 \\(protection violation, write, user mode\\)$;;'shell'\\] crash \\(process [0-9]+\\) ended: stopped by the CPU: exception 14 \\(page fault\\)$;;'shell'\\] console: this shell's Factory capability doesn't cover it;;'shell'\\] no programs started from this shell are running$;;programs checked: ||r u n spc s p i n ret pause p s ret j o b s ret k i l l spc 5 ret k i l l spc 8 ret pause r u n spc s p i n ret r u n spc s p i n ret k i l l spc s p i n ret pause r u n spc h e l l o ret pause r u n spc c r a s h ret pause r u n spc c o n s o l e ret j o b s ret p s ret"
   "kill-shell|kill_shell|128M|\\[demo\\] shell killed;;\\[user 3 'init'\\] the shell \\(process 7\\) ended: started it again as process [0-9]+ \\(1 of 3\\);;'shell'\\] hi$;;the shell started again answered||pause e c h o spc h i ret"
   "log-flood|log_flood|128M|flood 600;;tick 1;;flood checked: ;;screendump matches the mode: 1280x800, and the colour swatch is the VGA palette;;the log below the bar did not change||pause pgup screendump pause logsame pgdn pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup"
 )
@@ -448,6 +449,22 @@ check_shell() { # check_shell <serial log>: the shell case's editing keys
   fi
 }
 
+check_programs() { # check_programs <serial log>: the programs case
+  # Three spins stopped through the shell's Process capabilities (kill 8,
+  # then kill spin for two at once); while the first ran, the shell held
+  # one more capability (9), and at the end, with every program gone, it
+  # is back to its 8: each one let go of (Entry 24).
+  local stopped first last
+  stopped=$(grep -c "^\\[user [0-9]* 'shell'\\] spin (process [0-9]*) ended: stopped (kill)$" "$1")
+  first=$(grep "^\\[user [0-9]* 'shell'\\]   7  shell " "$1" | head -1 | awk '{print $6}')
+  last=$(grep "^\\[user [0-9]* 'shell'\\]   7  shell " "$1" | tail -1 | awk '{print $6}')
+  if [ "$stopped" = 3 ] && [ "$first" = 9 ] && [ "$last" = 8 ]; then
+    echo "[test.sh] programs checked: 3 spins stopped; the shell held 9 capabilities with one running, 8 after" >> "$1"
+  else
+    echo "[test.sh] programs wrong: $stopped spins stopped; the shell held $first, then $last capabilities" >> "$1"
+  fi
+}
+
 check_crash_screen() { # check_crash_screen <ppm> <notes file>
   # The crash screen's top rows are white on red. On a screen the console
   # driver had drawn, that shows the kernel took it back (Entry 20). The
@@ -607,6 +624,7 @@ for entry in "${CASES[@]}"; do
   [ "$name" = log-flood ] && check_flood "$dir/serial.log"
   [ "$name" = mouse ] && check_mouse "$dir/serial.log"
   [ "$name" = shell ] && check_shell "$dir/serial.log"
+  [ "$name" = programs ] && check_programs "$dir/serial.log"
   # After the console driver is killed: init starts it again (kill-console),
   # or, with init gone too, nothing does (kill-init).
   after=$(sed -n '/console driver killed/,$ p' "$dir/serial.log" | grep '^\[console note\] ')

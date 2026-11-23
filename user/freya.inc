@@ -29,7 +29,7 @@ SYS_POWER    equ 11                 ; power(cap, action): never returns if allow
                                     ; 12 was console_scroll (retired in Entry 20)
 SYS_MAP      equ 13                 ; map(memory, address): map a Memory capability
 SYS_NOTE     equ 14                 ; note(cap, ptr, len): like write, serial only
-SYS_SPAWN    equ 15                 ; spawn(factory, program, arg, slots, exit_ep): new process id
+SYS_SPAWN    equ 15                 ; spawn(factory, program, arg, slots, exit_ep, flags in r9): new process id
 SYS_ENDPOINT equ 16                 ; endpoint(factory): slot of a new endpoint capability
 SYS_MINT     equ 17                 ; mint(endpoint, rights, badge): slot of a narrower copy
 SYS_DROP     equ 18                 ; drop(slot): let go of a capability
@@ -37,6 +37,8 @@ SYS_IRQ_BIND equ 19                 ; irq_bind(irq, endpoint): the line's interr
 SYS_SIGNAL   equ 20                 ; signal(endpoint): its badge's bits set as signals there (Entry 23)
 SYS_INFO     equ 21                 ; info(info, ptr, len): uptime, memory, tasks into a buffer
 SYS_CAP_INFO equ 22                 ; cap_info(slot): what the caller's own slot holds
+SYS_KILL     equ 23                 ; kill(process): stop it (Entry 24)
+SYS_STATUS   equ 24                 ; status(process): running, or how it ended
 
 ; Programs spawn can start (kernel/src/factory.rs), and endpoint rights.
 PROGRAM_HELLO    equ 0
@@ -44,6 +46,8 @@ PROGRAM_CONSOLE  equ 1
 PROGRAM_PS2      equ 2
 PROGRAM_MOUSE    equ 3
 PROGRAM_SHELL    equ 4
+PROGRAM_SPIN     equ 5
+PROGRAM_CRASH    equ 6
 RIGHT_SEND   equ 1
 RIGHT_RECV   equ 2
 RIGHT_GRANT  equ 4

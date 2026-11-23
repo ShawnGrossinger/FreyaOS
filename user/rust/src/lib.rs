@@ -91,6 +91,8 @@ pub const SYS_IRQ_BIND: u64 = 19;
 pub const SYS_SIGNAL: u64 = 20;
 pub const SYS_INFO: u64 = 21;
 pub const SYS_CAP_INFO: u64 = 22;
+pub const SYS_KILL: u64 = 23;
+pub const SYS_STATUS: u64 = 24;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
 pub const ERR_NO_CAPABILITY: i64 = -2;
@@ -117,6 +119,14 @@ pub const PROGRAM_CONSOLE: u64 = 1;
 pub const PROGRAM_PS2: u64 = 2;
 pub const PROGRAM_MOUSE: u64 = 3;
 pub const PROGRAM_SHELL: u64 = 4;
+pub const PROGRAM_SPIN: u64 = 5;
+pub const PROGRAM_CRASH: u64 = 6;
+/// The programs' names, by number (kernel/src/process.rs).
+pub const PROGRAM_NAMES: [&[u8]; 7] = [b"hello", b"console", b"ps2", b"mouse", b"shell", b"spin", b"crash"];
+
+/// A Factory's rights (Entry 24): bit n lets it start program n; this one
+/// lets it make endpoints. mint makes a copy with fewer.
+pub const FACTORY_ENDPOINTS: u64 = 1 << 16;
 
 // ===========================================================================
 // Driver protocols: the first word of a call says what is asked
@@ -228,17 +238,31 @@ pub fn map(slot: u64, addr: u64) -> i64 {
 }
 
 /// Start built-in program `program` with `arg`, using the Factory
-/// capability in `factory`. `slots[i]` is the caller's slot to copy into
-/// the new process's slot i (NO_SLOT for none). If `exit_ep` is an
-/// endpoint capability (not NO_CAP), it is signalled with bit (1 << id)
-/// when the new process ends. Returns its id.
+/// capability in `factory` (which must cover it). `slots[i]` is the
+/// caller's slot to copy into the new process's slot i (NO_SLOT for none).
+/// If `exit_ep` is an endpoint capability (not NO_CAP), it is signalled
+/// with bit (1 << id) when the new process ends. Returns its id.
 pub fn spawn(factory: u64, program: u64, arg: u64, slots: &[u8; MAX_CAPS], exit_ep: u64) -> i64 {
-    spawn_raw(factory, program, arg, slots.as_ptr() as u64, exit_ep)
+    spawn_raw(factory, program, arg, slots.as_ptr() as u64, exit_ep, 0).0
 }
 
-/// spawn, with the slot list at any address (the self-tests pass bad ones).
-pub fn spawn_raw(factory: u64, program: u64, arg: u64, slots: u64, exit_ep: u64) -> i64 {
-    let result: i64;
+/// spawn, and a Process capability for the new process (Entry 24), to ask
+/// how it is doing (status) and stop it (kill): Ok((its id, the slot the
+/// capability landed in)).
+pub fn spawn_process(factory: u64, program: u64, arg: u64, slots: &[u8; MAX_CAPS], exit_ep: u64) -> Result<(u64, u64), i64> {
+    match spawn_raw(factory, program, arg, slots.as_ptr() as u64, exit_ep, SPAWN_PROCESS_CAP) {
+        (id, slot) if id >= 0 => Ok((id as u64, slot)),
+        (e, _) => Err(e),
+    }
+}
+
+/// spawn's flags: hand back a Process capability (in R9).
+pub const SPAWN_PROCESS_CAP: u64 = 1 << 0;
+
+/// spawn, with the slot list at any address and any flags (the self-tests
+/// pass bad ones): (the id or an error, the Process capability's slot).
+pub fn spawn_raw(factory: u64, program: u64, arg: u64, slots: u64, exit_ep: u64, flags: u64) -> (i64, u64) {
+    let (result, cap_slot): (i64, u64);
     unsafe {
         asm!(
             "syscall",
@@ -248,13 +272,46 @@ pub fn spawn_raw(factory: u64, program: u64, arg: u64, slots: u64, exit_ep: u64)
             in("rdx") arg,
             in("r10") slots,
             in("r8") exit_ep,
+            inlateout("r9") flags => cap_slot,
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack),
         );
     }
-    result
+    (result, cap_slot)
 }
+
+/// Stop the process the Process capability in `slot` names (Entry 24).
+/// Peer-gone if it has already ended.
+pub fn kill(slot: u64) -> i64 {
+    syscall3(SYS_KILL, slot, 0, 0)
+}
+
+/// How the process the Process capability in `slot` names is doing:
+/// Ok((STATUS_RUNNING, 0)), or how it ended, with its exit code or the
+/// CPU exception's vector. Peer-gone once its task slot holds another
+/// process.
+pub fn status(slot: u64) -> Result<(i64, u64), i64> {
+    let (how, value): (i64, u64);
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") SYS_STATUS => how,
+            inlateout("rdi") slot => value,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    if how < 0 {
+        return Err(how);
+    }
+    Ok((how, value))
+}
+pub const STATUS_RUNNING: i64 = 0;
+pub const STATUS_EXITED: i64 = 1;
+pub const STATUS_FAULT: i64 = 2;
+pub const STATUS_KILLED: i64 = 3;
 
 /// A new endpoint (SEND, RECV and GRANT, no badge), made with the Factory
 /// capability in `factory`. Returns the slot it landed in.
@@ -447,11 +504,13 @@ pub const KIND_POWER: i64 = 5;
 pub const KIND_MEMORY: i64 = 6;
 pub const KIND_FACTORY: i64 = 7;
 pub const KIND_INFO: i64 = 8;
+pub const KIND_PROCESS: i64 = 9;
 
 /// The capability in the caller's own `slot`: Ok((kind, a, b, c)), where
 /// an endpoint's a, b, c are its number, rights and badge; a port range's
 /// its base and count; an interrupt's its line; memory's its pages and
-/// flags.
+/// flags; a Factory's its rights; a process's its task slot (its id) and
+/// generation (Entry 24).
 pub fn cap_info(slot: u64) -> Result<(i64, u64, u64, u64), i64> {
     let (kind, a, b, c): (i64, u64, u64, u64);
     unsafe {
