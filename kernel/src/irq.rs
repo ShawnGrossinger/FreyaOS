@@ -31,6 +31,17 @@
 //! Line 16 is a test line with no device behind it: the kernel raises it
 //! by sending itself an interrupt through the local APIC, so the whole
 //! path from interrupt to user-space driver can be tested without one.
+//!
+//! Interrupts as signals (Entry 22): irq_bind(irq, endpoint) makes a line's
+//! interrupts arrive on an endpoint the driver receives on, as signal bit
+//! (1 << line), instead of waking irq_wait. A driver then waits in one
+//! place for its interrupts (several lines, if it has them) and for its
+//! clients' requests: the PS/2 driver waits for the keyboard's line, the
+//! mouse's line and the mouse driver's calls. Signals merge, so a bound
+//! line says "it fired since you last looked", not how often: the driver
+//! asks its device how much there is. Arming still works the same way:
+//! ack before emptying the device. The binding holds a reference to the
+//! endpoint until the line is bound again.
 
 use crate::cap::Cap;
 use crate::cpu::without_interrupts;
@@ -46,6 +57,11 @@ pub const VECTOR_BASE: u8 = 0x40;
 
 /// Interrupts that arrived and haven't been waited for yet, per line.
 static PENDING: [AtomicU32; LINES] = [const { AtomicU32::new(0) }; LINES];
+/// The endpoint each line's interrupts are signalled to, or UNBOUND.
+const UNBOUND: u32 = u32::MAX;
+static BOUND: [AtomicU32; LINES] = [const { AtomicU32::new(UNBOUND) }; LINES];
+// Signal bit (1 << line) must fit one word.
+const _: () = assert!(LINES <= 64);
 static TOTAL: AtomicU32 = AtomicU32::new(0);
 
 // ===========================================================================
@@ -183,10 +199,15 @@ pub fn on_interrupt(line: u8) {
     if is_level(line) {
         set_masked(line, true); // until the driver acks it
     }
-    PENDING[line as usize].fetch_add(1, Ordering::Relaxed);
     TOTAL.fetch_add(1, Ordering::Relaxed);
     crate::apic::end_of_interrupt();
-    sched::wake_irq_waiter(line);
+    match BOUND[line as usize].load(Ordering::Relaxed) {
+        UNBOUND => {
+            PENDING[line as usize].fetch_add(1, Ordering::Relaxed);
+            sched::wake_irq_waiter(line);
+        }
+        ep => crate::ipc::signal(ep as u8, 1 << line),
+    }
 }
 
 /// Line count, so idt.rs can tell a line's vector from anything else.
@@ -238,8 +259,8 @@ pub fn wait(slot: u64) -> i64 {
         Ok(l) => l,
         Err(e) => return e,
     };
-    if !is_routed_or_test(line) {
-        return ERR_BAD_ARGUMENT; // no such line on this machine
+    if !is_routed_or_test(line) || BOUND[line as usize].load(Ordering::Relaxed) != UNBOUND {
+        return ERR_BAD_ARGUMENT; // no such line here, or it signals instead
     }
     set_masked(line, false); // a driver is waiting: let it through
     without_interrupts(|| unsafe {
@@ -257,6 +278,38 @@ pub fn wait(slot: u64) -> i64 {
             }
         }
     })
+}
+
+/// irq_bind(irq, endpoint): the line in Cap::Irq slot `irq` signals the
+/// endpoint in slot `endpoint` (which the caller must be able to receive
+/// on) with bit (1 << line) from now on. Interrupts counted while it was
+/// unbound arrive as one signal at once. Returns 0.
+pub fn bind(irq: u64, endpoint: u64) -> i64 {
+    let line = match line_cap(irq) {
+        Ok(l) => l,
+        Err(e) => return e,
+    };
+    let Cap::Endpoint { ep, rights, .. } = sched::current_cap(endpoint) else {
+        return ERR_WRONG_CAPABILITY;
+    };
+    if rights & crate::cap::RECV == 0 {
+        return ERR_WRONG_CAPABILITY;
+    }
+    if !is_routed_or_test(line) {
+        return ERR_BAD_ARGUMENT;
+    }
+    crate::ipc::retain(ep);
+    let (old, waiting) = without_interrupts(|| {
+        let old = BOUND[line as usize].swap(ep as u32, Ordering::Relaxed);
+        (old, PENDING[line as usize].swap(0, Ordering::Relaxed))
+    });
+    if old != UNBOUND {
+        crate::ipc::release(old as u8);
+    }
+    if waiting > 0 {
+        crate::ipc::signal(ep, 1 << line);
+    }
+    0
 }
 
 /// irq_ack(slot): the driver is ready for the line's next interrupt, so it
@@ -418,7 +471,58 @@ pub fn selftest() -> bool {
             && PENDING[TEST_LINE as usize].load(Ordering::Relaxed) == 0,
     );
 
+    ok &= selftest_bind();
     ok
+}
+
+/// captest's bind test (user/rust/src/bin/captest.rs, BIND): three
+/// refusals, then a bound test line signalled 5 times.
+const CAPTEST_BIND: u64 = 3;
+const BIND_SIGNALS: u64 = 5;
+const BIND_REFUSALS_ALL: u64 = 0x7;
+
+/// 4. The test line bound to an endpoint: an interrupt raised before the
+///    bind arrives as a signal at once, then each one raised while the
+///    process waits in recv wakes it with bit (1 << 16).
+fn selftest_bind() -> bool {
+    use crate::cap::{RECV, SEND};
+    let Some(ep) = crate::ipc::create() else {
+        return check(b"driver", b"an endpoint for the bind test", false);
+    };
+    let delivered_early = raise_test_line();
+    let caps = table(&[Cap::Console, TEST_IRQ, Cap::Endpoint { ep, badge: 0, rights: SEND | RECV }]);
+    let started = process::spawn(&process::CAPTEST, CAPTEST_BIND, caps);
+    crate::ipc::release_created(ep);
+    let mut raised = delivered_early as u64;
+    let mut status = None;
+    if let Ok(id) = started {
+        for _ in 1..BIND_SIGNALS {
+            // Raise only once it waits again, so no two signals merge.
+            for _ in 0..200 {
+                if sched::blocked_in_ipc(id) {
+                    break;
+                }
+                sched::sleep_ticks(1);
+            }
+            raised += raise_test_line() as u64;
+        }
+        status = sched::join_timeout(id, 500);
+    }
+    unbind(TEST_LINE);
+    check(
+        b"driver",
+        b"an interrupt line bound to an endpoint arrives as signals (one waiting from before the bind, then 4); binding something not an Irq, or to an endpoint without RECV, and irq_wait on a bound line: refused",
+        raised == BIND_SIGNALS && status == Some(ExitStatus::Code(BIND_REFUSALS_ALL | BIND_SIGNALS << 8)),
+    )
+}
+
+/// Take a line's binding away (self-tests: the test line goes back to
+/// irq_wait), letting go of the endpoint it held.
+fn unbind(line: u8) {
+    let old = BOUND[line as usize].swap(UNBOUND, Ordering::Relaxed);
+    if old != UNBOUND {
+        crate::ipc::release(old as u8);
+    }
 }
 
 /// After init_ioapic: the hardware says what we told it. The facts a

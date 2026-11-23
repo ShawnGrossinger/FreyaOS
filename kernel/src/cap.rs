@@ -38,7 +38,7 @@
 //! keyboard driver only SEND, with a badge that names it. And a process
 //! can let go of a capability (system call drop).
 
-pub const MAX_CAPS: usize = 16;
+pub const MAX_CAPS: usize = 32;
 
 /// Endpoint rights.
 pub const SEND: u8 = 1 << 0;

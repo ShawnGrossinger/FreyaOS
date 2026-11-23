@@ -26,8 +26,18 @@
 //! What it waits for, all on its endpoint:
 //!   - signals from the kernel: LOG (the log grew), PANEL (a status row
 //!     changed);
-//!   - calls: SCROLL (from the keyboard driver: PageUp, PageDown, Enter),
-//!     answered with how many rows back the view is.
+//!   - calls: SCROLL (from the PS/2 driver: PageUp, PageDown, Enter),
+//!     answered with how many rows back the view is; POINTER (from the
+//!     mouse driver, Entry 22): movement, buttons and wheel.
+//!
+//! The pointer (Entry 22) is a cell drawn with its colours swapped. It
+//! appears in the middle of the screen at the mouse's first movement and
+//! moves in the mouse's own units, one count to a pixel (a cell is 8 x
+//! 16). Holding the middle button turns movement into scrolling, the way a
+//! ThinkPad's TrackPoint scrolls: up goes back, a row per 16 counts. The
+//! wheel, if there is one, scrolls 3 rows a notch. After each change of
+//! cell or buttons it leaves a note: "pointer at column C, row R;
+//! buttons: ..." (test.sh's mouse case reads them).
 //!
 //! Every cell drawn is remembered, so only cells that change are drawn
 //! again; the framebuffer is only ever written. After each scroll it leaves
@@ -56,10 +66,18 @@ const DESCRIPTION: u64 = 5;
 const SIGNAL_LOG: u64 = 1 << 0;
 const SIGNAL_PANEL: u64 = 1 << 1;
 
-const REQUEST_SCROLL: u64 = 1;
-const SCROLL_BACK: u64 = 0;
-const SCROLL_FORWARD: u64 = 1;
-const SCROLL_TO_END: u64 = 2;
+const REQUEST_SCROLL: u64 = freya::CONSOLE_SCROLL;
+const REQUEST_POINTER: u64 = freya::CONSOLE_POINTER;
+const SCROLL_BACK: u64 = freya::SCROLL_BACK;
+const SCROLL_FORWARD: u64 = freya::SCROLL_FORWARD;
+const SCROLL_TO_END: u64 = freya::SCROLL_TO_END;
+
+// The pointer.
+const MIDDLE_BUTTON: u8 = 1 << 2;
+/// Mouse counts (up or down) per row scrolled with the middle button held.
+const COUNTS_PER_ROW: i64 = 16;
+/// Rows a notch of the wheel scrolls.
+const ROWS_PER_NOTCH: i64 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -123,6 +141,18 @@ struct Console {
     back: usize,
     /// Bytes of the system log read so far.
     read: u64,
+
+    /// The pointer: shown once the mouse first moves; where it is, in
+    /// pixels (text mode: as if a cell were 8 x 16 pixels too), and the
+    /// cell that holds it.
+    pointer: bool,
+    px: i64,
+    py: i64,
+    pointer_row: usize,
+    pointer_col: usize,
+    buttons: u8,
+    /// Movement with the middle button held, not yet a whole row.
+    scroll_carry: i64,
 }
 
 static mut STATE: Console = unsafe { core::mem::zeroed() };
@@ -199,9 +229,81 @@ fn handle_call(c: &mut Console, msg: &Message) {
             note_view(c);
             freya::reply([c.back as u64, 0, 0, 0], NO_CAP);
         }
+        REQUEST_POINTER => {
+            pointer(c, msg.words[1] as i64, msg.words[2] as i64, msg.words[3]);
+            freya::reply([0; 4], NO_CAP);
+        }
         _ => {
             freya::reply([freya::ERR_BAD_ARGUMENT as u64, 0, 0, 0], NO_CAP);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The pointer (Entry 22)
+// ---------------------------------------------------------------------------
+
+/// The mouse moved by (dx, dy) (y up), with `word`'s buttons (bits 0 to 2)
+/// and wheel (bits 8 to 15, signed; negative is up).
+fn pointer(c: &mut Console, dx: i64, dy: i64, word: u64) {
+    let buttons = (word & 7) as u8;
+    let wheel = (word >> 8) as u8 as i8 as i64;
+    let (width, height) = if c.info.graphics != 0 {
+        (c.info.width as i64, c.info.height as i64)
+    } else {
+        ((c.cols * GLYPH_W) as i64, (c.rows * GLYPH_H) as i64)
+    };
+    let first = !c.pointer;
+    if first {
+        c.pointer = true;
+        c.px = width / 2;
+        c.py = height / 2;
+    }
+    let mut rows = 0;
+    if buttons & MIDDLE_BUTTON != 0 {
+        c.scroll_carry += dy;
+        rows = c.scroll_carry / COUNTS_PER_ROW;
+        c.scroll_carry -= rows * COUNTS_PER_ROW;
+    } else {
+        c.scroll_carry = 0;
+        c.px = (c.px + dx).clamp(0, width - 1);
+        c.py = (c.py - dy).clamp(0, height - 1);
+    }
+    rows -= wheel * ROWS_PER_NOTCH;
+    let cell = ((c.py as usize) / GLYPH_H, (c.px as usize) / GLYPH_W);
+    let moved = first || cell != (c.pointer_row, c.pointer_col);
+    let pressed = buttons != c.buttons;
+    (c.pointer_row, c.pointer_col) = cell;
+    c.buttons = buttons;
+    if rows != 0 {
+        read_log(c);
+        let back = (c.back as i64 + rows).clamp(0, max_back(c) as i64);
+        c.back = back as usize;
+    }
+    if moved || rows != 0 {
+        // Only the cells that change are drawn: the pointer's old and new
+        // cells, or the view the scroll moved.
+        draw_panel(c);
+        draw_log(c);
+    }
+    if rows != 0 {
+        note_view(c);
+    }
+    if moved || pressed {
+        let mut line = Line::<96>::new();
+        line.str(b"pointer at column ").dec(c.pointer_col as u64).str(b", row ").dec(c.pointer_row as u64);
+        line.str(b"; buttons:");
+        let names: [&[u8]; 3] = [b" left", b" right", b" middle"];
+        for (i, name) in names.iter().enumerate() {
+            if buttons & (1 << i) != 0 {
+                line.str(name);
+            }
+        }
+        if buttons == 0 {
+            line.str(b" none");
+        }
+        line.str(b"\n");
+        freya::note(CONSOLE, line.as_bytes());
     }
 }
 
@@ -372,6 +474,8 @@ fn put(c: &mut Console, row: usize, col: usize, ch: u8, attr: u8) {
     if row >= c.rows || col >= c.cols {
         return;
     }
+    // The pointer's cell: its colours swapped.
+    let attr = if c.pointer && (row, col) == (c.pointer_row, c.pointer_col) { attr << 4 | attr >> 4 } else { attr };
     let value = (attr as u32) << 8 | ch as u32;
     if c.drawn[row][col] == value + 1 {
         return;

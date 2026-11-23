@@ -26,6 +26,15 @@
 //!   bit 6  slots fill up: mint and endpoint then say no slot is free
 //!   bit 7  drop frees a slot, and mint lands in it again; dropping an
 //!          empty slot, or one past the last, is refused
+//!
+//! BIND (3, Entry 22), with slot 0 Console, 1 the test interrupt line,
+//! 2 an endpoint (SEND + RECV); exits with the refusals in bits 0 to 2 and
+//! the signals received in bits 8 up:
+//!   bit 0  binding the console capability as if it were a line: refused
+//!   bit 1  binding to an endpoint capability without RECV: refused
+//!   bit 2  irq_wait on the line once it is bound: refused
+//!   then 5 signals, each bit (1 << 16) alone (the kernel raises the line
+//!   once before this starts, then once each time it waits)
 
 #![no_std]
 #![no_main]
@@ -40,11 +49,14 @@ const EP: u64 = 2;
 
 const SPAWN: u64 = 1;
 const MINT: u64 = 2;
+const BIND: u64 = 3;
+const TEST_LINE: u64 = 16;
 
 fn main(arg: u64) -> u64 {
     match arg {
         SPAWN => spawn_tests(),
         MINT => mint_tests(),
+        BIND => bind_tests(),
         _ => 0,
     }
 }
@@ -116,4 +128,24 @@ fn mint_tests() -> u64 {
 
     bit(0, no_factory) | bit(1, made) | bit(2, sent) | bit(3, from_badged) | bit(4, refused) | bit(5, exit_without_send) | bit(6, full)
         | bit(7, freed && dropped_twice)
+}
+
+fn bind_tests() -> u64 {
+    const IRQ: u64 = 1;
+    let not_a_line = irq_bind(CONSOLE_SLOT, EP) == ERR_WRONG_CAPABILITY;
+    let send_only = mint(EP, SEND, 0);
+    let no_recv = send_only >= 0 && irq_bind(IRQ, send_only as u64) == ERR_WRONG_CAPABILITY;
+    if irq_bind(IRQ, EP) != 0 {
+        return 0;
+    }
+    let no_wait = irq_wait(IRQ) == ERR_BAD_ARGUMENT;
+    irq_ack(IRQ);
+    let mut signals = 0;
+    for _ in 0..5 {
+        match recv(EP) {
+            Ok(m) if m.badge == SIGNAL_BADGE && m.words[0] == 1 << TEST_LINE => signals += 1,
+            _ => break,
+        }
+    }
+    bit(0, not_a_line) | bit(1, no_recv) | bit(2, no_wait) | signals << 8
 }

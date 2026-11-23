@@ -330,6 +330,12 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// Timer interrupts have arrived since interrupts went on: what the
+/// scheduler needs, whatever the self-test made of their rate (Entry 22).
+pub fn ticking() -> bool {
+    ticks() > 0
+}
+
 pub fn enable_interrupts() {
     unsafe { asm!("sti", options(nomem, nostack)) };
 }
@@ -396,14 +402,38 @@ pub fn selftest(info: &ApicInfo) -> bool {
     enable_interrupts();
 
     // Ticks over 100 ms timed independently by the PIT: expect about 10.
-    let start = ticks();
-    for _ in 0..10 {
-        pit_wait_ms(10);
+    // Under an emulator on a busy host, the virtual timer can be held up
+    // and then catch up in a burst while the polled PIT keeps real time
+    // (Entry 22: 1 tick in one boot of Shawn's test run, then the next 5
+    // came twice as fast). So up to three measurements are made, each one
+    // reported; a timer that is missing or at the wrong rate fails all
+    // three. Real hardware passes the first.
+    let mut counts = [0u64; 3];
+    let mut attempts = 0;
+    for count in counts.iter_mut() {
+        let start = ticks();
+        for _ in 0..10 {
+            pit_wait_ms(10);
+        }
+        *count = ticks() - start;
+        attempts += 1;
+        if (8..=12).contains(count) {
+            break;
+        }
     }
-    let counted = ticks() - start;
+    let counted = counts[attempts - 1];
     crate::serial_write_str(b"[apic] self-test ");
     crate::serial_write_u64(counted);
     crate::serial_write_str(b" ticks in 100 ms measured by the PIT (expect about 10)");
+    if attempts > 1 {
+        crate::serial_write_str(b"; attempt ");
+        crate::serial_write_u64(attempts as u64);
+        crate::serial_write_str(b", after");
+        for &c in &counts[..attempts - 1] {
+            crate::serial_write_str(b" ");
+            crate::serial_write_u64(c);
+        }
+    }
     ok &= crate::selftest::verdict((8..=12).contains(&counted));
 
     // Work that timer interrupts land in the middle of must come out exactly
@@ -415,7 +445,7 @@ pub fn selftest(info: &ApicInfo) -> bool {
     let mut interrupted = (1u64, 0.0f64);
     let mut chunks = 0u64;
     let begin = ticks();
-    if counted > 0 {
+    if counts.iter().any(|&c| c > 0) {
         while ticks() < begin + 5 && chunks < MAX_CHUNKS {
             work(&mut interrupted, 10_000);
             chunks += 1;

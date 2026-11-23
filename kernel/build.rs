@@ -32,7 +32,7 @@ fn main() {
     // include_bytes! (process.rs). No file system to load them from yet.
     let user_dir = PathBuf::from(&manifest_dir).join("../user");
     println!("cargo:rerun-if-changed=../user/freya.inc");
-    for program in ["hello", "probe", "ipc", "driver", "keyboard"] {
+    for program in ["hello", "probe", "ipc", "driver"] {
         println!("cargo:rerun-if-changed=../user/{program}.asm");
         let status = Command::new("nasm")
             .args(["-f", "bin", "-I"])
@@ -50,7 +50,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=FREYA_USER_BINS");
     let bins = env::var("FREYA_USER_BINS")
         .expect("FREYA_USER_BINS is unset: build with make in build/, which builds the Rust user programs first");
-    for program in ["console", "init", "captest"] {
+    for program in ["console", "init", "captest", "ps2", "mouse"] {
         let src = PathBuf::from(&bins).join(format!("{program}.bin"));
         println!("cargo:rerun-if-changed={}", src.display());
         std::fs::copy(&src, PathBuf::from(&out_dir).join(format!("{program}.bin")))

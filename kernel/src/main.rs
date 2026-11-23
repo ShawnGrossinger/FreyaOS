@@ -571,9 +571,11 @@ pub extern "C" fn rust_start() -> ! {
     };
 
     // --- Scheduler: the boot thread becomes task 0 ---
-    // Only with a working timer: sleeping and preemption both run off it,
-    // and without ticks the sleep test would wait forever.
-    let sched_ok = if !irq_ok {
+    // Only with a timer that ticks: sleeping and preemption both run off it,
+    // and without ticks the sleep test would wait forever. Ticking is
+    // enough: a rate the self-test measured badly fails that test, not the
+    // scheduler and everything after it (Entry 22).
+    let sched_ok = if !apic::ticking() {
         selftest::check(b"sched", b"scheduler not started: it needs the timer", false)
     } else if sched::init().is_err() {
         selftest::check(b"sched", b"scheduler not started: no memory for the idle task", false)
@@ -662,7 +664,10 @@ pub extern "C" fn rust_start() -> ! {
     let (passed, failed) = selftest::counts();
     vga_summary(15, passed, failed);
 
-    // The uptime line is kept current by a task of its own.
+    // The uptime line is kept current by a task of its own. The self-tests'
+    // last tasks are reaped first, so the clock is task 2 and init process
+    // 3 on every boot.
+    sched::reap();
     if sched::is_enabled() && sched::spawn("clock", clock_task, 17).is_err() {
         serial_write_str(b"[kernel] could not start the clock task\n");
     }
@@ -717,7 +722,7 @@ static INIT_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 ///   4 the screen     5 the system log 6 the status rows 7 the screen's
 ///                                                         description
 ///   8 Irq 1 (the keyboard)            9 IoPorts 0x60   10 IoPorts 0x64
-///  11 Power
+///  11 Power                         12 Irq 12 (the mouse, Entry 22)
 ///
 /// A slot is left empty if the kernel has nothing to put there (no screen
 /// to lend, interrupts not routed); init then can't start what needs it,
@@ -740,6 +745,7 @@ fn start_init(ioapic_ready: bool) -> bool {
         Cap::IoPorts { base: 0x60, count: 1 },
         Cap::IoPorts { base: 0x64, count: 1 },
         Cap::Power,
+        if ioapic_ready { Cap::Irq { line: 12 } } else { Cap::None },
     ]);
     let started = process::spawn(&process::INIT, 0, caps);
     // init's table holds the endpoints now (or nothing does, and they go).

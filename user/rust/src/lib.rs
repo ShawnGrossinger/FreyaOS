@@ -87,6 +87,7 @@ pub const SYS_SPAWN: u64 = 15;
 pub const SYS_ENDPOINT: u64 = 16;
 pub const SYS_MINT: u64 = 17;
 pub const SYS_DROP: u64 = 18;
+pub const SYS_IRQ_BIND: u64 = 19;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
 pub const ERR_NO_CAPABILITY: i64 = -2;
@@ -101,7 +102,7 @@ pub const ERR_NO_MEMORY: i64 = -10;
 pub const ERR_NO_SLOT: i64 = -11;
 
 /// Capability slots per process.
-pub const MAX_CAPS: usize = 16;
+pub const MAX_CAPS: usize = 32;
 /// Endpoint rights (mint).
 pub const SEND: u64 = 1 << 0;
 pub const RECV: u64 = 1 << 1;
@@ -110,7 +111,31 @@ pub const GRANT: u64 = 1 << 2;
 /// The programs spawn can start (kernel/src/factory.rs: PROGRAMS).
 pub const PROGRAM_HELLO: u64 = 0;
 pub const PROGRAM_CONSOLE: u64 = 1;
-pub const PROGRAM_KEYBOARD: u64 = 2;
+pub const PROGRAM_PS2: u64 = 2;
+pub const PROGRAM_MOUSE: u64 = 3;
+
+// ===========================================================================
+// Driver protocols: the first word of a call says what is asked
+// ===========================================================================
+
+/// To the console driver (src/bin/console.rs). SCROLL: word 1 is the
+/// action; the answer is how many rows back the view is.
+pub const CONSOLE_SCROLL: u64 = 1;
+pub const SCROLL_BACK: u64 = 0;
+pub const SCROLL_FORWARD: u64 = 1;
+pub const SCROLL_TO_END: u64 = 2;
+/// POINTER (Entry 22): words 1 and 2 are the mouse's movement (x right, y
+/// up, as signed numbers), word 3 its buttons (bit 0 left, 1 right, 2
+/// middle) and, in bits 8 to 15, the wheel (signed: negative is up).
+pub const CONSOLE_POINTER: u64 = 2;
+
+/// To the PS/2 driver (src/bin/ps2.rs), from the mouse driver. READ:
+/// answered, at once or when some arrive, with the mouse's bytes: word 0
+/// the count (up to 24), words 1 to 3 the bytes, eight to a word, first in
+/// the lowest. SEND_TO_MOUSE: word 1 is a byte for the mouse; its answer
+/// (0xFA, ...) arrives among the bytes READ returns.
+pub const PS2_READ: u64 = 1;
+pub const PS2_SEND_TO_MOUSE: u64 = 2;
 /// "No capability here" in spawn's slot list.
 pub const NO_SLOT: u8 = 0xFF;
 
@@ -207,6 +232,59 @@ pub fn endpoint(factory: u64) -> i64 {
 pub fn mint(slot: u64, rights: u64, badge: u64) -> i64 {
     syscall3(SYS_MINT, slot, rights, badge)
 }
+
+/// The interrupt line in Irq slot `irq` signals the endpoint in slot
+/// `endpoint` (one the caller receives on) with bit (1 << line).
+pub fn irq_bind(irq: u64, endpoint: u64) -> i64 {
+    syscall3(SYS_IRQ_BIND, irq, endpoint, 0)
+}
+
+/// Wait for the line in Irq slot `irq` to fire (a line not bound to an
+/// endpoint).
+pub fn irq_wait(irq: u64) -> i64 {
+    syscall3(SYS_IRQ_WAIT, irq, 0, 0)
+}
+
+/// The line in Irq slot `irq` is ready for its next interrupt: unmask it
+/// (arm it, before emptying the device; again after a level-triggered
+/// interrupt).
+pub fn irq_ack(irq: u64) -> i64 {
+    syscall3(SYS_IRQ_ACK, irq, 0, 0)
+}
+
+/// Read one byte from I/O port `port` through the IoPorts capability in
+/// `slot`; negative on error.
+pub fn inb(slot: u64, port: u64) -> i64 {
+    syscall3(SYS_PORT_IN, slot, port, 1)
+}
+
+/// Write one byte to I/O port `port` through the IoPorts capability in
+/// `slot`.
+pub fn outb(slot: u64, port: u64, value: u8) -> i64 {
+    let result: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") SYS_PORT_OUT => result,
+            in("rdi") slot,
+            in("rsi") port,
+            in("rdx") 1u64,
+            in("r10") value as u64,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    result
+}
+
+/// Restart (POWER_RESTART) or switch off (POWER_OFF), with the Power
+/// capability in `slot`. Returns only if refused.
+pub fn power(slot: u64, action: u64) -> i64 {
+    syscall3(SYS_POWER, slot, action, 0)
+}
+pub const POWER_RESTART: u64 = 0;
+pub const POWER_OFF: u64 = 1;
 
 /// Let go of the capability in `slot`.
 pub fn drop_cap(slot: u64) -> i64 {

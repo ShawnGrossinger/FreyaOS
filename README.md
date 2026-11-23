@@ -23,14 +23,14 @@ Bridge, 16 GB), booted from a USB stick.
 | Interrupts | A gate for all 256 vectors, the local APIC timer at 100 Hz, the I/O APIC routed from ACPI tables; interrupts nobody set up are survived and reported |
 | Tasks | Kernel threads, preemptive round-robin scheduling, sleeping, joining, a mutex |
 | User mode | Ring 3 processes in their own address spaces, written in assembly or Rust; `SYSCALL`, SMEP and SMAP where the CPU has them; a fault ends only the process |
-| Capabilities and IPC | 16 capability slots per process; synchronous call/reply IPC that can pass capabilities (with GRANT) and badges; signals; memory lent through Memory capabilities; narrower copies (mint) and letting go (drop) |
+| Capabilities and IPC | 32 capability slots per process; synchronous call/reply IPC that can pass capabilities (with GRANT) and badges; signals; memory lent through Memory capabilities; narrower copies (mint) and letting go (drop) |
 | Init | The only process the kernel starts: it holds the drivers' capabilities and a Factory capability, starts each driver with exactly what it needs, and starts one again if it ends |
-| Drivers | I/O-port, interrupt-line and memory capabilities; a PS/2 keyboard driver and a console driver (in Rust) running as user processes, started by init |
+| Drivers | I/O-port, interrupt-line and memory capabilities, and interrupts delivered as signals; a console driver, a PS/2 driver (keyboard and controller) and a mouse driver, all in Rust, running as user processes, started by init |
 | Power | Restart and switch-off through ACPI, behind a Power capability (Ctrl+Alt+Del, Ctrl+Alt+End) |
 | Not yet | UEFI boot, mouse, disk, network, file system, multiple CPUs |
 
-Every boot runs **87 self-tests** and shows the result on screen. `make test`
-checks the disk image and boots **32 configurations** headless, checking each
+Every boot runs **88 self-tests** and shows the result on screen. `make test`
+checks the disk image and boots **33 configurations** headless, checking each
 one.
 
 ## Design in brief
@@ -47,14 +47,14 @@ one.
   with fewer rights and a badge (mint), and any capability let go of (drop).
 - **Init decides, the kernel enforces.** At the end of boot the kernel starts
   one process, init, with every capability the drivers will need. Init mints
-  narrower copies, starts the console and keyboard drivers with exactly the
+  narrower copies, starts the console, PS/2 and mouse drivers with exactly the
   slots each needs, and is signalled when one ends, so it can start it again
   (three times at most; then it lets go of what only that driver used).
 - **Drivers own their devices.** The console driver draws the screen through
   three Memory capabilities: the framebuffer (or VGA text memory), the
   kernel's log, and the kernel's status rows, the last two read-only, plus a
   read-only description of the screen and its font. The kernel wakes it with
-  signals on its endpoint; the keyboard driver asks it to scroll with an IPC
+  signals on its endpoint; the PS/2 driver asks it to scroll with an IPC
   call. The kernel draws the screen until a process maps it, and takes it
   back for a crash or when that process ends.
 - **System calls** (`SYSCALL`, number in `rax`):
@@ -75,6 +75,7 @@ one.
   | 16 | endpoint(cap): a new endpoint | Factory |
   | 17 | mint(cap, rights, badge): a narrower copy | Endpoint |
   | 18 | drop(slot): let go of a capability | anything |
+  | 19 | irq_bind(irq, endpoint): the line's interrupts become signals there | Irq, Endpoint with RECV |
 
 ## Repository layout
 
@@ -82,8 +83,8 @@ one.
 bootloader/BIOS/   stage1.asm (MBR), stage2.asm (loader, E820, VESA mode, long mode)
 bootloader/UEFI/   placeholder for a later UEFI loader
 kernel/            Rust kernel: entry.asm, kernel.ld, src/*.rs
-user/              user programs in NASM (keyboard driver, test programs)
-user/rust/         user programs in Rust (init, the console driver) and their library
+user/              user programs in NASM (test programs)
+user/rust/         user programs in Rust (init; the console, PS/2 and mouse drivers) and their library
 build/             Makefile, test.sh, write-usb.sh
 docs/              development journal, roadmap and design notes
 ```
@@ -103,7 +104,7 @@ Then, from `build/`:
 ```bash
 make            # builds out/freya-os.img (1 MiB disk image); "make build" too
 make run        # boots it in QEMU, serial output in the terminal
-make test       # every test case, headless; expect "33 passed, 0 failed"
+make test       # every test case, headless; expect "34 passed, 0 failed"
 TEXT_MODE=1 make   # an image that stays in 80x25 text mode
 ```
 
@@ -125,11 +126,12 @@ count, a banner, and an uptime counter; in graphics mode the mode and a
 everything the kernel prints (7 rows in text mode, 32 at 1280x800). Once boot
 is done the console driver draws all of this; the log says so ("process 4
 ('console') draws the screen from here on", after init's "started the console
-driver (process 4) and the keyboard driver (process 5)"). A failed
+driver (process 4), the PS/2 driver (process 5) and the mouse driver (process
+6)"). A failed
 self-test is repeated there, so a photo of the screen is a usable report on a
 machine without a serial port.
 
-Keys, handled by the keyboard driver:
+Keys, handled by the PS/2 driver:
 
 - **Ctrl+Alt+Del** restarts.
 - **Ctrl+Alt+End** switches off (ACPI S5).
@@ -138,6 +140,11 @@ Keys, handled by the keyboard driver:
   the view is; lines that arrive meanwhile don't move it.
 - Typing a line and pressing **Enter** echoes it back (and returns the log to
   its newest line first).
+
+The mouse (on the T430, the TrackPoint and the touchpad) moves a pointer, a
+cell drawn with its colours swapped. Holding the middle button while moving
+scrolls the log, the way a ThinkPad's TrackPoint scrolls; a wheel, if there
+is one, scrolls 3 rows a notch.
 
 If the kernel ever stops on a CPU exception or a panic, it takes the screen
 back from the console driver, and the top of the screen shows the exception,
@@ -167,6 +174,9 @@ headless and checks its serial log:
 - `log-flood`: 600 lines, then more four times a second, while the log is
   scrolled back: the view must stay put (checked in the console driver's
   notes and in screenshots), and the history must stop at 400 rows
+- `mouse`: QEMU's mouse moved, clicked, wheeled and middle-dragged through
+  the monitor; the console driver's notes must follow every step, typing
+  must still work, and a screenshot must show the pointer where it says
 - `kill-console`, `kill-console-often`, `kill-init`: the console driver is
   killed, and init must start it again; killed four times, after which init
   must leave it stopped and let go of it; or killed after init itself: the
@@ -217,6 +227,6 @@ why. `TEXT_MODE=1 make usb DEV=/dev/sdX` writes a stick that always does.
 
 ## Next
 
-Init on the T430, then the TrackPoint/touchpad: the keyboard driver becomes
-the PS/2 controller's driver and passes mouse bytes to a mouse driver through
-an endpoint init makes.
+The mouse on the T430. Then one of: the capability layer (revoking what was
+handed out; capabilities for memory and address spaces), a first shell, or
+read-only disks on a spare machine.

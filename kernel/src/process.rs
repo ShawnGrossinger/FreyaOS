@@ -88,10 +88,17 @@ pub static DRIVER: Program = Program {
     image: include_bytes!(concat!(env!("OUT_DIR"), "/driver.bin")),
 };
 
-/// The PS/2 keyboard driver (user/keyboard.asm).
-pub static KEYBOARD: Program = Program {
-    name: "keyboard",
-    image: include_bytes!(concat!(env!("OUT_DIR"), "/keyboard.bin")),
+/// The PS/2 controller driver: the keyboard, and the mouse's bytes
+/// (user/rust/src/bin/ps2.rs, Entry 22; user/keyboard.asm before).
+pub static PS2: Program = Program {
+    name: "ps2",
+    image: include_bytes!(concat!(env!("OUT_DIR"), "/ps2.bin")),
+};
+
+/// The mouse driver (user/rust/src/bin/mouse.rs, Entry 22).
+pub static MOUSE: Program = Program {
+    name: "mouse",
+    image: include_bytes!(concat!(env!("OUT_DIR"), "/mouse.bin")),
 };
 
 /// Test program: its argument picks one thing to try (user/probe.asm).

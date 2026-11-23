@@ -7,8 +7,9 @@
 //! and lends all of it to init, which passes it on:
 //!
 //!   slot 0  Console    to write to the log and leave notes for test.sh
-//!   slot 1  Endpoint   with RECV: scroll requests from the keyboard
-//!                      driver, and the kernel's signals
+//!   slot 1  Endpoint   with RECV: scroll requests from the PS/2 driver,
+//!                      pointer movement from the mouse driver (Entry 22),
+//!                      and the kernel's signals
 //!   slot 2  Memory     the screen: the framebuffer, or VGA text memory
 //!   slot 3  Memory     the system log (log.rs), read-only
 //!   slot 4  Memory     the kernel's status rows (display.rs), read-only
@@ -40,7 +41,7 @@ use crate::{display, ipc, log, sched};
 pub const SIGNAL_LOG: u64 = 1 << 0;
 pub const SIGNAL_PANEL: u64 = 1 << 1;
 
-// Requests to the console driver are its business and the keyboard's
+// Requests to the console driver are its business and its callers'
 // (user/freya.inc: CONSOLE_SCROLL): the kernel only passes the calls on.
 
 const NONE: u32 = u32::MAX;

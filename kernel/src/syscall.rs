@@ -34,6 +34,7 @@
 //!  16 endpoint(factory)                -> slot of a new endpoint capability
 //!  17 mint(endpoint, rights, badge)    -> slot of a narrower copy  (cap.rs)
 //!  18 drop(slot)                       -> 0: the capability let go of
+//!  19 irq_bind(irq, endpoint)          -> 0: the line signals there  (irq.rs)
 //!
 //! Message registers: send/call take the four words in RSI, RDX, R10, R8
 //! and in R9 the slot of a capability to pass along (-1 for none). recv and
@@ -69,6 +70,7 @@ pub const SYS_SPAWN: u64 = 15;
 pub const SYS_ENDPOINT: u64 = 16;
 pub const SYS_MINT: u64 = 17;
 pub const SYS_DROP: u64 = 18;
+pub const SYS_IRQ_BIND: u64 = 19;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
 /// write, note: the slot doesn't hold the console capability; map: it
@@ -209,6 +211,7 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
         SYS_ENDPOINT => crate::factory::endpoint(f.rdi),
         SYS_MINT => crate::cap::mint(f.rdi, f.rsi, f.rdx),
         SYS_DROP => crate::cap::drop_cap(f.rdi),
+        SYS_IRQ_BIND => crate::irq::bind(f.rdi, f.rsi),
         _ => ERR_BAD_SYSCALL,
     };
     f.rax = result as u64;

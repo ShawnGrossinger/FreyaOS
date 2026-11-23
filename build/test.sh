@@ -35,10 +35,13 @@ ROOT=out/test
 #        (hold-shift, hold-ctrl) holds that key down, repeating like a real keyboard,
 #        from stage 2 until just after the keyboard driver is ready (keys
 #        after it are pressed once it has been let go). Keys wait for
-#        "keyboard ready", or for a crash report to end.
+#        "keyboard ready", or for a crash report to end. The mouse (Entry
+#        22): "mouse:DX:DY" moves it (y down, as on screen), "wheel:N" turns
+#        its wheel (positive is up), "button:MASK" sets its buttons (1 left,
+#        2 right, 4 middle).
 CASES=(
   "image||||"   # not booted: checks the disk image's layout (see check_image)
-  "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;\\[user [0-9]+ 'init'\\] started the console driver \\(process [0-9]+\\) and the keyboard driver \\(process [0-9]+\\);;\\[console\\] process [0-9]+ \\('console'\\) draws the screen from here on;;\\[display\\] VESA graphics [0-9]+x[0-9]+, 32-bit;;reads back pixel for pixel \\(128 pixels, [0-9]+ lit, 0 wrong\\); framebuffer mapped write-combining \\(PAT entry 4\\): PASS;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!;;'probe' killed by vector 14 #PF;;\\[user [0-9]+ 'ipc'\\] printed for me by the log server;;driver handled 10"
+  "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;\\[user 3 'init'\\] started the console driver \\(process 4\\), the PS/2 driver \\(process 5\\) and the mouse driver \\(process 6\\);;\\[console\\] process [0-9]+ \\('console'\\) draws the screen from here on;;\\[display\\] VESA graphics [0-9]+x[0-9]+, 32-bit;;reads back pixel for pixel \\(128 pixels, [0-9]+ lit, 0 wrong\\); framebuffer mapped write-combining \\(PAT entry 4\\): PASS;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!;;'probe' killed by vector 14 #PF;;\\[user [0-9]+ 'ipc'\\] printed for me by the log server;;driver handled 10"
   "bios-if-on|bios-if-on|128M|BIOS had left them ON after its disk calls; stage 2 turned them off\\): PASS;;self-tests: [0-9]+ passed, 0 failed"
   "dirty-ram||128M-dirty|self-tests: [0-9]+ passed, 0 failed;;init complete"
   "boot-4G||4G|physical map at 0xffff800000000000: 4096 MiB;;init complete - boot thread done; scheduler and timer running"
@@ -69,6 +72,7 @@ CASES=(
   "kill-console|kill_console|128M|\\[demo\\] console driver killed;;ended: the kernel draws the screen again;;\\[user [0-9]+ 'init'\\] the console driver \\(process [0-9]+\\) ended: started it again as process [0-9]+ \\(1 of 3\\);;started again: it draws and scrolls;;typed: hi;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette||screendump pause pgup h i ret"
   "kill-console-often|kill_console_often|128M|\\[demo\\] console driver killed \\(4 of 4\\);;started it again as process [0-9]+ \\(3 of 3\\);;started again 3 times already, so it stays stopped;;typed: hi;;no console notes after it stayed stopped;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette;;the screen changed since the last screendump||screendump pause pause pgup h i ret pause screendiff"
   "kill-init|kill_init|128M|\\[demo\\] init killed;;\\[demo\\] console driver killed;;ended: the kernel draws the screen again;;typed: hi;;no console notes after it ended;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette;;the screen changed since the last screendump||screendump pause pgup h i ret pause screendiff"
+  "mouse||128M|mouse ready: 4-byte packets, with a wheel;;mouse checked: ;;typed: hi;;the pointer is drawn where the console says||pause mouse:80:48 button:1 button:0 wheel:1 wheel:-1 button:4 mouse:0:-64 button:0 mouse:0:64 mouse:127:127 mouse:127:127 mouse:127:127 mouse:127:127 mouse:127:127 mouse:-40:-200 h i ret pointerdump"
   "log-flood|log_flood|128M|flood 600;;tick 1;;flood checked: ;;screendump matches the mode: 1280x800, and the colour swatch is the VGA palette;;the log below the bar did not change||pause pgup screendump pause logsame pgdn pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup"
 )
 COMMON="self-tests: [0-9]+ passed, 0 failed"
@@ -150,6 +154,16 @@ boot() { # boot <image> <ram> <serial log> <keys> [extra QEMU arguments...]
           wait "$holder" 2>/dev/null; holder=
           continue ;;
         pause) sleep 1.5; continue ;;
+        mouse:*|wheel:*|button:*)  # the PS/2 mouse, through the monitor (Entry 22)
+          local cmd
+          case $k in
+            mouse:*) cmd="mouse_move $(echo "${k#mouse:}" | tr ':' ' ')" ;;
+            wheel:*) cmd="mouse_move 0 0 ${k#wheel:}" ;;
+            button:*) cmd="mouse_button ${k#button:}" ;;
+          esac
+          timeout 2 sh -c 'echo "$1" > "$2"' _ "$cmd" "$mon.in"
+          sleep 0.3
+          continue ;;
         screendiff)
           take_screendump "${log%/*}/screen2.ppm" "$mon.in"
           if [ ! -s "${log%/*}/screen.ppm" ] || [ ! -s "${log%/*}/screen2.ppm" ]; then
@@ -163,6 +177,10 @@ boot() { # boot <image> <ram> <serial log> <keys> [extra QEMU arguments...]
         crashdump)
           take_screendump "${log%/*}/screen.ppm" "$mon.in"
           check_crash_screen "${log%/*}/screen.ppm" "$notes"
+          continue ;;
+        pointerdump)
+          take_screendump "${log%/*}/screen.ppm" "$mon.in"
+          check_pointer "${log%/*}/screen.ppm" "$log" "$notes"
           continue ;;
         logsame)
           take_screendump "${log%/*}/screen2.ppm" "$mon.in"
@@ -302,6 +320,58 @@ check_log_same() { # check_log_same <earlier ppm> <later ppm> <notes file>
     echo "[test.sh] the log below the bar did not change" >> "$out"
   else
     echo "[test.sh] the log below the bar changed" >> "$out"
+  fi
+}
+
+check_pointer() { # check_pointer <ppm> <serial log> <notes file>
+  # The cell the console driver last said the pointer is in must be drawn
+  # with its colours swapped (Entry 22). The mouse case leaves it on a
+  # blank cell of the log: grey (0xaaaaaa) swapped, black otherwise. Its
+  # top-left pixel is background in every glyph of the font.
+  local ppm=$1 log=$2 out=$3 w hdr col row off seen
+  read -r col row < <(grep -a '^\[console note\] pointer at column' "$log" | tail -1 | sed 's/.*column \([0-9]*\), row \([0-9]*\);.*/\1 \2/')
+  w=$(head -c 40 "$ppm" 2>/dev/null | tr '\n' ' ' | awk '$1 == "P6" { print $2 }')
+  if [ -z "$w" ] || [ -z "$row" ]; then
+    echo "[test.sh] pointerdump: no screendump, or no pointer note" >> "$out"
+    return
+  fi
+  hdr=$(head -c 40 "$ppm" | head -3 | wc -c)
+  off=$((hdr + (row * 16 * w + col * 8) * 3))
+  seen=$(od -An -v -t x1 -j "$off" -N 3 "$ppm" | tr -d ' \n')
+  if [ "$seen" = aaaaaa ]; then
+    echo "[test.sh] the pointer is drawn where the console says (column $col, row $row)" >> "$out"
+  else
+    echo "[test.sh] the pointer's cell (column $col, row $row) is $seen, not swapped" >> "$out"
+  fi
+}
+
+check_mouse() { # check_mouse <serial log>: the mouse case's moves
+  # From the middle of 1280x800 (cell 80, 25): 80 right and 48 down is
+  # column 90, row 28; left pressed and let go there; the wheel up a notch
+  # (3 rows back) and down again (0); the middle button held and 64 up
+  # (4 rows back, the pointer staying put); let go, 64 down (row 32);
+  # five steps of 127 right and down, past the corner (159, 49); then 40
+  # left and 200 up (154, 37). (QEMU's PS/2 mouse sends at most 127 a
+  # packet and only a few packets per move; the rest waits for the next
+  # move, so the case moves in steps.)
+  local pointers views why
+  pointers=$(sed -n '/mouse ready/,$ s/^\[console note\] pointer at column \([0-9]*\), row \([0-9]*\); buttons: \(.*\)$/\1,\2,\3/p' "$1" | tr ' ' '+' | tr '\n' ' ')
+  views=$(sed -n '/mouse ready/,$ s/^\[console note\] view \([0-9]*\) rows back.*/\1/p' "$1" | tr '\n' ' ')
+  why=$(awk -v p="$pointers" -v v="$views" 'BEGIN {
+      n = split(p, at, " "); m = split(v, view, " ")
+      if (at[1] != "90,28,none") { print "first: " at[1]; exit }
+      if (at[2] != "90,28,left" || at[3] != "90,28,none") { print "click: " at[2] " " at[3]; exit }
+      if (m < 3 || view[1] != 3 || view[2] != 0 || view[3] != 4) { print "scrolling: " v; exit }
+      if (at[4] != "90,28,middle" || at[5] != "90,28,none" || at[6] != "90,32,none") { print "middle: " at[4] " " at[5] " " at[6]; exit }
+      corner = 0; for (i = 7; i <= n; i++) if (at[i] == "159,49,none") corner = 1
+      if (!corner) { print "never reached the corner (159, 49)"; exit }
+      if (at[n] != "154,37,none") { print "last: " at[n]; exit }
+      print "ok"
+    }')
+  if [ "$why" = ok ]; then
+    echo "[test.sh] mouse checked: ${pointers}| views ${views}" >> "$1"
+  else
+    echo "[test.sh] mouse wrong: $why ($pointers | $views)" >> "$1"
   fi
 }
 
@@ -462,6 +532,7 @@ for entry in "${CASES[@]}"; do
   boot "$dir/freya-os.img" "$mem" "$dir/serial.log" "$keys" $extra
   [ "$name" = scroll ] && check_scroll "$dir/serial.log"
   [ "$name" = log-flood ] && check_flood "$dir/serial.log"
+  [ "$name" = mouse ] && check_mouse "$dir/serial.log"
   # After the console driver is killed: init starts it again (kill-console),
   # or, with init gone too, nothing does (kill-init).
   after=$(sed -n '/console driver killed/,$ p' "$dir/serial.log" | grep '^\[console note\] ')

@@ -58,7 +58,7 @@ KERNEL_SRCS := $(shell find $(KERNDIR)/src -name '*.rs') \
 USERRS          := ../user/rust
 USER_RS_SRCS    := $(shell find $(USERRS)/src -name '*.rs') $(USERRS)/Cargo.toml \
                    $(USERRS)/user.ld $(USERRS)/x86_64-freya-user.json
-USER_RS_PROGRAMS := console init captest
+USER_RS_PROGRAMS := console init captest ps2 mouse
 USER_RS_STAMP   := $(OUTDIR)/user/.built
 
 $(USER_RS_STAMP): $(USER_RS_SRCS) | $(OUTDIR)

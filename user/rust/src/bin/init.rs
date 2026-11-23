@@ -9,11 +9,14 @@
 //!   slot 4  the screen   5  the system log  6  the status rows
 //!   slot 7  the screen's description
 //!   slot 8  Irq 1        9  IoPorts 0x60   10  IoPorts 0x64   11  Power
+//!   slot 12 Irq 12 (Entry 22)
 //!
-//! From the console driver's endpoint it mints two narrower copies: RECV
-//! for the console driver, and SEND with badge 1 for the keyboard driver,
-//! so the console can tell who asks. Then it starts each driver with
-//! exactly the slots it needs, asking the kernel to signal its own
+//! It makes one endpoint itself, the PS/2 driver's (Entry 22), and mints
+//! narrower copies of both endpoints: RECV for the driver that receives
+//! on each, and SEND with a badge for each caller (the PS/2 driver 1 and
+//! the mouse driver 3 on the console's; the mouse driver 2 on the PS/2
+//! driver's), so each driver can tell who asks. Then it starts each driver
+//! with exactly the slots it needs, asking the kernel to signal its own
 //! endpoint with bit (1 << id) when one ends, and waits there. A driver
 //! that ends is started again, at most MAX_RESTARTS times; after that init
 //! says so, leaves it stopped, and lets go of what only it would have
@@ -43,9 +46,12 @@ const KEYBOARD_IRQ: u8 = 8;
 const KEYBOARD_DATA: u8 = 9;
 const KEYBOARD_STATUS: u8 = 10;
 const POWER: u8 = 11;
+const MOUSE_IRQ: u8 = 12;
 
-/// The badge the keyboard driver's calls to the console carry.
-const KEYBOARD_BADGE: u64 = 1;
+/// Badges: who is calling, on the endpoint called.
+const PS2_TO_CONSOLE: u64 = 1;
+const MOUSE_TO_PS2: u64 = 2;
+const MOUSE_TO_CONSOLE: u64 = 3;
 
 /// Times a driver is started again before init leaves it stopped.
 const MAX_RESTARTS: u32 = 3;
@@ -93,14 +99,18 @@ fn couldnt_start(d: &Driver, error: i64, again: bool) {
     say(line.as_bytes());
 }
 
-/// A copy of the console driver's endpoint with `rights` and `badge`, in a
-/// slot spawn's list can name; NO_SLOT if it couldn't be made.
-fn minted(rights: u64, badge: u64) -> u8 {
-    match freya::mint(CONSOLE_EP, rights, badge) {
-        slot if slot >= 0 => slot as u8,
+/// A copy of the endpoint capability in `slot` with `rights` and `badge`,
+/// in a slot spawn's list can name; NO_SLOT if it couldn't be made (and
+/// then spawning a driver that needs it fails, and says so).
+fn minted(slot: u8, rights: u64, badge: u64) -> u8 {
+    if slot == NO_SLOT {
+        return NO_SLOT;
+    }
+    match freya::mint(slot as u64, rights, badge) {
+        copy if copy >= 0 => copy as u8,
         error => {
             let mut line = Line::<96>::new();
-            line.str(b"couldn't copy the console driver's endpoint (error -").dec(error.unsigned_abs()).str(b")\n");
+            line.str(b"couldn't copy an endpoint capability (error -").dec(error.unsigned_abs()).str(b")\n");
             say(line.as_bytes());
             NO_SLOT
         }
@@ -108,8 +118,18 @@ fn minted(rights: u64, badge: u64) -> u8 {
 }
 
 fn main(_arg: u64) -> u64 {
-    let console_recv = minted(RECV, 0);
-    let keyboard_send = minted(SEND, KEYBOARD_BADGE);
+    let ps2_ep = match freya::endpoint(FACTORY) {
+        slot if slot >= 0 => slot as u8,
+        _ => {
+            say(b"couldn't make the PS/2 driver's endpoint\n");
+            NO_SLOT
+        }
+    };
+    let console_recv = minted(CONSOLE_EP as u8, RECV, 0);
+    let ps2_to_console = minted(CONSOLE_EP as u8, SEND, PS2_TO_CONSOLE);
+    let mouse_to_console = minted(CONSOLE_EP as u8, SEND, MOUSE_TO_CONSOLE);
+    let ps2_recv = minted(ps2_ep, RECV, 0);
+    let mouse_to_ps2 = minted(ps2_ep, SEND, MOUSE_TO_PS2);
 
     let mut drivers = [
         Driver {
@@ -122,31 +142,43 @@ fn main(_arg: u64) -> u64 {
             without: b"the kernel keeps drawing the screen",
         },
         Driver {
-            name: b"keyboard driver",
-            program: freya::PROGRAM_KEYBOARD,
-            slots: slots(&[CONSOLE, KEYBOARD_IRQ, KEYBOARD_DATA, KEYBOARD_STATUS, POWER, keyboard_send]),
+            name: b"PS/2 driver",
+            program: freya::PROGRAM_PS2,
+            slots: slots(&[CONSOLE, KEYBOARD_IRQ, KEYBOARD_DATA, KEYBOARD_STATUS, POWER, ps2_to_console, ps2_recv, MOUSE_IRQ]),
+            id: None,
+            restarts: 0,
+            drop_when_stopped: [ps2_ep, ps2_recv],
+            without: b"no keyboard: to switch off, hold the power button (safe: nothing is written to disk)",
+        },
+        Driver {
+            name: b"mouse driver",
+            program: freya::PROGRAM_MOUSE,
+            slots: slots(&[CONSOLE, mouse_to_ps2, mouse_to_console]),
             id: None,
             restarts: 0,
             drop_when_stopped: [NO_SLOT, NO_SLOT],
-            without: b"to switch off, hold the power button (safe: nothing is written to disk)",
+            without: b"no pointer",
         },
     ];
 
     // One line for everything started, so it reads as one step.
     let mut line = Line::<160>::new();
     line.str(b"started");
-    let mut first = true;
-    for d in drivers.iter_mut() {
+    let mut started = 0;
+    let last = drivers.len() - 1;
+    for (i, d) in drivers.iter_mut().enumerate() {
         match start(d) {
             Ok(id) => {
-                line.str(if first { b" the " } else { b" and the " }).str(d.name);
-                line.str(b" (process ").dec(id).str(b")");
-                first = false;
+                if started > 0 {
+                    line.str(if i == last { b" and" } else { b"," });
+                }
+                line.str(b" the ").str(d.name).str(b" (process ").dec(id).str(b")");
+                started += 1;
             }
             Err(e) => couldnt_start(d, e, false),
         }
     }
-    if !first {
+    if started > 0 {
         line.str(b"\n");
         say(line.as_bytes());
     }
