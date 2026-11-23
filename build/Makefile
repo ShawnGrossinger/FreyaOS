@@ -48,6 +48,35 @@ KERNEL_SRCS := $(shell find $(KERNDIR)/src -name '*.rs') \
 			   $(KERNDIR)/Cargo.toml $(KERNDIR)/x86_64-freya.json \
 			   $(wildcard ../user/*.asm ../user/*.inc)
 
+# -------------------------
+# User programs in Rust (Entry 20)
+# -------------------------
+# Built before the kernel, which embeds them (kernel/build.rs copies them
+# from FREYA_USER_BINS). Each is an ELF linked by user.ld at the fixed user
+# addresses, then turned into a flat image like the NASM programs.
+
+USERRS          := ../user/rust
+USER_RS_SRCS    := $(shell find $(USERRS)/src -name '*.rs') $(USERRS)/Cargo.toml \
+                   $(USERRS)/user.ld $(USERRS)/x86_64-freya-user.json
+USER_RS_PROGRAMS := console
+USER_RS_STAMP   := $(OUTDIR)/user/.built
+
+$(USER_RS_STAMP): $(USER_RS_SRCS) | $(OUTDIR)
+	mkdir -p $(OUTDIR)/user
+	cd $(USERRS) && \
+	  RUST_TARGET_PATH=$(abspath $(USERRS)) \
+	  RUSTFLAGS="-C link-arg=--script=user.ld" \
+	  cargo +nightly build \
+	    --target x86_64-freya-user.json \
+	    --release \
+	    -Z build-std=core,compiler_builtins \
+	    -Z build-std-features=compiler-builtins-mem \
+	    -Z json-target-spec
+	for p in $(USER_RS_PROGRAMS); do \
+	  $(OBJCOPY) -O binary $(USERRS)/target/x86_64-freya-user/release/$$p $(OUTDIR)/user/$$p.bin || exit 1; \
+	done
+	touch $@
+
 # Build-time fault demo: FREYA_DEMO=<name> make run  (names: see
 # run_requested_demo() in kernel/src/main.rs). The stamp file's name holds
 # the current choice, so changing FREYA_DEMO rebuilds the kernel even when
@@ -58,11 +87,12 @@ $(DEMO_STAMP): | $(OUTDIR)
 	rm -f $(OUTDIR)/.demo-*
 	touch $@
 
-$(KERNELELF): $(KERNEL_SRCS) $(DEMO_STAMP) | $(OUTDIR)
+$(KERNELELF): $(KERNEL_SRCS) $(DEMO_STAMP) $(USER_RS_STAMP) | $(OUTDIR)
 	cd $(KERNDIR) && \
 	  RUST_TARGET_PATH=$(abspath $(KERNDIR)) \
 	  RUSTFLAGS="-C link-arg=--script=kernel.ld" \
 	  FREYA_DEMO="$(FREYA_DEMO)" \
+	  FREYA_USER_BINS=$(abspath $(OUTDIR)/user) \
 	  cargo +nightly build \
 	    --target x86_64-freya.json \
 	    --release \
@@ -85,10 +115,14 @@ $(KERNELBIN): $(KERNELELF)
 # again after setting the display.
 # TEXT_MODE=1: stage2 keeps the BIOS's 80x25 text mode instead of setting a
 # VESA graphics mode (Entry 18). Holding Shift while it boots does the same.
-STAGE2_DEFS := $(if $(BIOS_LEAVES_IF_ON),-D__BIOS_LEAVES_IF_ON,) $(if $(TEXT_MODE),-D__TEXT_MODE,)
+# TEST_VBE_LIES=1 (test.sh's vbe-lies case): stage2 believes a video BIOS
+# that misdescribes its larger modes, to test the checks it makes before
+# setting one (Entry 20).
+STAGE2_DEFS := $(if $(BIOS_LEAVES_IF_ON),-D__BIOS_LEAVES_IF_ON,) $(if $(TEXT_MODE),-D__TEXT_MODE,) \
+               $(if $(TEST_VBE_LIES),-D__TEST_VBE_LIES,)
 # As with FREYA_DEMO: a stamp names the current choice, so switching
 # between "make" and "TEXT_MODE=1 make" rebuilds stage2.
-STAGE2_STAMP := $(OUTDIR)/.stage2$(if $(BIOS_LEAVES_IF_ON),-bios-if-on,)$(if $(TEXT_MODE),-text-mode,)
+STAGE2_STAMP := $(OUTDIR)/.stage2$(if $(BIOS_LEAVES_IF_ON),-bios-if-on,)$(if $(TEXT_MODE),-text-mode,)$(if $(TEST_VBE_LIES),-vbe-lies,)
 
 $(STAGE2_STAMP): | $(OUTDIR)
 	rm -f $(OUTDIR)/.stage2*
@@ -225,3 +259,4 @@ test:
 clean:
 	rm -rf $(OUTDIR)
 	cd $(KERNDIR) && cargo clean
+	cd $(USERRS) && cargo clean

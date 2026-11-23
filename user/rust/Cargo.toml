@@ -1,0 +1,33 @@
+[package]
+name = "freya-user"
+version = "0.1.0"
+edition = "2021"
+
+# User programs written in Rust (Entry 20). Each binary in src/bin/ is a
+# program the kernel embeds, built for x86_64-freya-user.json, linked by
+# user.ld at the fixed user addresses (kernel/src/process.rs), and turned
+# into a flat image by the Makefile. src/lib.rs is their runtime.
+
+[lib]
+name = "freya"
+path = "src/lib.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "console"
+path = "src/bin/console.rs"
+test = false
+bench = false
+
+[dependencies]
+# none: like the kernel, nothing from outside
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+codegen-units = 1
+lto = false
+debug = false
+
+[workspace]

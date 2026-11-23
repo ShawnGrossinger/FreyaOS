@@ -198,6 +198,7 @@ pub fn init() -> Result<ApicInfo, &'static [u8]> {
 pub fn on_timer() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     write(REG_EOI, 0);
+    crate::console::kick(); // what the console driver should look at (Entry 20)
     crate::sched::on_tick();
 }
 

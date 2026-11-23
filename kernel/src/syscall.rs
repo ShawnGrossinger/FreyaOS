@@ -24,9 +24,11 @@
 //!   9 irq_wait(irq)                    -> 0 once the line has fired
 //!  10 irq_ack(irq)                     -> 0 (the line unmasked: armed)
 //!  11 power(power, action)             -> never returns (0 restart, 1 off)
-//!  12 console_scroll(console, action)  -> rows the screen log's view is
-//!                                         back (0 back a page, 1 forward a
-//!                                         page, 2 to the newest line)
+//!  12 (console_scroll, Entry 18; retired in Entry 20: the console driver
+//!      process scrolls its own view)       -> bad-syscall
+//!  13 map(memory, address)             -> 0                     (mem.rs)
+//!  14 note(console, ptr, len)          -> bytes: like write, to the serial
+//!                                         port only (test notes)
 //!
 //! Message registers: send/call take the four words in RSI, RDX, R10, R8
 //! and in R9 the slot of a capability to pass along (-1 for none). recv and
@@ -56,10 +58,12 @@ pub const SYS_PORT_OUT: u64 = 8;
 pub const SYS_IRQ_WAIT: u64 = 9;
 pub const SYS_IRQ_ACK: u64 = 10;
 pub const SYS_POWER: u64 = 11;
-pub const SYS_CONSOLE_SCROLL: u64 = 12;
+pub const SYS_MAP: u64 = 13;
+pub const SYS_NOTE: u64 = 14;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
-/// write, console_scroll: the slot doesn't hold the console capability.
+/// write, note: the slot doesn't hold the console capability; map: it
+/// doesn't hold a Memory capability.
 pub const ERR_NO_CAPABILITY: i64 = -2;
 pub const ERR_BAD_ADDRESS: i64 = -3;
 /// The slot doesn't hold the kind of capability this call needs, or it
@@ -74,9 +78,10 @@ pub const ERR_INTERRUPTED: i64 = -7;
 /// reply with no call to answer.
 pub const ERR_NO_REPLY: i64 = -8;
 /// An argument outside what the call accepts: a port width, an interrupt
-/// line the machine doesn't have, a power or scroll action that doesn't
-/// exist.
+/// line the machine doesn't have, a power action that doesn't exist.
 pub const ERR_BAD_ARGUMENT: i64 = -9;
+/// No frame left for a page table (map).
+pub const ERR_NO_MEMORY: i64 = -10;
 
 /// Longest write in one call; longer ones are cut (the return value says
 /// how much was written).
@@ -185,7 +190,8 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
         SYS_IRQ_WAIT => crate::irq::wait(f.rdi),
         SYS_IRQ_ACK => crate::irq::ack(f.rdi),
         SYS_POWER => sys_power(f.rdi, f.rsi),
-        SYS_CONSOLE_SCROLL => sys_console_scroll(f.rdi, f.rsi),
+        SYS_MAP => crate::mem::map(f.rdi, f.rsi),
+        SYS_NOTE => sys_note(f.rdi, f.rsi, f.rdx),
         _ => ERR_BAD_SYSCALL,
     };
     f.rax = result as u64;
@@ -208,24 +214,6 @@ fn sys_power(slot: u64, action: u64) -> i64 {
     }
 }
 
-/// console_scroll(slot, action): move the screen log's view (PageUp and
-/// PageDown, through the keyboard driver), with the Console capability in
-/// `slot`. Returns how many rows back from the newest line the view is.
-fn sys_console_scroll(slot: u64, action: u64) -> i64 {
-    if sched::current_cap(slot) != Cap::Console {
-        return ERR_NO_CAPABILITY;
-    }
-    if action > crate::SCROLL_TO_END {
-        return ERR_BAD_ARGUMENT;
-    }
-    let back = crate::screen_log_scroll(action);
-    // For test.sh, on serial only (the screen already shows it).
-    let mut note = crate::idt::Line::new();
-    note.str(b"[console] view ").dec(back as u64).str(b" rows back\n");
-    crate::serial_note(note.as_bytes());
-    back as i64
-}
-
 /// A received message goes back in the message registers (only on success:
 /// on an error they keep what the process had).
 fn with_message(f: &mut SyscallFrame, (result, msg): (i64, Message)) -> i64 {
@@ -240,28 +228,77 @@ fn with_message(f: &mut SyscallFrame, (result, msg): (i64, Message)) -> i64 {
     result
 }
 
-/// write(handle, ptr, len): print `len` bytes at `ptr` on the console, if
-/// capability slot `handle` holds the console capability.
+/// write(handle, ptr, len): print `len` bytes at `ptr` to the system log
+/// (serial, the screen), if capability slot `handle` holds the console
+/// capability.
 fn sys_write(handle: u64, ptr: u64, len: u64) -> i64 {
+    let mut buf = [0u8; MAX_WRITE as usize];
+    let len = match console_text(handle, ptr, len, &mut buf) {
+        Ok(len) => len,
+        Err(e) => return e,
+    };
+    print_from_process(&buf, len);
+    BYTES_WRITTEN.fetch_add(len as u64, Ordering::Relaxed);
+    crate::console::kick(); // show it now, not at the next tick
+    len as i64
+}
+
+/// note(handle, ptr, len): the same checks as write, but the text goes to
+/// the serial port only, as "[name note] text": how the console driver
+/// tells test.sh what it did without putting it in the log it shows.
+fn sys_note(handle: u64, ptr: u64, len: u64) -> i64 {
+    let mut buf = [0u8; MAX_WRITE as usize];
+    let len = match console_text(handle, ptr, len, &mut buf) {
+        Ok(len) => len,
+        Err(e) => return e,
+    };
+    let _console = CONSOLE.lock();
+    crate::cpu::without_interrupts(|| {
+        let mut line_start = true;
+        for &b in buf.iter().take(len) {
+            if line_start {
+                crate::serial_note(b"[");
+                crate::serial_note(sched::name(sched::current()).as_bytes());
+                crate::serial_note(b" note] ");
+                line_start = false;
+            }
+            match b {
+                b'\n' => {
+                    crate::serial_note(b"\n");
+                    line_start = true;
+                }
+                0x20..=0x7E => crate::serial_note(&[b]),
+                _ => crate::serial_note(b"."),
+            }
+        }
+        if !line_start {
+            crate::serial_note(b"\n");
+        }
+    });
+    len as i64
+}
+
+/// For write and note: the console capability in `handle`, and up to
+/// MAX_WRITE bytes at `ptr` copied into `buf`. Returns how many.
+fn console_text(handle: u64, ptr: u64, len: u64, buf: &mut [u8; MAX_WRITE as usize]) -> Result<usize, i64> {
     if sched::current_cap(handle) != Cap::Console {
-        return ERR_NO_CAPABILITY;
+        return Err(ERR_NO_CAPABILITY);
     }
     let len = len.min(MAX_WRITE);
     if len == 0 {
-        return 0;
+        return Ok(0);
     }
     if !vmm::is_user_range(ptr, len) {
-        return ERR_BAD_ADDRESS;
+        return Err(ERR_BAD_ADDRESS);
     }
 
     // Copy it out page by page, checking each page is the caller's to read.
     let space = unsafe { AddressSpace::from_root(sched::current_space()) };
-    let mut buf = [0u8; MAX_WRITE as usize];
     let mut done = 0;
     while done < len {
         let va = ptr + done;
         let Some(frame) = space.user_page(va & !0xFFF, false) else {
-            return ERR_BAD_ADDRESS;
+            return Err(ERR_BAD_ADDRESS);
         };
         let offset = va & 0xFFF;
         let n = (0x1000 - offset).min(len - done);
@@ -274,10 +311,7 @@ fn sys_write(handle: u64, ptr: u64, len: u64) -> i64 {
         }
         done += n;
     }
-
-    print_from_process(&buf, len as usize);
-    BYTES_WRITTEN.fetch_add(len, Ordering::Relaxed);
-    len as i64
+    Ok(len as usize)
 }
 
 /// Print a process's text, every line prefixed with who wrote it, so a

@@ -1,5 +1,6 @@
 // build.rs — assemble entry.asm and hand the object to the linker, and
-// assemble the user programs the kernel embeds.
+// gather the user programs the kernel embeds: NASM ones assembled here,
+// Rust ones built by build/Makefile.
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
@@ -42,5 +43,17 @@ fn main() {
             .status()
             .expect("failed to spawn nasm");
         assert!(status.success(), "nasm failed to assemble user/{program}.asm");
+    }
+
+    // User programs in Rust (../user/rust, Entry 20): build/Makefile builds
+    // them first, as flat images in FREYA_USER_BINS.
+    println!("cargo:rerun-if-env-changed=FREYA_USER_BINS");
+    let bins = env::var("FREYA_USER_BINS")
+        .expect("FREYA_USER_BINS is unset: build with make in build/, which builds the Rust user programs first");
+    for program in ["console"] {
+        let src = PathBuf::from(&bins).join(format!("{program}.bin"));
+        println!("cargo:rerun-if-changed={}", src.display());
+        std::fs::copy(&src, PathBuf::from(&out_dir).join(format!("{program}.bin")))
+            .unwrap_or_else(|e| panic!("can't copy {}: {e}", src.display()));
     }
 }

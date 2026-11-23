@@ -770,6 +770,9 @@ setup_display:
     mov es, bx
     cmp ax, 0x004F
     jne .next_mode
+%ifdef __TEST_VBE_LIES
+    call vbe_lie
+%endif
     mov ax, [VBE_MODE_INFO + 0]         ; attributes: supported (0), graphics (4), linear (7)
     and ax, 0x0091
     cmp ax, 0x0091
@@ -854,6 +857,9 @@ setup_display:
     mov es, bx
     cmp ax, 0x004F
     jne .set_failed
+%ifdef __TEST_VBE_LIES
+    call vbe_lie
+%endif
     mov bx, [vbe_best]
     or bx, 0x4000                       ; linear framebuffer
     mov ax, 0x4F02
@@ -915,6 +921,26 @@ vbe_mode       dw 0
 vbe_best       dw 0
 vbe_best_area  dd 0
 vbe_best_bpp   db 0
+
+%ifdef __TEST_VBE_LIES
+; Test build only (TEST_VBE_LIES=1, test.sh's vbe-lies case, Entry 20): a
+; video BIOS that describes modes it can't really give, to show that the
+; checks made before setting a mode work. Modes wider than 1024 pixels
+; claim lines half as long as a row of pixels; 1024-wide ones claim no
+; framebuffer. Applied to every mode information stage 2 reads.
+vbe_lie:
+    mov ax, [VBE_MODE_INFO + 18]        ; width
+    cmp ax, 1024
+    jb .true
+    ja .short_lines
+    mov dword [VBE_MODE_INFO + 40], 0   ; no framebuffer
+    ret
+.short_lines:
+    shr word [VBE_MODE_INFO + 16], 1
+    shr word [VBE_MODE_INFO + 50], 1
+.true:
+    ret
+%endif
 
 ; AX = bytes from one line to the next of the mode in VBE_MODE_INFO: the
 ; VBE 3 linear-mode field (offset 50) when there is one, else offset 16.

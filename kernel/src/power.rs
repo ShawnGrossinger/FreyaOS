@@ -61,6 +61,7 @@ fn announce(what: &[u8]) {
     crate::serial_write_str(b"[power] ");
     crate::serial_write_str(what);
     crate::serial_write_str(b"\n");
+    crate::display::reclaim(); // the kernel shows this itself (Entry 20)
     crate::vga_print(16, what, 0x0E);
 }
 
@@ -127,6 +128,7 @@ pub fn shut_down() -> ! {
             _ => crate::serial_write_str(b"[power] no ACPI soft-off information\n"),
         }
     }
+    crate::display::reclaim();
     crate::vga_print(16, b"FreyaOS has stopped. It is safe to switch off (hold the power button).", 0x0E);
     crate::serial_write_str(b"[power] stopped; safe to switch off\n");
     crate::halt();

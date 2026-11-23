@@ -27,11 +27,15 @@ ROOT=out/test
 #        sendkey names, space-separated). Afterwards "QEMU exited by
 #        itself" is logged if the machine restarted or switched off.
 #        Some names aren't keys: "screendump" saves the screen QEMU shows
-#        and logs whether its size is the mode the kernel reported, and
-#        "hold-<key>" (hold-shift, hold-ctrl) holds that key down,
-#        repeating like a real keyboard, from stage 2 until just after the
-#        keyboard driver is ready (keys after it are pressed once it has
-#        been let go).
+#        and logs whether its size is the mode the kernel reported;
+#        "screendiff" takes another and logs whether the screen changed
+#        since the last; "logsame" does the same for the log's rows below
+#        its top one; "crashdump" checks the kernel's crash screen is
+#        showing; "pause" waits a second and a half; and "hold-<key>"
+#        (hold-shift, hold-ctrl) holds that key down, repeating like a real keyboard,
+#        from stage 2 until just after the keyboard driver is ready (keys
+#        after it are pressed once it has been let go). Keys wait for
+#        "keyboard ready", or for a crash report to end.
 CASES=(
   "image||||"   # not booted: checks the disk image's layout (see check_image)
   "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;\\[display\\] VESA graphics [0-9]+x[0-9]+, 32-bit;;reads back pixel for pixel \\(128 pixels, [0-9]+ lit, 0 wrong\\); framebuffer mapped write-combining \\(PAT entry 4\\): PASS;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!;;'probe' killed by vector 14 #PF;;\\[user [0-9]+ 'ipc'\\] printed for me by the log server;;driver handled 10"
@@ -39,15 +43,15 @@ CASES=(
   "dirty-ram||128M-dirty|self-tests: [0-9]+ passed, 0 failed;;init complete"
   "boot-4G||4G|physical map at 0xffff800000000000: 4096 MiB;;init complete - boot thread done; scheduler and timer running"
   "ud2|ud2|128M|vector 6 #UD Invalid Opcode"
-  "page_fault|page_fault|128M|vector 14 #PF Page Fault;;cr2=0x0000000010000000;;page not present, read"
+  "page_fault|page_fault|128M|vector 14 #PF Page Fault;;cr2=0x0000000010000000;;page not present, read;;crash screen: red at the top||crashdump"
   "stack_overflow|stack_overflow|128M|vector 8 #DF Double Fault;;KERNEL STACK OVERFLOW;;running task: 0 'boot'"
   "task_stack_overflow|task_stack_overflow|128M|vector 8 #DF Double Fault;;TASK STACK OVERFLOW \(task [0-9]+ 'overflow-demo';;running task: [0-9]+ 'overflow-demo'"
   "smap|smap|128M|vector 14 #PF Page Fault;;cr2=0x0000000040000000;;protection violation, read, supervisor mode;;kernel touched user memory|-cpu max"
   "smep|smep|128M|vector 14 #PF Page Fault;;cr2=0x0000000040000000;;protection violation, instruction fetch, supervisor mode;;kernel touched user memory|-cpu max"
   "keyboard||128M|keyboard ready;;typed: hello World||delete end ctrl-delete alt-end ctrl-end alt-delete h e l l o spc shift-w o r l d ret"
   "scroll||128M|scrolling checked: [0-9 ]+;;typed: hi;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette||pgdn pgup pgup pgdn pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup h i ret screendump"
-  "text-mode|text-mode|128M|text mode, 80x25: built with TEXT_MODE=1;;a character put in the last cell of text mode is in VGA memory .*: PASS;;\\[console\\] view 6 rows back;;\\[console\\] view 12 rows back;;screendump matches the mode: 720x400||pgup pgup screendump"
-  "edid-1366||128M|display's own resolution 1366x768 \\(EDID\\);;VESA graphics 1280x768, 32-bit;;screendump matches the mode: 1280x768, and the colour swatch is the VGA palette|-vga none -device VGA,xres=1366,yres=768|screendump"
+  "text-mode|text-mode|128M|text mode, 80x25: built with TEXT_MODE=1;;a character put in the last cell of text mode is in VGA memory .*: PASS;;\\[console note\\] view 6 rows back;;\\[console note\\] view 12 rows back;;screendump matches the mode: 720x400||pgup pgup screendump"
+  "edid-1366||128M|display's own resolution 1366x768 \\(EDID\\);;VESA graphics 1280x768, 32-bit;;screendump matches the mode: 1280x768, and the colour swatch is the VGA palette;;the screen changed since the last screendump|-vga none -device VGA,xres=1366,yres=768|screendump pause screendiff"
   "edid-1440||128M|display's own resolution 1440x900 \\(EDID\\);;VESA graphics 1440x900, 32-bit|-vga none -device VGA,xres=1440,yres=900|"
   "no-edid||128M|display's own resolution unknown \\(no EDID: modes up to 1024x768\\);;VESA graphics 1024x768, 32-bit;;screendump matches the mode: 1024x768, and the colour swatch|-vga none -device VGA,edid=off|screendump"
   "cirrus-24bit||128M|VESA graphics 1024x768, 24-bit;;reads back pixel for pixel \\(128 pixels, [0-9]+ lit, 0 wrong\\);;screendump matches the mode: 1024x768, and the colour swatch|-vga cirrus|screendump"
@@ -60,7 +64,10 @@ CASES=(
   "use_after_unmap|use_after_unmap|128M|vector 14 #PF Page Fault;;cr2=0xffffc00000100000;;page not present, read"
   "write_read_only|write_read_only|128M|vector 14 #PF Page Fault;;protection violation, write"
   "heap_double_free|heap_double_free|128M|\[heap\] FATAL: double free"
-  "panic|panic|128M|\[kernel\] PANIC at src/main.rs:[0-9]+: FREYA_DEMO=panic"
+  "panic|panic|128M|\[kernel\] PANIC at src/main.rs:[0-9]+: FREYA_DEMO=panic;;crash screen: red at the top||crashdump"
+  "vbe-lies|vbe-lies|128M|display's own resolution 1280x800 \\(EDID\\);;VESA graphics 800x600, 32-bit;;screendump matches the mode: 800x600, and the colour swatch is the VGA palette|-vga none -device VGA,xres=1280,yres=800|screendump"
+  "kill-console|kill_console|128M|\\[demo\\] console driver killed;;the console driver ended: the kernel draws the screen again;;typed: hi;;no console notes after it ended;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette;;the screen changed since the last screendump||screendump pgup h i ret pause screendiff"
+  "log-flood|log_flood|128M|flood 600;;tick 1;;flood checked: ;;screendump matches the mode: 1280x800, and the colour swatch is the VGA palette;;the log below the bar did not change||pgup screendump pause logsame pgdn pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup"
 )
 COMMON="self-tests: [0-9]+ passed, 0 failed"
 
@@ -104,6 +111,11 @@ boot() { # boot <image> <ram> <serial log> <keys> [extra QEMU arguments...]
   fi
 
   : > "$log"
+  # What the harness itself finds while QEMU runs goes here, and into the
+  # serial log only once QEMU has stopped: QEMU writes the log at its own
+  # offset, so a line appended meanwhile could be overwritten (Entry 20).
+  local notes=${log%/*}/notes.log
+  : > "$notes"
   "$QEMU" -drive "format=raw,file=$img,if=ide,media=disk,index=0" "${memargs[@]}" \
           -display none "${monitor[@]}" "${qmpargs[@]}" -serial "file:$log" -no-reboot \
           -d int,cpu_reset -D "${log%/*}/qemu.log" "$@" </dev/null >/dev/null 2>&1 &
@@ -119,7 +131,7 @@ boot() { # boot <image> <ram> <serial log> <keys> [extra QEMU arguments...]
     sleep 0.2
     ticks=$((ticks + 1))
     if [ "$ticks" -ge $((TIMEOUT * 5)) ]; then
-      echo "[test.sh] TIMEOUT: no terminal line after ${TIMEOUT}s" >> "$log"
+      echo "[test.sh] TIMEOUT: no terminal line after ${TIMEOUT}s" >> "$notes"
       break
     fi
   done
@@ -128,20 +140,35 @@ boot() { # boot <image> <ram> <serial log> <keys> [extra QEMU arguments...]
   fi
   if [ -n "$keys" ] && kill -0 "$pid" 2>/dev/null; then
     local t k
-    for t in $(seq 1 50); do grep -q "keyboard ready" "$log" && break; sleep 0.2; done
+    for t in $(seq 1 50); do grep -qE "keyboard ready|\[EXCEPTION\] halted|PANIC" "$log" && break; sleep 0.2; done
     for k in $keys; do
       kill -0 "$pid" 2>/dev/null || break   # a key restarted or switched it off
       case $k in
         hold-*)                   # held since stage 2: wait until it's let go
           wait "$holder" 2>/dev/null; holder=
           continue ;;
+        pause) sleep 1.5; continue ;;
+        screendiff)
+          take_screendump "${log%/*}/screen2.ppm" "$mon.in"
+          if [ ! -s "${log%/*}/screen.ppm" ] || [ ! -s "${log%/*}/screen2.ppm" ]; then
+            echo "[test.sh] screendiff: a screendump is missing" >> "$notes"
+          elif cmp -s "${log%/*}/screen.ppm" "${log%/*}/screen2.ppm"; then
+            echo "[test.sh] the screen did not change since the last screendump" >> "$notes"
+          else
+            echo "[test.sh] the screen changed since the last screendump" >> "$notes"
+          fi
+          continue ;;
+        crashdump)
+          take_screendump "${log%/*}/screen.ppm" "$mon.in"
+          check_crash_screen "${log%/*}/screen.ppm" "$notes"
+          continue ;;
+        logsame)
+          take_screendump "${log%/*}/screen2.ppm" "$mon.in"
+          check_log_same "${log%/*}/screen.ppm" "${log%/*}/screen2.ppm" "$notes"
+          continue ;;
         screendump)
-          sleep 0.5               # let the screen settle
-          rm -f "${log%/*}/screen.ppm"
-          timeout 2 sh -c 'echo "screendump $1" > "$2"' _ "${log%/*}/screen.ppm" "$mon.in"
-          for t in $(seq 1 25); do [ -s "${log%/*}/screen.ppm" ] && break; sleep 0.2; done
-          sleep 0.3
-          check_screendump "${log%/*}/screen.ppm" "$log"
+          take_screendump "${log%/*}/screen.ppm" "$mon.in"
+          check_screendump "${log%/*}/screen.ppm" "$log" "$notes"
           continue ;;
       esac
       # Bounded: opening the pipe would block forever if QEMU had just exited.
@@ -150,10 +177,12 @@ boot() { # boot <image> <ram> <serial log> <keys> [extra QEMU arguments...]
     done
     # -no-reboot makes QEMU exit on a restart as well as on power-off.
     for t in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
-    kill -0 "$pid" 2>/dev/null || echo "[test.sh] QEMU exited by itself" >> "$log"
+    kill -0 "$pid" 2>/dev/null || echo "[test.sh] QEMU exited by itself" >> "$notes"
   fi
   kill "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
+  cat "$notes" >> "$log"
+  rm -f "$notes"
   if [ -n "$reader" ]; then kill "$reader" 2>/dev/null; wait "$reader" 2>/dev/null; fi
   if [ -n "$holder" ]; then kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null; fi
   if [ -n "$qmp_reader" ]; then kill "$qmp_reader" 2>/dev/null; wait "$qmp_reader" 2>/dev/null; fi
@@ -207,20 +236,20 @@ hold_key() { # hold_key <QEMU key name> <QMP pipe> <serial log> <QEMU pid>, in t
   exec 3>&-
 }
 
-check_screendump() { # check_screendump <ppm> <serial log>
+check_screendump() { # check_screendump <ppm> <serial log> <notes file>
   # QEMU's picture of the screen is as big as the mode the kernel says
   # stage 2 set: text mode shows as 720x400 (80x25 cells of 9x16 pixels).
-  local ppm=$1 log=$2 want got
+  local ppm=$1 log=$2 out=$3 want got
   want=$(sed -n 's/.*\[display\] VESA graphics \([0-9]*x[0-9]*\),.*/\1/p' "$log" | head -1)
   [ -z "$want" ] && grep -q '\[display\] text mode, 80x25' "$log" && want=720x400
   # A PPM starts "P6", then width and height, as text.
   got=$(head -c 40 "$ppm" 2>/dev/null | tr '\n' ' ' | awk '$1 == "P6" { print $2 "x" $3 }')
   if [ -z "$got" ] || [ "$got" != "$want" ]; then
-    echo "[test.sh] screendump is '${got:-missing}', the kernel reported '${want:-nothing}'" >> "$log"
+    echo "[test.sh] screendump is '${got:-missing}', the kernel reported '${want:-nothing}'" >> "$out"
     return
   fi
   if [ "$want" = 720x400 ]; then
-    echo "[test.sh] screendump matches the mode: $got" >> "$log"
+    echo "[test.sh] screendump matches the mode: $got" >> "$out"
     return
   fi
   # Graphics: the 16-colour swatch on row 2 (from 36 cells before the
@@ -239,10 +268,108 @@ check_screendump() { # check_screendump <ppm> <serial log>
     [ "$seen" = "${palette[$i]}" ] || bad="${bad:+$bad, }colour $i is $seen, not ${palette[$i]}"
   done
   if [ -z "$bad" ]; then
-    echo "[test.sh] screendump matches the mode: $got, and the colour swatch is the VGA palette" >> "$log"
+    echo "[test.sh] screendump matches the mode: $got, and the colour swatch is the VGA palette" >> "$out"
   else
-    echo "[test.sh] screendump is $got, but $bad" >> "$log"
+    echo "[test.sh] screendump is $got, but $bad" >> "$out"
   fi
+}
+
+take_screendump() { # take_screendump <ppm> <monitor pipe>: QEMU's picture of the screen
+  sleep 0.5                 # let the screen settle
+  rm -f "$1"
+  # Bounded: opening the pipe would block forever if QEMU had just exited.
+  timeout 2 sh -c 'echo "screendump $1" > "$2"' _ "$1" "$2"
+  local t
+  for t in $(seq 1 25); do [ -s "$1" ] && break; sleep 0.2; done
+  sleep 0.3                 # QEMU may still be writing it
+}
+
+check_log_same() { # check_log_same <earlier ppm> <later ppm> <notes file>
+  # The log's rows below its top one (where the scrolled-back bar says how
+  # far back the view is), in two screendumps taken while scrolled back:
+  # the same pixels mean new lines left the view where it was (Entry 20).
+  local a=$1 b=$2 out=$3 w hdr off
+  w=$(head -c 40 "$a" 2>/dev/null | tr '\n' ' ' | awk '$1 == "P6" { print $2 }')
+  if [ -z "$w" ] || [ ! -s "$b" ]; then
+    echo "[test.sh] logsame: a screendump is missing" >> "$out"
+    return
+  fi
+  hdr=$(head -c 40 "$a" | head -3 | wc -c)
+  off=$((hdr + 19 * 16 * w * 3))   # row 19: the log starts at row 18
+  if cmp -s -i "$off:$off" "$a" "$b"; then
+    echo "[test.sh] the log below the bar did not change" >> "$out"
+  else
+    echo "[test.sh] the log below the bar changed" >> "$out"
+  fi
+}
+
+check_crash_screen() { # check_crash_screen <ppm> <notes file>
+  # The crash screen's top rows are white on red. On a screen the console
+  # driver had drawn, that shows the kernel took it back (Entry 20). The
+  # pixel looked at is in row 0, two cells from the right edge: background.
+  local ppm=$1 out=$2 w hdr off seen
+  w=$(head -c 40 "$ppm" 2>/dev/null | tr '\n' ' ' | awk '$1 == "P6" { print $2 }')
+  if [ -z "$w" ]; then
+    echo "[test.sh] crash screen: no screendump" >> "$out"
+    return
+  fi
+  hdr=$(head -c 40 "$ppm" | head -3 | wc -c)
+  off=$((hdr + (4 * w + (w / 8 - 2) * 8 + 4) * 3))
+  seen=$(od -An -v -t x1 -j "$off" -N 3 "$ppm" | tr -d ' \n')
+  if [ "$seen" = aa0000 ]; then
+    echo "[test.sh] crash screen: red at the top" >> "$out"
+  else
+    echo "[test.sh] crash screen: the top is $seen, not red" >> "$out"
+  fi
+}
+
+check_flood() { # check_flood <serial log>: the log-flood case's key presses
+  # The console driver's notes, after each key: view B rows back of K
+  # kept, and the view's top row, its bottom row and the newest finished
+  # row (the first 56 characters of each). The demo printed 600 lines
+  # ("flood N"), then one every quarter second ("tick N").
+  #   1st (PageUp): one page back, B1 rows; its top row T1.
+  #   3rd (PageDown, PageUp, after a pause in which ticks arrived): back
+  #       further than B1, because the view stayed on the same rows while
+  #       new ones came in below; its top row still T1.
+  #   last (17 more PageUps): at the oldest of 400 rows kept: B = 400 less
+  #       the log's height (B1 + 1), the last two the same; flood lines.
+  #   every note: its rows are where B says. From "flood 1" on, each line
+  #       on serial is one row of the log (notes and test.sh's lines
+  #       aside), so a row's place is its line's place there; the newest
+  #       row is 1 row old, the bottom row B, the top row B + B1.
+  local why
+  why=$(awk '
+      function text(s) { s = substr(s, 1, 56); sub(/ +$/, "", s); return s }
+      /^\[console note\] view / {
+        s = substr($0, 21)
+        i = index(s, " rows back of ");        b[++n] = substr(s, 1, i - 1) + 0; s = substr(s, i + 14)
+        i = index(s, " kept, top row: ");      k[n] = substr(s, 1, i - 1) + 0;   s = substr(s, i + 16)
+        i = index(s, ", bottom row: ");        t[n] = substr(s, 1, i - 1);       s = substr(s, i + 14)
+        i = index(s, ", newest row: ");        u[n] = substr(s, 1, i - 1);       w[n] = substr(s, i + 14)
+        next
+      }
+      /^\[console note\]|^\[test\.sh\]/ { next }
+      $0 == "flood 1" && !row { row = 1 }
+      row { line = text($0); if (!(line in at)) at[line] = row; row++ }
+      END {
+        if (n != 20) { print "expected 20 notes, saw " n; exit }
+        if (b[3] <= b[1] || t[3] != t[1]) { print "new lines while scrolled back: first " b[1] " back, top \"" t[1] "\"; then " b[3] ", top \"" t[3] "\""; exit }
+        if (k[20] != 400) { print "kept " k[20] " rows, not 400"; exit }
+        if (b[20] != 400 - (b[1] + 1) || b[19] != b[20]) { print "oldest row: " b[19] ", " b[20] " back, not " 400 - (b[1] + 1); exit }
+        if (t[20] !~ /^flood [0-9]+$/ || u[20] !~ /^flood [0-9]+$/) { print "top and bottom at the oldest: \"" t[20] "\", \"" u[20] "\""; exit }
+        for (i = 1; i <= n; i++) {
+          if (!(w[i] in at)) { print "note " i ": newest row \"" w[i] "\" is not a line on serial"; exit }
+          newest = at[w[i]] + 1                # the row in progress: 0 rows old
+          if (!(t[i] in at) || at[t[i]] != newest - b[i] - b[1]) { print "note " i ": " b[i] " back from \"" w[i] "\", but the top row is \"" t[i] "\""; exit }
+          if (b[i] > 0 && (!(u[i] in at) || at[u[i]] != newest - b[i])) { print "note " i ": " b[i] " back from \"" w[i] "\", but the bottom row is \"" u[i] "\""; exit }
+        }
+        print "ok " b[1] " " b[3] " " b[20] " " t[20] " to " u[20] ", every row in place"
+      }' "$1")
+  case $why in
+    ok*) echo "[test.sh] flood checked: ${why#ok }" >> "$1" ;;
+    *)   echo "[test.sh] flood wrong: ${why:-no notes}" >> "$1" ;;
+  esac
 }
 
 check_scroll() { # check_scroll <serial log>: the scroll case's key presses
@@ -252,7 +379,7 @@ check_scroll() { # check_scroll <serial log>: the scroll case's key presses
   # typed "hi" goes back to the newest line before printing it.
   # (Only notes after the keyboard driver started: a self-test scrolls too.)
   local views
-  views=$(sed -n '/keyboard ready/,$ s/^\[console\] view \([0-9]*\) rows back$/\1/p' "$1" | tr '\n' ' ')
+  views=$(sed -n '/keyboard ready/,$ s/^\[console note\] view \([0-9]*\) rows back.*/\1/p' "$1" | tr '\n' ' ')
   local why
   why=$(echo "$views" | awk '{
       if (NF != 21) { print "expected 21 scroll notes, saw " NF; exit }
@@ -311,6 +438,8 @@ for entry in "${CASES[@]}"; do
   [ "$demo" = bios-if-on ] && build=(FREYA_DEMO= BIOS_LEAVES_IF_ON=1)
   # "text-mode" builds stage2 to keep the BIOS's text mode (Entry 18).
   [ "$demo" = text-mode ] && build=(FREYA_DEMO= TEXT_MODE=1)
+  # "vbe-lies": a stage2 that believes a lying video BIOS (Entry 20).
+  [ "$demo" = vbe-lies ] && build=(FREYA_DEMO= TEST_VBE_LIES=1)
   if ! make -s OUTDIR="$dir" "${build[@]}" all > "$dir/build.log" 2>&1; then
     printf '\r  FAIL  %-19s build failed (see %s)\n' "$name" "$dir/build.log"
     tail -5 "$dir/build.log" | sed 's/^/          /'
@@ -330,6 +459,10 @@ for entry in "${CASES[@]}"; do
   # shellcheck disable=SC2086  # extra is a list of separate arguments
   boot "$dir/freya-os.img" "$mem" "$dir/serial.log" "$keys" $extra
   [ "$name" = scroll ] && check_scroll "$dir/serial.log"
+  [ "$name" = log-flood ] && check_flood "$dir/serial.log"
+  if [ "$name" = kill-console ] && [ -z "$(sed -n '/console driver killed/,$ p' "$dir/serial.log" | grep '^\[console note\] view')" ]; then
+    echo "[test.sh] no console notes after it ended" >> "$dir/serial.log"
+  fi
 
   missing=()
   # Split on ";;" exactly (IFS would split on every single ";").
@@ -338,10 +471,12 @@ for entry in "${CASES[@]}"; do
     [ -z "$p" ] && continue
     grep -qE -- "$p" "$dir/serial.log" || missing+=("$p")
   done
-  failed_lines=$(grep -E ': FAIL$' "$dir/serial.log")
+  # The console driver's notes quote rows of the log, so neither check
+  # below looks at them (Entry 20).
+  failed_lines=$(grep -vE '^\[console note\] ' "$dir/serial.log" | grep -E ': FAIL$')
   # A process's line starting in the middle of another line means two
   # writers were interleaved (Entry 17). Every case checks for it.
-  interleaved=$(grep -nE '.\[user [0-9]+ ' "$dir/serial.log" | head -2)
+  interleaved=$(grep -nE '.\[user [0-9]+ ' "$dir/serial.log" | grep -vE '^[0-9]+:\[console note\] ' | head -2)
 
   if [ "${#missing[@]}" -eq 0 ] && [ -z "$failed_lines" ] && [ -z "$interleaved" ]; then
     summary=$(grep -oE "$COMMON" "$dir/serial.log" | head -1)

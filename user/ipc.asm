@@ -35,6 +35,7 @@ table:
     dq sender                   ; 10: one plain send; exit(result)
     dq collector                ; 11: receive `value` messages; exit(their badges, in order)
     dq patient_server           ; 12: take a call, wait for word on slot 2, then answer
+    dq signalled                ; 13: receive two signals; exit(their bits)
 table_end:
 
 ; --- 0: echo server ---------------------------------------------------------
@@ -297,6 +298,27 @@ patient_server:
     mov r9, NO_CAP
     syscall
     jmp exit_rax                ; ERR_PEER_GONE if the caller is gone
+
+; --- 13: signalled (Entry 20) ------------------------------------------------
+; Two receives on slot 1, both of which must be signals from the kernel
+; (badge -1); exits with the first one's bits | the second one's << 8.
+signalled:
+    call .one
+    mov r12, rsi
+    call .one
+    shl rsi, 8
+    or r12, rsi
+    mov rdi, r12
+    jmp exit
+.one:
+    mov eax, SYS_RECV
+    mov edi, ENDPOINT
+    syscall
+    test rax, rax
+    jnz exit_rax
+    cmp rdi, -1
+    jne bad
+    ret
 
 bad_mode:
 bad:

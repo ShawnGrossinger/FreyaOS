@@ -9,6 +9,7 @@ mod apic;
 mod acpi;
 mod boot;
 mod cap;
+mod console;
 mod cpu;
 mod disk_io;
 mod display;
@@ -17,6 +18,8 @@ mod heap;
 mod idt;
 mod ipc;
 mod irq;
+mod log;
+mod mem;
 mod paging;
 mod pic;
 mod pmm;
@@ -90,9 +93,14 @@ fn serial_init() {
     }
 }
 
-/// Every byte of output goes to the screen log (rows 18-24) and, if there
-/// is one, to COM1.
+/// Every byte of output goes to the system log (log.rs, which the console
+/// driver shows), to the kernel's own screen log, and, if there is one, to
+/// COM1.
 fn serial_write_byte(b: u8) {
+    if b != b'\r' {
+        log::push(b);
+        console::notify(console::SIGNAL_LOG);
+    }
     screen_log_byte(b);
     uart_byte(b);
 }
@@ -118,17 +126,21 @@ fn uart_byte(b: u8) {
 // ------------------------------------------------------------------
 //
 // Real hardware like the T430 has no serial port, so everything printed
-// is also kept here, from row 18 to the bottom of the screen: 7 rows in
-// text mode, 30 at 1024x768 (Entry 18). Long lines wrap at the screen's
-// width. The last HISTORY rows are kept, and PageUp/PageDown (through the
-// keyboard driver and system call 12) scroll back through them.
+// is also shown from row 18 to the bottom of the screen: 7 rows in text
+// mode, 32 at 1280x800. Long lines wrap at the screen's width.
+//
+// Since Entry 20 this is the kernel's own copy, for the boot screen and
+// for when it takes the screen back (a crash, a panic, power, the console
+// driver ending): every byte also goes to the system log (log.rs), from
+// which the console driver keeps 400 rows of scrollback and draws the
+// screen the rest of the time. The kernel's copy only needs a screenful.
 // The line being printed is also kept whole, so a failing self-test can
 // be repeated after the summary, where it stays on screen.
 
-const LOG_TOP: usize = 18;
+const LOG_TOP: usize = display::PANEL_ROWS;
 const LOG_ATTR: u8 = 0x07;
 const LINE_MAX: usize = 160;
-const HISTORY: usize = 400;
+const HISTORY: usize = display::MAX_ROWS;
 /// Rows and width of the crash screen's "before it happened" block.
 const SNAPSHOT_ROWS: usize = 7;
 const SNAPSHOT_COLS: usize = 160;
@@ -141,8 +153,6 @@ struct ScreenLog {
     /// Rows started since boot (the first row counts as 1).
     total: usize,
     col: usize,
-    /// Rows scrolled back from the end; 0 = following new output.
-    back: usize,
     line: [u8; LINE_MAX],
     line_len: usize,
 }
@@ -152,7 +162,6 @@ static mut SCREEN_LOG: ScreenLog = ScreenLog {
     newest: 0,
     total: 1,
     col: 0,
-    back: 0,
     line: [0; LINE_MAX],
     line_len: 0,
 };
@@ -175,9 +184,7 @@ fn screen_log_byte(b: u8) {
                     screen_log_new_row(log); // wrap
                 }
                 log.history[log.newest][log.col] = b;
-                if log.back == 0 {
-                    display::put(LOG_TOP + log_rows() - 1, log.col, b, LOG_ATTR);
-                }
+                display::put(LOG_TOP + log_rows() - 1, log.col, b, LOG_ATTR);
                 log.col += 1;
                 if let Some(slot) = log.line.get_mut(log.line_len) {
                     *slot = b;
@@ -193,16 +200,7 @@ fn screen_log_new_row(log: &mut ScreenLog) {
     log.history[log.newest] = [b' '; display::MAX_COLS];
     log.total += 1;
     log.col = 0;
-    if log.back > 0 {
-        // Scrolled back: keep showing the same rows.
-        log.back = (log.back + 1).min(max_back(log));
-    }
     screen_log_draw(log);
-}
-
-/// How far back the view can go: rows kept, less one screenful.
-fn max_back(log: &ScreenLog) -> usize {
-    log.total.min(HISTORY).saturating_sub(log_rows())
 }
 
 /// The log area from history. display::put skips cells that already show
@@ -212,48 +210,19 @@ fn screen_log_draw(log: &ScreenLog) {
     let cols = display::cols();
     let kept = log.total.min(HISTORY);
     for r in 0..rows {
-        // Screen row r shows the row (rows - 1 - r + back) before the newest.
-        let age = rows - 1 - r + log.back;
+        // Screen row r shows the row (rows - 1 - r) before the newest.
+        let age = rows - 1 - r;
         let row = (age < kept).then(|| &log.history[(log.newest + HISTORY - age) % HISTORY]);
         for c in 0..cols {
             let ch = row.map_or(b' ', |row| row[c]);
             display::put(LOG_TOP + r, c, ch, LOG_ATTR);
         }
     }
-    if log.back > 0 {
-        let mut note = idt::Line::new();
-        note.str(b" -- scrolled back ").dec(log.back as u64).str(b" rows: PageDown to go forward -- ");
-        // Across the whole top row, so no half-hidden line shows beside it.
-        let text = note.as_bytes();
-        for c in 0..cols {
-            display::put(LOG_TOP, c, text.get(c).copied().unwrap_or(b' '), 0x70);
-        }
-    }
 }
 
-/// What PageUp/PageDown do (system call 12, through the keyboard driver).
-pub const SCROLL_BACK: u64 = 0;
-pub const SCROLL_FORWARD: u64 = 1;
-pub const SCROLL_TO_END: u64 = 2;
-
-/// Move the log's view; returns how many rows back it now is.
-fn screen_log_scroll(action: u64) -> usize {
-    cpu::without_interrupts(|| {
-        let log = unsafe { &mut *(&raw mut SCREEN_LOG) };
-        let page = log_rows().saturating_sub(1).max(1);
-        log.back = match action {
-            SCROLL_BACK => (log.back + page).min(max_back(log)),
-            SCROLL_FORWARD => log.back.saturating_sub(page),
-            _ => 0,
-        };
-        screen_log_draw(log);
-        log.back
-    })
-}
-
-/// The last rows of the log as they are now (wherever the view is). A
-/// crash report takes this before it prints anything, so the lines that
-/// led up to the crash aren't scrolled off by the report itself.
+/// The last rows of the log as they are now. A crash report takes this
+/// before it prints anything, so the lines that led up to the crash aren't
+/// scrolled off by the report itself.
 fn screen_log_snapshot() -> Snapshot {
     cpu::without_interrupts(|| {
         let log = unsafe { &*(&raw const SCREEN_LOG) };
@@ -272,12 +241,12 @@ fn screen_log_snapshot() -> Snapshot {
 
 /// Rows 0 to 17 after a fatal error, for machines with no serial port:
 /// `lines` (white on red) from the top, then the log as it stood before
-/// the error, under a heading. The log below goes back to following new
-/// output, so it shows the end of the full report.
+/// the error, under a heading. The kernel takes the screen back from the
+/// console driver first; the log below shows the end of the full report.
 fn crash_screen(lines: &[&[u8]], before: &Snapshot) {
     const RED: u8 = 0x4F;
     const HEADING_ROW: usize = LOG_TOP - SNAPSHOT_ROWS - 1; // 10
-    screen_log_scroll(SCROLL_TO_END);
+    display::reclaim();
     for row in 0..LOG_TOP {
         vga_print(row, b"", 0x07);
     }
@@ -691,17 +660,28 @@ pub extern "C" fn rust_start() -> ! {
     let (passed, failed) = selftest::counts();
     vga_summary(15, passed, failed);
 
-    // Build-time fault demo, if one was requested (halts).
-    run_requested_demo();
-
     // The uptime line is kept current by a task of its own.
     if sched::is_enabled() && sched::spawn("clock", clock_task, 17).is_err() {
         serial_write_str(b"[kernel] could not start the clock task\n");
     }
 
+    // The console driver (Entry 20): a process that draws the screen from
+    // here on, with the framebuffer, the log and the status rows lent to it.
+    let console_ep = if user_mode_on { console::start() } else { None };
+
+    // Build-time demo, if one was requested. The fault demos halt; they run
+    // once the console driver has drawn, so their crash screens show the
+    // kernel taking the screen back (Entry 20).
+    if option_env!("FREYA_DEMO").is_some_and(|d| !d.is_empty()) && console_ep.is_some() && sched::is_enabled() {
+        sched::sleep_ticks(20);
+    }
+    run_requested_demo();
+
     // The keyboard driver: a user process with exactly the capabilities it
     // needs, including Power, so the person at the keyboard can restart or
-    // switch off cleanly.
+    // switch off cleanly, and the console driver's endpoint to ask it to
+    // scroll.
+    let console_cap = console_ep.map_or(cap::Cap::None, |ep| cap::Cap::Endpoint { ep, badge: 1, rights: cap::SEND });
     let keyboard = ioapic_ready
         && user_mode_on
         && process::spawn(
@@ -713,9 +693,13 @@ pub extern "C" fn rust_start() -> ! {
                 cap::Cap::IoPorts { base: 0x60, count: 1 },
                 cap::Cap::IoPorts { base: 0x64, count: 1 },
                 cap::Cap::Power,
+                console_cap,
             ]),
         )
         .is_ok();
+    if let Some(ep) = console_ep {
+        ipc::release_created(ep);
+    }
     if !keyboard {
         serial_write_str(b"[kernel] no keyboard driver: to switch off, hold the power button (safe: nothing is written to disk)\n");
     }
@@ -861,14 +845,59 @@ fn run_requested_demo() {
             "heap_double_free" => heap::demo_double_free(),
             // [kernel] PANIC with file and line
             "panic" => panic!("FREYA_DEMO=panic"),
+            // Not faults (Entry 20): the console driver killed, so the
+            // kernel must take the screen back and the keyboard driver
+            // must carry on without it; and the log flooded past the
+            // console's 400 rows, then a line every quarter second.
+            "kill_console" => {
+                demo_kill_console();
+                return;
+            }
+            "log_flood" => {
+                demo_log_flood();
+                return;
+            }
             _ => {
                 serial_write_str(b"[demo] unknown; known: ud2 page_fault stack_overflow \
-                                   task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free panic\n");
+                                   task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free panic \
+                                   kill_console log_flood\n");
                 return;
             }
         }
     }
     serial_write_str(b"[demo] returned without faulting\n");
+}
+
+/// Demo: kill the console driver and wait until it has ended.
+fn demo_kill_console() {
+    let Some(id) = console::task() else {
+        serial_write_str(b"[demo] no console driver to kill\n");
+        return;
+    };
+    let ended = sched::kill(id) && sched::join_timeout(id, 200).is_some();
+    serial_write_str(if ended { b"[demo] console driver killed\n" } else { b"[demo] the console driver didn't end\n" });
+}
+
+/// Demo: 600 numbered lines at once, then one every 25 ticks for ever (a
+/// task of its own).
+fn demo_log_flood() {
+    for n in 1..=600u64 {
+        let mut line = idt::Line::new();
+        line.str(b"flood ").dec(n).str(b"\n");
+        serial_write_str(line.as_bytes());
+    }
+    if sched::spawn("ticker", ticker_task, 0).is_err() {
+        serial_write_str(b"[demo] could not start the ticker\n");
+    }
+}
+
+fn ticker_task(_: u64) {
+    for n in 1.. {
+        sched::sleep_ticks(25);
+        let mut line = idt::Line::new();
+        line.str(b"tick ").dec(n).str(b"\n");
+        serial_write_str(line.as_bytes());
+    }
 }
 
 /// One status row: label followed by OK (green) or FAIL (red).

@@ -24,6 +24,21 @@
 //! One outstanding call per server: a server that receives a second call
 //! before replying to the first can no longer reply to the first (that
 //! caller waits until the server ends). seL4 has the same rule.
+//!
+//! Entry 20 adds two things the console driver needs:
+//!
+//!   - Signals: the kernel can tell an endpoint's receiver that something
+//!     happened without blocking and without a sender process. signal()
+//!     sets bits; a receiver gets them, ahead of any message, as a message
+//!     with SIGNAL_BADGE and the bits in its first word. Bits wait on the
+//!     endpoint until someone receives, and repeats merge (seL4's
+//!     notifications, bound to an endpoint). Nothing in a process can
+//!     forge one: no capability carries SIGNAL_BADGE.
+//!   - An endpoint nobody can receive from: while its creator still holds
+//!     its reference, or a capability with RECV exists, a sender may wait
+//!     for a receiver. Once neither does, nobody ever will: senders waiting
+//!     wake with ERR_PEER_GONE, and later sends get it at once. (Before, a
+//!     keyboard driver whose console had died would have waited forever.)
 
 use crate::cap::{self, Cap, GRANT, RECV, SEND};
 use crate::cpu::without_interrupts;
@@ -34,6 +49,9 @@ pub const MAX_ENDPOINTS: usize = 32;
 
 /// No capability in a message / "don't transfer one" (-1 in a register).
 pub const NO_SLOT: u64 = u64::MAX;
+
+/// The badge of a signal (no capability is ever made with it).
+pub const SIGNAL_BADGE: u64 = u64::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Message {
@@ -53,19 +71,92 @@ pub const EMPTY_MESSAGE: Message = Message { badge: 0, words: [0; 4], cap: Cap::
 /// until released). 0 = free.
 static mut REFS: [u32; MAX_ENDPOINTS] = [0; MAX_ENDPOINTS];
 
+/// Who could still receive on each endpoint: its creator (until it lets go)
+/// plus every capability to it with RECV.
+static mut RECEIVERS: [u32; MAX_ENDPOINTS] = [0; MAX_ENDPOINTS];
+
+/// Signal bits waiting on each endpoint for its next receiver.
+static mut SIGNALS: [u64; MAX_ENDPOINTS] = [0; MAX_ENDPOINTS];
+
 fn refs() -> &'static mut [u32; MAX_ENDPOINTS] {
     unsafe { &mut *(&raw mut REFS) }
 }
 
-/// A new endpoint, with one reference held by the caller (release it when
-/// done handing out capabilities to it).
+fn receivers() -> &'static mut [u32; MAX_ENDPOINTS] {
+    unsafe { &mut *(&raw mut RECEIVERS) }
+}
+
+fn signals() -> &'static mut [u64; MAX_ENDPOINTS] {
+    unsafe { &mut *(&raw mut SIGNALS) }
+}
+
+/// A new endpoint, with one reference held by the caller: let go of it
+/// with release_created when done handing out capabilities to it.
 pub fn create() -> Option<u8> {
     without_interrupts(|| {
         let r = refs();
         let ep = r.iter().position(|&n| n == 0)?;
         r[ep] = 1;
+        receivers()[ep] = 1;
+        signals()[ep] = 0;
         Some(ep as u8)
     })
+}
+
+/// The creator lets go of its reference (and so of its chance to hand out
+/// a RECV capability later).
+pub fn release_created(ep: u8) {
+    release_receiver(ep);
+    release(ep);
+}
+
+/// A capability with RECV to `ep` was stored in a table.
+pub fn retain_receiver(ep: u8) {
+    without_interrupts(|| receivers()[ep as usize % MAX_ENDPOINTS] += 1);
+}
+
+/// One fewer who could receive on `ep`. At none, nobody ever will again:
+/// every sender waiting there wakes with ERR_PEER_GONE.
+pub fn release_receiver(ep: u8) {
+    without_interrupts(|| {
+        let n = &mut receivers()[ep as usize % MAX_ENDPOINTS];
+        *n = n.saturating_sub(1);
+        if *n > 0 {
+            return;
+        }
+        for id in 0..sched::MAX_TASKS {
+            let t = sched::task(id);
+            if t.state == State::Sending(ep) {
+                t.result = ERR_PEER_GONE;
+                t.state = State::Ready;
+            }
+        }
+    });
+}
+
+/// Set signal `bits` on `ep` for its receiver: delivered at once to one
+/// waiting in recv, else kept (merged with any already waiting) for the
+/// next recv. Never blocks; any context with interrupts off or on.
+pub fn signal(ep: u8, bits: u64) {
+    without_interrupts(|| {
+        let ep_index = ep as usize % MAX_ENDPOINTS;
+        if refs()[ep_index] == 0 {
+            return;
+        }
+        let pending = signals()[ep_index] | bits;
+        match sched::oldest(|t| t.state == State::Receiving(ep)) {
+            Some(receiver) => {
+                signals()[ep_index] = 0;
+                deliver(receiver, signal_message(pending));
+                sched::task(receiver).state = State::Ready;
+            }
+            None => signals()[ep_index] = pending,
+        }
+    });
+}
+
+fn signal_message(bits: u64) -> Message {
+    Message { badge: SIGNAL_BADGE, words: [bits, 0, 0, 0], cap: Cap::None, cap_slot: NO_SLOT }
 }
 
 pub fn retain(ep: u8) {
@@ -148,6 +239,9 @@ pub fn send(slot: u64, words: [u64; 4], xfer: u64, call: bool) -> (i64, Message)
     let msg = Message { badge, words, cap, cap_slot: NO_SLOT };
 
     without_interrupts(|| unsafe {
+        if receivers()[ep as usize % MAX_ENDPOINTS] == 0 {
+            return (ERR_PEER_GONE, EMPTY_MESSAGE); // nobody can ever receive it
+        }
         let me = sched::current();
         match sched::oldest(|t| t.state == State::Receiving(ep)) {
             Some(receiver) => {
@@ -182,7 +276,10 @@ pub fn recv(slot: u64) -> (i64, Message) {
     };
     without_interrupts(|| unsafe {
         let me = sched::current();
-        if let Some(sender) = sched::oldest(|t| t.state == State::Sending(ep)) {
+        let pending = core::mem::take(&mut signals()[ep as usize % MAX_ENDPOINTS]);
+        if pending != 0 {
+            deliver(me, signal_message(pending));
+        } else if let Some(sender) = sched::oldest(|t| t.state == State::Sending(ep)) {
             let s = sched::task(sender);
             let msg = s.msg;
             if s.calling {
@@ -265,6 +362,7 @@ const RECEIVER: u64 = 9;
 const SENDER: u64 = 10;
 const COLLECTOR: u64 = 11;
 const PATIENT_SERVER: u64 = 12;
+const SIGNALLED: u64 = 13;
 
 const WAIT_TICKS: u64 = 500;
 
@@ -295,7 +393,7 @@ fn fresh() -> u8 {
 }
 
 fn done(ep: u8) {
-    release(ep);
+    release_created(ep);
 }
 
 pub fn selftest() -> bool {
@@ -433,6 +531,44 @@ pub fn selftest() -> bool {
     sched::sleep_ticks(3);
     let killed = stuck.is_some_and(sched::kill);
     ok &= check(b"ipc", b"a process blocked in recv with no sender can be killed", killed && finish(stuck) == Some(ExitStatus::Killed));
+
+    // 8b. Signals (Entry 20): one waiting receiver gets the first at once;
+    //     the next two, sent before it receives again, wait and merge.
+    let ep = fresh();
+    let waiter = start(SIGNALLED, 0, Cap::None, endpoint_cap(ep, 0, RECV));
+    let deadline = crate::apic::ticks() + 100;
+    while waiter.is_some_and(|id| !sched::blocked_in_ipc(id)) && crate::apic::ticks() < deadline {
+        sched::sleep_ticks(1);
+    }
+    signal(ep, 0x01);
+    signal(ep, 0x02);
+    signal(ep, 0x04);
+    done(ep);
+    ok &= check(
+        b"ipc",
+        b"signals: the first reaches a receiver waiting in recv; two more sent before it receives again wait and merge (0x01, then 0x06)",
+        finish(waiter) == code(0x0601),
+    );
+
+    // 8c. An endpoint nobody can receive from (Entry 20): the sender waiting
+    //     there when its creator lets go wakes with peer-gone, and a later
+    //     one gets it at once.
+    let ep = fresh();
+    let waiting = start(SENDER, 0, Cap::None, endpoint_cap(ep, 0, SEND));
+    let deadline = crate::apic::ticks() + 100;
+    while waiting.is_some_and(|id| !sched::blocked_in_ipc(id)) && crate::apic::ticks() < deadline {
+        sched::sleep_ticks(1);
+    }
+    retain(ep); // keep the endpoint itself while `later` is started
+    done(ep);
+    let later = start(SENDER, 0, Cap::None, endpoint_cap(ep, 0, SEND));
+    let (sw, sl) = (finish(waiting), finish(later));
+    release(ep);
+    ok &= check(
+        b"ipc",
+        b"an endpoint no one can receive from any more: the sender waiting there gets peer-gone, and so does the next at once",
+        sw == code(ERR_PEER_GONE) && sl == code(ERR_PEER_GONE),
+    );
 
     // 9. Everything given back: endpoints, tasks, frames.
     sched::reap();

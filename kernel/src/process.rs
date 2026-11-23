@@ -15,12 +15,19 @@
 //! call (syscall.rs). A CPU exception in ring 3 ends the process, not the
 //! kernel: idt.rs reports it and calls sched::exit_with(Fault(vector)).
 //!
-//! Programs are flat binaries assembled from user/*.asm by build.rs and
-//! built into the kernel image: there is no file system to load them from
-//! yet. Layout of every process (user/freya.inc says the same):
+//! Programs are flat binaries built into the kernel image: there is no file
+//! system to load them from yet. Most are assembled from user/*.asm by
+//! build.rs; since Entry 20 some are written in Rust (user/rust, built by
+//! build/Makefile). Layout of every process (user/freya.inc and
+//! user/rust/user.ld say the same):
 //!
 //!   0x0000_0000_4000_0000  code, read + execute (at most 1 MiB)
-//!   0x0000_0000_4010_0000  data, read + write, zeroed (USER_DATA_PAGES)
+//!   0x0000_0000_4010_0000  data, read + write, zeroed: one page for a NASM
+//!                          program; for a Rust one as many as its header
+//!                          asks (Program::data_pages), the first two being
+//!                          its start block, which spawn_with may fill
+//!   0x0000_0001_0000_0000  where memory capabilities may be mapped
+//!   to 0x0000_7F00_0000_0000  (system call map, mem.rs)
 //!   0x0000_7FFF_0000_0000  top of the stack, read + write (16 KiB below)
 
 use crate::cap::{Caps, CONSOLE_ONLY, NO_CAPS};
@@ -32,6 +39,10 @@ pub const USER_CODE_BASE: u64 = crate::vmm::USER_BASE;
 const MAX_CODE_BYTES: u64 = 0x10_0000;
 pub const USER_DATA_BASE: u64 = USER_CODE_BASE + MAX_CODE_BYTES;
 pub const USER_DATA_PAGES: u64 = 1;
+/// Most data pages a program may ask for (1 MiB).
+const MAX_DATA_PAGES: u64 = 256;
+/// The start block: the first two data pages, which the creator may fill.
+pub const START_BLOCK_BYTES: usize = 0x2000;
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_0000_0000;
 pub const USER_STACK_PAGES: u64 = 4;
 
@@ -42,6 +53,23 @@ pub const USER_STACK_PAGES: u64 = 4;
 pub struct Program {
     pub name: &'static str,
     pub image: &'static [u8],
+}
+
+impl Program {
+    /// Data pages to map from USER_DATA_BASE. A Rust program says how many
+    /// in its header ("FREYAPRG" at byte 8, then the count: user/rust/src/
+    /// lib.rs); a NASM program has none and gets USER_DATA_PAGES.
+    pub fn data_pages(&self) -> u64 {
+        match self.image.get(16..24) {
+            Some(n) if self.has_header() => u64::from_le_bytes([n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7]]),
+            _ => USER_DATA_PAGES,
+        }
+    }
+
+    /// A Rust program's header, which also means it has a start block.
+    fn has_header(&self) -> bool {
+        matches!(self.image.get(8..16), Some(magic) if magic == b"FREYAPRG")
+    }
 }
 
 /// Prints one line with the console capability in slot 0, then exits with
@@ -75,6 +103,12 @@ pub static PROBE: Program = Program {
     image: include_bytes!(concat!(env!("OUT_DIR"), "/probe.bin")),
 };
 
+/// The console driver, written in Rust (user/rust/src/bin/console.rs).
+pub static CONSOLE: Program = Program {
+    name: "console",
+    image: include_bytes!(concat!(env!("OUT_DIR"), "/console.bin")),
+};
+
 // ===========================================================================
 // Creating a process
 // ===========================================================================
@@ -88,11 +122,26 @@ extern "C" {
 /// Start `program` as a new process with argument `arg` (in RDI) and
 /// capability table `caps`. It runs when the scheduler picks it.
 pub fn spawn(program: &Program, arg: u64, caps: Caps) -> Result<TaskId, SpawnError> {
-    if program.image.len() as u64 > MAX_CODE_BYTES {
+    spawn_with(program, arg, caps, &[])
+}
+
+/// spawn, with `start_block` copied to the beginning of its data (the start
+/// block: what a program needs to know at once, such as the console's
+/// screen mode and font). At most START_BLOCK_BYTES, and only for a program
+/// with a start block (a Rust one).
+pub fn spawn_with(program: &Program, arg: u64, caps: Caps, start_block: &[u8]) -> Result<TaskId, SpawnError> {
+    let data_pages = program.data_pages();
+    let start_pages = if program.has_header() { (START_BLOCK_BYTES as u64) / PAGE_SIZE } else { 0 };
+    if program.image.len() as u64 > MAX_CODE_BYTES
+        || data_pages == 0
+        || data_pages > MAX_DATA_PAGES
+        || data_pages < start_pages
+        || start_block.len() as u64 > start_pages * PAGE_SIZE
+    {
         return Err(SpawnError::OutOfMemory);
     }
     let mut space = AddressSpace::new_user().map_err(|_| SpawnError::OutOfMemory)?;
-    if unsafe { load(&mut space, program.image) }.is_err() {
+    if unsafe { load(&mut space, program.image, data_pages, start_block) }.is_err() {
         unsafe { space.destroy() };
         return Err(SpawnError::OutOfMemory);
     }
@@ -102,10 +151,10 @@ pub fn spawn(program: &Program, arg: u64, caps: Caps) -> Result<TaskId, SpawnErr
     })
 }
 
-/// Map code (copied in), zeroed data, and a stack. Every frame mapped
-/// belongs to the address space: if this fails part-way, destroy() frees
-/// what was mapped.
-unsafe fn load(space: &mut AddressSpace, image: &[u8]) -> Result<(), ()> {
+/// Map code (copied in), data (zeroed, `start` copied to its beginning),
+/// and a stack. Every frame mapped belongs to the address space: if this
+/// fails part-way, destroy() frees what was mapped.
+unsafe fn load(space: &mut AddressSpace, image: &[u8], data_pages: u64, start: &[u8]) -> Result<(), ()> {
     let mut map_new = |va: u64, flags: PageFlags, src: &[u8]| -> Result<(), ()> {
         let frame = pmm::alloc_frame().ok_or(())? as u64; // arrives zeroed
         core::ptr::copy_nonoverlapping(src.as_ptr(), crate::paging::phys_to_virt(frame), src.len());
@@ -114,8 +163,9 @@ unsafe fn load(space: &mut AddressSpace, image: &[u8]) -> Result<(), ()> {
     for (i, chunk) in image.chunks(PAGE_SIZE as usize).enumerate() {
         map_new(USER_CODE_BASE + i as u64 * PAGE_SIZE, PageFlags::USER_CODE, chunk)?;
     }
-    for i in 0..USER_DATA_PAGES {
-        map_new(USER_DATA_BASE + i * PAGE_SIZE, PageFlags::USER_DATA, &[])?;
+    for i in 0..data_pages {
+        let chunk = start.chunks(PAGE_SIZE as usize).nth(i as usize).unwrap_or(&[]);
+        map_new(USER_DATA_BASE + i * PAGE_SIZE, PageFlags::USER_DATA, chunk)?;
     }
     for i in 1..=USER_STACK_PAGES {
         map_new(USER_STACK_TOP - i * PAGE_SIZE, PageFlags::USER_DATA, &[])?;
@@ -183,7 +233,7 @@ pub fn demo_kernel_touches_user(execute: bool) {
         return;
     }
     let Ok(mut space) = AddressSpace::new_user() else { return };
-    if unsafe { load(&mut space, HELLO.image) }.is_err() {
+    if unsafe { load(&mut space, HELLO.image, USER_DATA_PAGES, &[]) }.is_err() {
         unsafe { space.destroy() };
         return;
     }
@@ -217,7 +267,7 @@ pub fn on_return_to_user() {
 // ===========================================================================
 
 use crate::selftest::verdict;
-use crate::syscall::{ERR_BAD_ADDRESS, ERR_BAD_ARGUMENT, ERR_BAD_SYSCALL, ERR_NO_CAPABILITY};
+use crate::syscall::{ERR_BAD_ADDRESS, ERR_BAD_SYSCALL, ERR_NO_CAPABILITY};
 use crate::{serial_write_str as s, serial_write_u64 as dec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -236,7 +286,10 @@ const BAD_SYSCALL: u64 = 10;
 const SPIN: u64 = 11;
 const ISOLATE: u64 = 12;
 const MXCSR: u64 = 13;
-const CONSOLE_SCROLL: u64 = 14;
+const MAP_READ: u64 = 14;
+const MAP_WRITE: u64 = 15;
+const MAP_TWICE: u64 = 16;
+const MAP_THEN_PRINT: u64 = 17;
 
 /// Every wait is bounded: a broken kernel fails the test instead of
 /// hanging the boot.
@@ -248,6 +301,54 @@ fn started(result: Result<TaskId, SpawnError>) -> Option<TaskId> {
 }
 
 /// Run a process to completion; None if it couldn't start or didn't end.
+/// Memory capabilities: a frame of the kernel's, with a known value in it,
+/// mapped by probe processes in every way that should work and every way
+/// that shouldn't. The frame must still be the kernel's at the end: a
+/// process's address space must never free what it only borrowed.
+fn selftest_memory() -> bool {
+    use crate::cap::{table, Cap, MEM_WRITE};
+    use crate::mem::{MAP_BASE, MAP_END};
+    const PATTERN: u64 = 0x0123_4567_89AB_CDEF;
+    const WRITTEN: u64 = 0x5EED_5EED_5EED_5EED; // what probe's map_write stores
+    let Some(page) = (unsafe { pmm::alloc_frame() }) else {
+        return crate::selftest::check(b"user", b"a frame for the memory capability tests", false);
+    };
+    let page = page as u64;
+    let word = crate::paging::phys_to_virt(page) as *mut u64;
+    unsafe { word.write_volatile(PATTERN) };
+    let ro = Cap::Memory { base: page, pages: 1, flags: 0 };
+    let rw = Cap::Memory { base: page, pages: 1, flags: MEM_WRITE };
+    let at = MAP_BASE;
+
+    let read = run(&PROBE, MAP_READ | at << 8, table(&[ro]));
+    let write_ro = run(&PROBE, MAP_WRITE | at << 8, table(&[ro]));
+    let write_rw = run(&PROBE, MAP_WRITE | at << 8, table(&[rw]));
+    let written = unsafe { word.read_volatile() } == WRITTEN;
+    let print = run(&PROBE, MAP_THEN_PRINT | at << 8, table(&[ro, Cap::Console]));
+    let mut ok = crate::selftest::check(
+        b"user",
+        b"a Memory capability maps a kernel page where asked: read-only reads it and can't write it (#PF), writable writes it; write() won't print from it",
+        read == code(PATTERN as i64) && write_ro == Some(ExitStatus::Fault(14)) && write_rw == code(0) && written && print == code(ERR_BAD_ADDRESS),
+    );
+
+    let refused = |arg: u64, caps: Caps| run(&PROBE, arg, caps) == code(ERR_BAD_ADDRESS);
+    let no_cap = run(&PROBE, MAP_READ | at << 8, NO_CAPS) == code(ERR_NO_CAPABILITY);
+    let console = run(&PROBE, MAP_READ | at << 8, CONSOLE_ONLY) == code(ERR_NO_CAPABILITY);
+    let misaligned = refused(MAP_READ | (at + 8) << 8, table(&[ro]));
+    let below = refused(MAP_READ | (USER_DATA_BASE + 0x10_0000) << 8, table(&[ro]));
+    let past = refused(MAP_READ | MAP_END << 8, table(&[ro]));
+    let twice = run(&PROBE, MAP_TWICE | at << 8, table(&[ro])) == code(ERR_BAD_ADDRESS);
+    sched::reap();
+    let kept = !pmm::is_frame_free(page) && unsafe { word.read_volatile() } == WRITTEN;
+    ok &= crate::selftest::check(
+        b"user",
+        b"map refused with no capability or the console's, misaligned, below or past the window, or over a mapping; the page is still the kernel's after them all",
+        no_cap && console && misaligned && below && past && twice && kept,
+    );
+    unsafe { pmm::free_frame(page as usize) };
+    ok
+}
+
 fn run(program: &Program, arg: u64, caps: Caps) -> Option<ExitStatus> {
     let id = started(spawn(program, arg, caps))?;
     sched::join_timeout(id, WAIT_TICKS)
@@ -328,25 +429,8 @@ pub fn selftest() -> bool {
         refused == code(ERR_NO_CAPABILITY) && bytes_now == bytes_after,
     );
 
-    // 3b. Scrolling the screen's log takes the console capability too, and
-    //     only the three actions exist. With it, "to the newest line" works
-    //     (the view is there already during boot, so 0 rows back).
-    let scroll_none = run(&PROBE, CONSOLE_SCROLL | crate::SCROLL_TO_END << 8, NO_CAPS);
-    let scroll_ports = run(
-        &PROBE,
-        CONSOLE_SCROLL | crate::SCROLL_TO_END << 8,
-        crate::cap::table(&[crate::cap::Cap::IoPorts { base: 0x70, count: 2 }]),
-    );
-    let scroll_bad = run(&PROBE, CONSOLE_SCROLL | 3 << 8, CONSOLE_ONLY);
-    let scroll_end = run(&PROBE, CONSOLE_SCROLL | crate::SCROLL_TO_END << 8, CONSOLE_ONLY);
-    ok &= crate::selftest::check(
-        b"user",
-        b"console_scroll with no capability or a port capability: refused; an action that doesn't exist: bad argument; to the newest line with the console: 0 rows back",
-        scroll_none == code(ERR_NO_CAPABILITY)
-            && scroll_ports == code(ERR_NO_CAPABILITY)
-            && scroll_bad == code(ERR_BAD_ARGUMENT)
-            && scroll_end == code(0),
-    );
+    // 3b. Memory capabilities (Entry 20): a page of the kernel's, lent.
+    ok &= selftest_memory();
 
     // 4. Pointers are checked.
     let kernel_ptr = run(&PROBE, WRITE_KERNEL_POINTER, CONSOLE_ONLY);

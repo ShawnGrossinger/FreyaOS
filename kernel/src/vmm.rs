@@ -27,7 +27,9 @@
 //! Mapping does not transfer ownership in the kernel's address space:
 //! `unmap` hands back the physical address and the caller decides what
 //! happens to that frame. A user address space is different: it owns the
-//! frames mapped into it, and destroy() frees them with it.
+//! frames mapped into it, and destroy() frees them with it, except pages
+//! marked BORROWED (Entry 20): memory a Memory capability lets a process
+//! map (a framebuffer, pages the kernel shares), which is never its own.
 //!
 //! Virtual layout (kernel's view):
 //!
@@ -84,6 +86,9 @@ const CACHE_DISABLE: u64 = 1 << 4; // PCD
 /// In a 4 KiB leaf, bit 7 selects PAT entries 4-7. With PCD and PWT clear
 /// it picks entry 4, which display.rs makes write-combining (Entry 18).
 const PAT_4K: u64 = 1 << 7;
+/// A bit the CPU leaves to the OS: this leaf's frame isn't the address
+/// space's, so destroy() must not free it (a mapped Memory capability).
+const BORROWED: u64 = 1 << 9;
 
 // ===========================================================================
 // Flags
@@ -112,6 +117,23 @@ impl PageFlags {
     pub const USER_CODE: PageFlags = PageFlags(USER);
     /// Ring 3: read + write, no execute. Data and stacks.
     pub const USER_DATA: PageFlags = PageFlags(USER | WRITABLE | NO_EXECUTE);
+
+    /// Ring 3, no execute, BORROWED: what a Memory capability maps (mem.rs).
+    /// Writable only if `write`; write-combining (a framebuffer) or
+    /// uncached (device registers, VGA text memory) if asked, else
+    /// write-back (ordinary RAM the kernel shares).
+    pub const fn user_borrowed(write: bool, write_combining: bool, uncached: bool) -> PageFlags {
+        let mut bits = USER | NO_EXECUTE | BORROWED;
+        if write {
+            bits |= WRITABLE;
+        }
+        if write_combining {
+            bits |= PAT_4K;
+        } else if uncached {
+            bits |= CACHE_DISABLE | WRITE_THROUGH;
+        }
+        PageFlags(bits)
+    }
 
     fn is_user(self) -> bool {
         self.0 & USER != 0
@@ -338,7 +360,7 @@ impl AddressSpace {
                         let pt = e2 & ADDR_MASK;
                         for l in 0..ENTRIES {
                             let e1 = *table(pt).add(l);
-                            if e1 & PRESENT != 0 {
+                            if e1 & PRESENT != 0 && e1 & BORROWED == 0 {
                                 pmm::free_frame((e1 & ADDR_MASK) as usize);
                             }
                         }
@@ -356,6 +378,11 @@ impl AddressSpace {
     /// The frame behind user address `virt`, if ring 3 could read it (or
     /// write it, with `write`): present, U/S at every level, and writable
     /// if asked. This is how the kernel checks a pointer a process hands it.
+    ///
+    /// Borrowed pages (a mapped Memory capability) don't count: the kernel
+    /// copies through the physical map, which doesn't reach device memory
+    /// such as a framebuffer, so a process pointing write() at one would
+    /// fault the kernel (Entry 20).
     pub fn user_page(&self, virt: u64, write: bool) -> Option<u64> {
         if !is_user_range(virt, 1) {
             return None;
@@ -368,6 +395,9 @@ impl AddressSpace {
                     || (write && entry & WRITABLE == 0)
                     || (level < 4 && level > 1 && entry & HUGE != 0)
                 {
+                    return None;
+                }
+                if level == 1 && entry & BORROWED != 0 {
                     return None;
                 }
                 table_phys = entry & ADDR_MASK;

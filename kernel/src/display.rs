@@ -22,6 +22,14 @@
 //! then draws it all. Anything that goes wrong before that point shows on
 //! serial only, so stage 2 stays in text mode if Shift is held while it
 //! boots, or if the image was built with TEXT_MODE=1.
+//!
+//! Since Entry 20 the screen belongs to the console driver, a process,
+//! once boot is done (console.rs): hand_over() stops the kernel drawing,
+//! and the driver draws instead, from the system log (log.rs) and from the
+//! kernel's status rows, which it reads in `cells` (PANEL_ROWS of them, lent
+//! read-only). The kernel keeps `cells` up to date all the same, so that
+//! reclaim() can take the screen back and draw it whole: on a crash, a
+//! panic, a restart or switch-off, or if the console driver ends.
 
 use crate::boot::{self, DisplayInfo};
 use crate::cpu;
@@ -32,7 +40,9 @@ const TEXT_COLS: usize = 80;
 const TEXT_ROWS: usize = 25;
 const GLYPH_W: usize = 8;
 const GLYPH_H: usize = 16;
-const BLANK: u16 = 0x0700 | b' ' as u16;
+/// Rows 0 to 17: the kernel's status rows, which the console driver shows
+/// as they are (main.rs fills them); the log is below.
+pub const PANEL_ROWS: usize = 18;
 
 /// The CGA/VGA palette the attribute bytes index (0-7 dim, 8-15 bright).
 const PALETTE: [(u8, u8, u8); 16] = [
@@ -63,7 +73,8 @@ struct Screen {
     /// Some once the framebuffer is mapped.
     fb: Option<Framebuffer>,
     write_combining: bool,
-    cells: [[u16; MAX_COLS]; MAX_ROWS],
+    /// The console driver draws the screen; the kernel only keeps `cells`.
+    console_draws: bool,
     drawn: [[u16; MAX_COLS]; MAX_ROWS],
 }
 
@@ -74,9 +85,22 @@ static mut SCREEN: Screen = Screen {
     info: None,
     fb: None,
     write_combining: false,
-    cells: [[BLANK; MAX_COLS]; MAX_ROWS],
+    console_draws: false,
     drawn: [[0; MAX_COLS]; MAX_ROWS],
 };
+
+/// What should be on screen, row by row (MAX_COLS cells a row, whatever the
+/// mode). Page-aligned and a whole number of pages: its first pages, the
+/// status rows, are lent to the console driver read-only, and lend nothing
+/// else. Blank from init() on.
+#[repr(C, align(4096))]
+struct Cells([[u16; MAX_COLS]; MAX_ROWS]);
+
+static mut CELLS: Cells = Cells([[0; MAX_COLS]; MAX_ROWS]);
+
+fn cells() -> &'static mut [[u16; MAX_COLS]; MAX_ROWS] {
+    unsafe { &mut (*(&raw mut CELLS)).0 }
+}
 
 /// The VGA ROM's 8x16 font, copied from where stage 2 left it.
 static mut FONT: [u8; 256 * GLYPH_H] = [0; 256 * GLYPH_H];
@@ -142,7 +166,14 @@ pub fn put(row: usize, col: usize, ch: u8, attr: u8) {
             return;
         }
         let value = (attr as u16) << 8 | ch as u16;
-        s.cells[row][col] = value;
+        let cell = &mut cells()[row][col];
+        if row < PANEL_ROWS && *cell != value {
+            crate::console::notify(crate::console::SIGNAL_PANEL);
+        }
+        *cell = value;
+        if s.console_draws {
+            return;
+        }
         if !s.graphics {
             let cell = (0xB8000 + (row * TEXT_COLS + col) * 2) as *mut u16;
             unsafe { cell.write_volatile(value) };
@@ -271,7 +302,7 @@ pub unsafe fn attach() -> Result<(), &'static [u8]> {
     cpu::without_interrupts(|| {
         for row in 0..s.rows {
             for col in 0..s.cols {
-                let value = s.cells[row][col];
+                let value = cells()[row][col];
                 draw_cell(&fb, row, col, value);
                 s.drawn[row][col] = value;
             }
@@ -279,6 +310,93 @@ pub unsafe fn attach() -> Result<(), &'static [u8]> {
         s.fb = Some(fb);
     });
     Ok(())
+}
+
+// ===========================================================================
+// Handing the screen to the console driver, and taking it back (Entry 20)
+// ===========================================================================
+
+/// The console driver draws from now on.
+pub fn hand_over() {
+    cpu::without_interrupts(|| screen().console_draws = true);
+}
+
+/// The kernel draws again, starting with the whole screen: whatever the
+/// console driver left there is overwritten with `cells`.
+pub fn reclaim() {
+    cpu::without_interrupts(|| {
+        let s = screen();
+        if !s.console_draws {
+            return;
+        }
+        s.console_draws = false;
+        for row in 0..s.rows {
+            for col in 0..s.cols {
+                let value = cells()[row][col];
+                if !s.graphics {
+                    let cell = (0xB8000 + (row * TEXT_COLS + col) * 2) as *mut u16;
+                    unsafe { cell.write_volatile(value) };
+                } else if let Some(fb) = s.fb {
+                    unsafe { draw_cell(&fb, row, col, value) };
+                    s.drawn[row][col] = value;
+                }
+            }
+        }
+    });
+}
+
+/// A Memory capability for the screen: the framebuffer (write-combining if
+/// the kernel's own mapping is) or VGA text memory (uncached, one page).
+/// None if graphics mode never got a framebuffer mapped.
+pub fn screen_memory() -> Option<crate::cap::Cap> {
+    use crate::cap::{Cap, MEM_UNCACHED, MEM_WRITE, MEM_WRITE_COMBINING};
+    let s = screen();
+    if !s.graphics {
+        return Some(Cap::Memory { base: 0xB8000, pages: 1, flags: MEM_WRITE | MEM_UNCACHED });
+    }
+    let fb = s.fb?;
+    let pages = ((fb.pitch * fb.height) as u64).div_ceil(4096) as u32;
+    let caching = if s.write_combining { MEM_WRITE_COMBINING } else { MEM_UNCACHED };
+    Some(Cap::Memory { base: fb.phys, pages, flags: MEM_WRITE | caching })
+}
+
+/// A read-only Memory capability for the status rows in `cells`.
+pub fn panel_memory() -> crate::cap::Cap {
+    let bytes = (PANEL_ROWS * MAX_COLS * 2) as u64;
+    crate::cap::Cap::Memory { base: (&raw const CELLS) as u64, pages: bytes.div_ceil(4096) as u32, flags: 0 }
+}
+
+/// What the console driver needs to know to draw (console.rs puts it in
+/// its start block).
+pub struct Geometry {
+    pub graphics: bool,
+    pub cols: u32,
+    pub rows: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub bytes_per_pixel: u32,
+    pub colours: [u32; 16],
+}
+
+pub fn geometry() -> Geometry {
+    let s = screen();
+    let fb = s.fb.filter(|_| s.graphics);
+    Geometry {
+        graphics: fb.is_some(),
+        cols: s.cols as u32,
+        rows: s.rows as u32,
+        width: fb.map_or(0, |fb| fb.width as u32),
+        height: fb.map_or(0, |fb| fb.height as u32),
+        pitch: fb.map_or(0, |fb| fb.pitch as u32),
+        bytes_per_pixel: fb.map_or(0, |fb| fb.bytes_per_pixel as u32),
+        colours: fb.map_or([0; 16], |fb| fb.colours),
+    }
+}
+
+/// The ROM font the kernel draws with (256 glyphs of 16 bytes).
+pub fn font() -> &'static [u8; 256 * GLYPH_H] {
+    unsafe { &*(&raw const FONT) }
 }
 
 /// For the boot log: what stage 2 chose, and why.
@@ -417,7 +535,7 @@ pub fn selftest() -> bool {
         (true, None) => return true,
     };
     let (row, col) = (s.rows - 1, s.cols - 1);
-    let saved = s.cells[row][col];
+    let saved = cells()[row][col];
     put(row, col, b'F', 0x1E); // yellow on blue
     unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
 
@@ -490,7 +608,7 @@ fn selftest_text() -> bool {
     use crate::serial_write_str as w;
     let s = screen();
     let (row, col) = (s.rows - 1, s.cols - 1);
-    let saved = s.cells[row][col];
+    let saved = cells()[row][col];
     let at = 0xB8000 + (row * TEXT_COLS + col) * 2;
     put(row, col, b'F', 0x1E);
     let seen = unsafe { (at as *const u16).read_volatile() };

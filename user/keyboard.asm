@@ -2,11 +2,13 @@
 ; keyboard.asm — the PS/2 keyboard driver, as a user process.
 ;
 ; Capabilities it is given (and all it can touch):
-;   slot 0  Console        to print what is typed and scroll the log
+;   slot 0  Console        to print what is typed
 ;   slot 1  Irq line 1     the keyboard interrupt
 ;   slot 2  IoPorts 0x60   the controller's data port
 ;   slot 3  IoPorts 0x64   the controller's status port
 ;   slot 4  Power          to restart or switch off
+;   slot 5  Endpoint       the console driver's, to send: PageUp and PageDown
+;                          are calls to it (Entry 20; before, a system call)
 ;
 ; The firmware has already set the controller up (keyboard on, interrupt
 ; on, scancode set 1 through translation), as every PC BIOS does, so this
@@ -36,6 +38,7 @@ KEYBOARD_IRQ equ 1              ; capability slots
 DATA_CAP     equ 2
 STATUS_CAP   equ 3
 POWER        equ 4
+CONSOLE_EP   equ 5
 
 DATA_PORT    equ 0x60
 STATUS_PORT  equ 0x64
@@ -120,6 +123,20 @@ wait_for_key:
     mov edi, KEYBOARD_IRQ
     syscall
     jmp wait_for_key
+
+; --- console_scroll: ESI = action. A call to the console driver; if there
+; is none (it ended, or never started) the call fails at once with
+; peer-gone (ipc.rs) and nothing happens. Changes RDI, RSI, RDX, R8-R10.
+console_scroll:
+    mov edx, esi                ; words: the request, then the action
+    mov esi, CONSOLE_SCROLL
+    xor r10d, r10d
+    xor r8d, r8d
+    mov r9, NO_CAP
+    mov eax, SYS_CALL
+    mov edi, CONSOLE_EP
+    syscall
+    ret
 
 ; --- port access (each a system call through a port capability) ---------
 read_status:
@@ -231,10 +248,8 @@ handle_scancode:
 .enter:
     test r14d, r14d
     jz .handled
-    mov eax, SYS_CONSOLE_SCROLL ; back to the newest line, where this lands
-    mov edi, CONSOLE
-    mov esi, SCROLL_TO_END
-    syscall
+    mov esi, SCROLL_TO_END      ; back to the newest line, where this lands
+    call console_scroll
     mov eax, SYS_WRITE
     mov edi, CONSOLE
     mov rsi, LINE
@@ -245,13 +260,11 @@ handle_scancode:
 
 .page_up:
     mov esi, SCROLL_BACK
-    jmp .scroll
+    call console_scroll
+    jmp .handled
 .page_down:
     mov esi, SCROLL_FORWARD
-.scroll:
-    mov eax, SYS_CONSOLE_SCROLL
-    mov edi, CONSOLE
-    syscall
+    call console_scroll
     jmp .handled
 
 .restart:

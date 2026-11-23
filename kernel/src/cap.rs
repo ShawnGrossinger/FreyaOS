@@ -19,6 +19,11 @@
 //!     a user-space driver needs to talk to its device.
 //!   - Irq: may wait for (and acknowledge) one interrupt line.
 //!   - Power: may restart or switch off the machine.
+//!   - Memory: may map `pages` pages of physical memory from `base` into
+//!     its own address space (system call map, mem.rs), with the access
+//!     and caching `flags` say: a framebuffer, or pages the kernel shares
+//!     read-only, such as the system log (Entry 20). The pages stay
+//!     whoever's they were; the process only borrows them.
 //!
 //! Capabilities are values; copying one into another table (spawn, or a
 //! transfer in a message) copies the authority. Endpoints are reference
@@ -41,7 +46,16 @@ pub enum Cap {
     Irq { line: u8 },
     /// May restart or switch off the machine (power.rs).
     Power,
+    /// May map physical [base, base + pages * 4 KiB) (mem.rs).
+    Memory { base: u64, pages: u32, flags: u8 },
 }
+
+/// Memory capability flags.
+pub const MEM_WRITE: u8 = 1 << 0;
+/// Write-combining: for a framebuffer.
+pub const MEM_WRITE_COMBINING: u8 = 1 << 1;
+/// Uncached: for device memory that must see every access (VGA text).
+pub const MEM_UNCACHED: u8 = 1 << 2;
 
 pub type Caps = [Cap; MAX_CAPS];
 pub const NO_CAPS: Caps = [Cap::None; MAX_CAPS];
@@ -65,16 +79,23 @@ pub fn free_slot(caps: &Caps) -> Option<usize> {
     caps.iter().position(|&c| c == Cap::None)
 }
 
-/// A capability is being stored in a table: count the reference.
+/// A capability is being stored in a table: count the reference (and, for
+/// one with RECV, that someone can receive there).
 pub fn retain(cap: Cap) {
-    if let Cap::Endpoint { ep, .. } = cap {
+    if let Cap::Endpoint { ep, rights, .. } = cap {
         crate::ipc::retain(ep);
+        if rights & RECV != 0 {
+            crate::ipc::retain_receiver(ep);
+        }
     }
 }
 
 /// A capability is leaving a table.
 pub fn release(cap: Cap) {
-    if let Cap::Endpoint { ep, .. } = cap {
+    if let Cap::Endpoint { ep, rights, .. } = cap {
+        if rights & RECV != 0 {
+            crate::ipc::release_receiver(ep);
+        }
         crate::ipc::release(ep);
     }
 }

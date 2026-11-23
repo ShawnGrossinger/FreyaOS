@@ -72,7 +72,10 @@ table:
     dq spin                     ; 11
     dq isolate                  ; 12
     dq mxcsr                    ; 13
-    dq console_scroll           ; 14
+    dq map_read                 ; 14
+    dq map_write                ; 15
+    dq map_twice                ; 16
+    dq map_then_print           ; 17
 table_end:
 
 ring:                           ; exit(CS & 3): 3 in ring 3; 0xD1D if we started dirty
@@ -204,11 +207,48 @@ mxcsr:                          ; unmask every SSE exception, yield, read it bac
     mov edi, [rax]
     jmp exit
 
-console_scroll:                 ; console_scroll(slot 0, action `value`): exit with the result
-    mov eax, SYS_CONSOLE_SCROLL
-    mov edi, CONSOLE
+; Memory capabilities (Entry 20): the capability is in slot 0, `value` is
+; where to map it.
+map_read:                       ; map, then exit with the first quadword there
+    call map_slot0
+    mov rdi, [rbx]
+    jmp exit
+
+map_write:                      ; map, then write a quadword there: exit 0,
+    call map_slot0              ; or be killed if the mapping is read-only
+    mov rax, 0x5EED5EED5EED5EED
+    mov [rbx], rax
+    xor edi, edi
+    jmp exit
+
+map_twice:                      ; map, then map again at the same place:
+    call map_slot0              ; exit with what the second map returned
+    mov eax, SYS_MAP
+    xor edi, edi
     mov rsi, rbx
     syscall
+    mov rdi, rax
+    jmp exit
+
+map_then_print:                 ; map, then ask the kernel to print 16 bytes
+    call map_slot0              ; from there (console in slot 1): exit with
+    mov eax, SYS_WRITE          ; what write returned
+    mov edi, 1
+    mov rsi, rbx
+    mov edx, 16
+    syscall
+    mov rdi, rax
+    jmp exit
+
+map_slot0:                      ; map(slot 0, rbx); on an error, exit with it
+    mov eax, SYS_MAP
+    xor edi, edi
+    mov rsi, rbx
+    syscall
+    test rax, rax
+    jnz .failed
+    ret
+.failed:
     mov rdi, rax
     jmp exit
 

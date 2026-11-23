@@ -8,6 +8,8 @@
 CODE_BASE   equ 0x40000000          ; code, read + execute (org of every program)
 DATA_BASE   equ 0x40100000          ; data, read + write, zeroed
 DATA_SIZE   equ 4096
+MAP_BASE    equ 0x100000000         ; memory capabilities are mapped from here...
+MAP_END     equ 0x7F0000000000      ; ...to here (system call map)
 STACK_TOP   equ 0x00007FFF00000000  ; RSP at entry (16 KiB of stack below)
 
 ; System calls: number in RAX, arguments in RDI, RSI, RDX, result in RAX.
@@ -24,12 +26,18 @@ SYS_PORT_OUT equ 8                  ; port_out(ports, port, width, value)
 SYS_IRQ_WAIT equ 9                  ; irq_wait(irq): returns once the line has fired
 SYS_IRQ_ACK  equ 10                 ; irq_ack(irq): unmask the line (after handling it, or to arm it first)
 SYS_POWER    equ 11                 ; power(cap, action): never returns if allowed
-SYS_CONSOLE_SCROLL equ 12           ; console_scroll(cap, action): rows the view is back
+                                    ; 12 was console_scroll (retired in Entry 20)
+SYS_MAP      equ 13                 ; map(memory, address): map a Memory capability
+SYS_NOTE     equ 14                 ; note(cap, ptr, len): like write, serial only
 
 POWER_RESTART  equ 0
 POWER_SHUTDOWN equ 1
 
-SCROLL_BACK    equ 0                ; console_scroll: a page back (PageUp)
+; The console driver's protocol (user/rust/src/bin/console.rs): a call to
+; its endpoint with the request in the first word. SCROLL takes the action
+; in the second and answers with how many rows back the view is.
+CONSOLE_SCROLL equ 1
+SCROLL_BACK    equ 0                ; a page back (PageUp)
 SCROLL_FORWARD equ 1                ; a page forward (PageDown)
 SCROLL_TO_END  equ 2                ; to the newest line
 
@@ -46,6 +54,7 @@ ERR_PEER_GONE        equ -6
 ERR_INTERRUPTED      equ -7
 ERR_NO_REPLY         equ -8
 ERR_BAD_ARGUMENT     equ -9
+ERR_NO_MEMORY        equ -10
 
 ; Capability slots. A process gets only what its creator hands it; the
 ; kernel's tests use these slots.

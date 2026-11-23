@@ -373,6 +373,7 @@ pub fn exit_with(status: ExitStatus) -> ! {
         }
     }
     crate::ipc::on_exit(me);
+    crate::console::on_exit(me);
     unsafe { schedule() };
     // schedule() never picks a finished task, so this is unreachable.
     crate::halt();
