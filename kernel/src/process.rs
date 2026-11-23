@@ -101,6 +101,12 @@ pub static MOUSE: Program = Program {
     image: include_bytes!(concat!(env!("OUT_DIR"), "/mouse.bin")),
 };
 
+/// The shell (user/rust/src/bin/shell.rs, Entry 23).
+pub static SHELL: Program = Program {
+    name: "shell",
+    image: include_bytes!(concat!(env!("OUT_DIR"), "/shell.bin")),
+};
+
 /// Test program: its argument picks one thing to try (user/probe.asm).
 pub static PROBE: Program = Program {
     name: "probe",

@@ -39,11 +39,20 @@
 //!     for a receiver. Once neither does, nobody ever will: senders waiting
 //!     wake with ERR_PEER_GONE, and later sends get it at once. (Before, a
 //!     keyboard driver whose console had died would have waited forever.)
+//!
+//! Entry 23 lets a process signal too (system call signal): through an
+//! endpoint capability with SEND, it sets the bits of that capability's
+//! badge, so who may signal, and which bits, is decided by whoever mints
+//! the capabilities. A server tells a client "something is waiting for
+//! you" this way without ever waiting for that client: the PS/2 driver
+//! tells the shell there are keys, and the mouse driver there are bytes,
+//! and each then asks. That keeps the rule above (one held call per
+//! server) from mattering: the PS/2 driver answers every call at once.
 
 use crate::cap::{self, Cap, GRANT, RECV, SEND};
 use crate::cpu::without_interrupts;
 use crate::sched::{self, State, TaskId};
-use crate::syscall::{ERR_INTERRUPTED, ERR_NO_GRANT, ERR_NO_REPLY, ERR_PEER_GONE, ERR_WRONG_CAPABILITY};
+use crate::syscall::{ERR_BAD_ARGUMENT, ERR_INTERRUPTED, ERR_NO_GRANT, ERR_NO_REPLY, ERR_PEER_GONE, ERR_WRONG_CAPABILITY};
 
 pub const MAX_ENDPOINTS: usize = 32;
 
@@ -298,6 +307,31 @@ pub fn recv(slot: u64) -> (i64, Message) {
     })
 }
 
+/// signal(slot) (Entry 23): set the bits of the badge of the caller's
+/// endpoint capability in `slot`, which needs SEND, on that endpoint, for
+/// its receiver: as signal() above, never blocking. The receiver can't
+/// tell them from the kernel's, so the endpoint's owner picks badges that
+/// don't share bits with the kernel's signals there (init's choices:
+/// user/rust/src/bin/init.rs). A capability without a badge has no bits
+/// to set; an endpoint nobody can receive on any more gets peer-gone, as a
+/// send would.
+pub fn signal_through(slot: u64) -> i64 {
+    let (ep, badge, _) = match endpoint(slot, SEND) {
+        Ok(e) => e,
+        Err(e) => return e,
+    };
+    if badge == 0 {
+        return ERR_BAD_ARGUMENT;
+    }
+    without_interrupts(|| {
+        if receivers()[ep as usize % MAX_ENDPOINTS] == 0 {
+            return ERR_PEER_GONE;
+        }
+        signal(ep, badge);
+        0
+    })
+}
+
 /// Answer the last call this task received.
 pub fn reply(words: [u64; 4], xfer: u64) -> i64 {
     let cap = match outgoing(xfer, true) {
@@ -365,6 +399,12 @@ const PATIENT_SERVER: u64 = 12;
 const SIGNALLED: u64 = 13;
 
 const WAIT_TICKS: u64 = 500;
+
+/// captest's signal test (user/rust/src/bin/captest.rs, SIGNAL), the
+/// badge it signals with, and its exit code when every check passes.
+const CAPTEST_SIGNAL: u64 = 4;
+const SIGNAL_BITS: u64 = 0x5;
+const CAPTEST_SIGNAL_ALL: u64 = 0xF;
 
 fn endpoint_cap(ep: u8, badge: u64, rights: u8) -> Cap {
     Cap::Endpoint { ep, badge, rights }
@@ -568,6 +608,32 @@ pub fn selftest() -> bool {
         b"ipc",
         b"an endpoint no one can receive from any more: the sender waiting there gets peer-gone, and so does the next at once",
         sw == code(ERR_PEER_GONE) && sl == code(ERR_PEER_GONE),
+    );
+
+    // 8d. Signals from a process (Entry 23): captest's SIGNAL test sets
+    //     bits through a badged capability and receives them, and is
+    //     refused without a badge, without SEND, or where nobody can
+    //     receive any more (captest.rs says which bit is which).
+    let ep = fresh();
+    let nobody = fresh();
+    let tester = process::spawn(
+        &process::CAPTEST,
+        CAPTEST_SIGNAL,
+        table(&[
+            Cap::Console,
+            endpoint_cap(ep, 0, SEND | RECV),
+            endpoint_cap(ep, SIGNAL_BITS, SEND),
+            endpoint_cap(ep, 0x2, RECV),
+            endpoint_cap(nobody, 0x1, SEND),
+        ]),
+    )
+    .ok();
+    done(ep);
+    done(nobody);
+    ok &= check(
+        b"ipc",
+        b"a process signals through a badged capability: the badge's bits arrive once, merged (0x5), without blocking; refused: no badge, no SEND, the console; peer-gone where nobody can receive",
+        finish(tester) == code(CAPTEST_SIGNAL_ALL as i64),
     );
 
     // 9. Everything given back: endpoints, tasks, frames.

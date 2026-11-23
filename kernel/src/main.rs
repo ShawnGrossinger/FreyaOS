@@ -17,6 +17,7 @@ mod factory;
 mod gdt;
 mod heap;
 mod idt;
+mod info;
 mod ipc;
 mod irq;
 mod log;
@@ -620,8 +621,9 @@ pub extern "C" fn rust_start() -> ! {
         let mutex = sync::selftest();
         let ipc = ipc::selftest();
         let factory = factory::selftest();
+        let info = info::selftest();
         let drivers = irq::selftest();
-        mutex && ipc && factory && drivers
+        mutex && ipc && factory && info && drivers
     };
 
     // --- VGA status display (screen was cleared at entry) ---
@@ -723,6 +725,7 @@ static INIT_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 ///                                                         description
 ///   8 Irq 1 (the keyboard)            9 IoPorts 0x60   10 IoPorts 0x64
 ///  11 Power                         12 Irq 12 (the mouse, Entry 22)
+///  13 Info (for the shell, Entry 23)
 ///
 /// A slot is left empty if the kernel has nothing to put there (no screen
 /// to lend, interrupts not routed); init then can't start what needs it,
@@ -746,6 +749,7 @@ fn start_init(ioapic_ready: bool) -> bool {
         Cap::IoPorts { base: 0x64, count: 1 },
         Cap::Power,
         if ioapic_ready { Cap::Irq { line: 12 } } else { Cap::None },
+        Cap::Info,
     ]);
     let started = process::spawn(&process::INIT, 0, caps);
     // init's table holds the endpoints now (or nothing does, and they go).
@@ -886,7 +890,7 @@ fn run_requested_demo() {
             "heap_double_free" => heap::demo_double_free(),
             // [kernel] PANIC with file and line
             "panic" => panic!("FREYA_DEMO=panic"),
-            // Not faults (Entries 20 and 21): the console driver killed, so
+            // Not faults (Entries 20, 21 and 23): the console driver killed, so
             // init must start it again; init and then the console driver
             // killed, or the console driver killed more often than init
             // starts it again, so the kernel must take the screen back and
@@ -909,10 +913,16 @@ fn run_requested_demo() {
                 demo_log_flood();
                 return;
             }
+            // The shell killed (Entry 23): init starts it again, and
+            // typing reaches the new one.
+            "kill_shell" => {
+                demo_kill_shell();
+                return;
+            }
             _ => {
                 serial_write_str(b"[demo] unknown; known: ud2 page_fault stack_overflow \
                                    task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free panic \
-                                   kill_console kill_init kill_console_often log_flood\n");
+                                   kill_console kill_init kill_console_often log_flood kill_shell\n");
                 return;
             }
         }
@@ -959,6 +969,24 @@ fn demo_kill_console_often() {
         line.dec(n).str(b" of 4)\n");
         serial_write_str(line.as_bytes());
     }
+}
+
+/// Demo: kill the shell once it is running (waiting up to 3 s for it).
+fn demo_kill_shell() {
+    let mut shell = None;
+    for _ in 0..300 {
+        shell = sched::find("shell");
+        if shell.is_some() {
+            break;
+        }
+        sched::sleep_ticks(1);
+    }
+    let Some(id) = shell else {
+        serial_write_str(b"[demo] no shell to kill\n");
+        return;
+    };
+    let ended = sched::kill(id) && sched::join_timeout(id, 200).is_some();
+    serial_write_str(if ended { b"[demo] shell killed\n" } else { b"[demo] the shell didn't end\n" });
 }
 
 /// Demo: once the console driver draws, kill init, then the console

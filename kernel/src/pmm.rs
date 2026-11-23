@@ -267,6 +267,7 @@ pub unsafe fn init(e820: &[E820Entry], early_used: (u64, u64)) -> PmmStats {
     pmm.mark_bytes(bitmap_phys, bitmap_phys + bitmap_bytes, true);
 
     pmm.free = pmm.count_free();
+    USABLE_FRAMES.store(usable_bytes / PAGE_SIZE, core::sync::atomic::Ordering::Relaxed);
 
     PmmStats {
         frames,
@@ -359,6 +360,14 @@ pub fn is_frame_free(phys: u64) -> bool {
 
 pub fn free_frames() -> u64 {
     unsafe { (*(&raw const PMM)).free }
+}
+
+static USABLE_FRAMES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Frames of RAM the firmware's map calls usable (Entry 23: the shell's
+/// mem shows free frames out of these).
+pub fn usable_frames() -> u64 {
+    USABLE_FRAMES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 // ===========================================================================

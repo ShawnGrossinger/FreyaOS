@@ -17,7 +17,8 @@
 //!
 //! The screen is the kernel's status rows (0 to 17) as they are, then the
 //! log: everything in the system log, wrapped at the screen's width, the
-//! last HISTORY rows kept. The view follows new lines, or stays where
+//! last HISTORY rows kept; and, on the last row, the line being typed
+//! (Entry 23). The view follows new lines, or stays where
 //! PageUp put it: while it is scrolled back, new lines move it one row
 //! further back each, so what is on screen doesn't move, until those rows
 //! are the oldest kept and fall out (then it shows the oldest left). A grey
@@ -26,18 +27,36 @@
 //! What it waits for, all on its endpoint:
 //!   - signals from the kernel: LOG (the log grew), PANEL (a status row
 //!     changed);
-//!   - calls: SCROLL (from the PS/2 driver: PageUp, PageDown, Enter),
-//!     answered with how many rows back the view is; POINTER (from the
-//!     mouse driver, Entry 22): movement, buttons and wheel.
+//!   - calls: SCROLL (from the PS/2 driver: PageUp, PageDown; from the
+//!     shell: Enter), answered with how many rows back the view is;
+//!     POINTER (from the mouse driver, Entry 22): movement, buttons and
+//!     wheel; INPUT (from the shell, Entry 23): the line being typed.
+//!
+//! The shell's lines (Entry 23). The kernel starts every line a process
+//! writes with "[user N 'name'] ", so no process can pass its words off as
+//! another's; serial keeps that. On screen, lines from the process named
+//! shell are shown without it, in bright white, so the shell reads as a
+//! terminal. Names are the kernel's (its program table), so only the
+//! shell's lines can lose their prefix.
+//!
+//! The line being typed is the shell's to edit: it sends the whole line
+//! with each change (INPUT), and this draws it on the last row, with the
+//! cursor after it, and leaves a note: "input row: ..." (test.sh reads
+//! it). If this driver is started again, init tells the shell, which sends
+//! the line again.
 //!
 //! The pointer (Entry 22) is a cell drawn with its colours swapped. It
-//! appears in the middle of the screen at the mouse's first movement and
-//! moves in the mouse's own units, one count to a pixel (a cell is 8 x
-//! 16). Holding the middle button turns movement into scrolling, the way a
-//! ThinkPad's TrackPoint scrolls: up goes back, a row per 16 counts. The
-//! wheel, if there is one, scrolls 3 rows a notch. After each change of
-//! cell or buttons it leaves a note: "pointer at column C, row R;
-//! buttons: ..." (test.sh's mouse case reads them).
+//! appears in the middle of the screen at the mouse's first movement. It
+//! moves over a field 640 x 400 counts in every mode, mapped onto the
+//! screen's cells (Entry 23): text mode's 80 x 25 cells of 8 x 16, so the
+//! mouse feels the same in text mode and in graphics at any resolution
+//! (before, graphics moved a pixel a count: 1600 counts across the T430's
+//! screen, where text mode needs 640). Holding the middle button turns
+//! movement into scrolling, the way a ThinkPad's TrackPoint scrolls: up
+//! goes back, a row per 16 counts. The wheel, if there is one, scrolls 3
+//! rows a notch. After each change of cell or buttons it leaves a note:
+//! "pointer at column C, row R; buttons: ..." (test.sh's mouse case reads
+//! them).
 //!
 //! Every cell drawn is remembered, so only cells that change are drawn
 //! again; the framebuffer is only ever written. After each scroll it leaves
@@ -68,12 +87,16 @@ const SIGNAL_PANEL: u64 = 1 << 1;
 
 const REQUEST_SCROLL: u64 = freya::CONSOLE_SCROLL;
 const REQUEST_POINTER: u64 = freya::CONSOLE_POINTER;
+const REQUEST_INPUT: u64 = freya::CONSOLE_INPUT;
 const SCROLL_BACK: u64 = freya::SCROLL_BACK;
 const SCROLL_FORWARD: u64 = freya::SCROLL_FORWARD;
 const SCROLL_TO_END: u64 = freya::SCROLL_TO_END;
 
 // The pointer.
 const MIDDLE_BUTTON: u8 = 1 << 2;
+/// The field the pointer moves over, in mouse counts, in every mode.
+const FIELD_W: i64 = 640;
+const FIELD_H: i64 = 400;
 /// Mouse counts (up or down) per row scrolled with the middle button held.
 const COUNTS_PER_ROW: i64 = 16;
 /// Rows a notch of the wheel scrolls.
@@ -120,6 +143,17 @@ const TEXT_COLS: usize = 80;
 const HISTORY: usize = 400;
 const LOG_ATTR: u8 = 0x07;
 const BAR_ATTR: u8 = 0x70;
+/// The shell's lines, and the line being typed: bright white.
+const SHELL_ATTR: u8 = 0x0F;
+const CURSOR_ATTR: u8 = 0x70;
+/// Longest line being typed that is kept (the shell's are shorter).
+const MAX_INPUT: usize = 128;
+
+/// How the kernel starts a line the shell wrote: "[user ", its process
+/// number, and this.
+const SHELL_HEAD: &[u8] = b"[user ";
+const SHELL_TAIL: &[u8] = b" 'shell'] ";
+const SHELL_PREFIX_MAX: usize = 6 + 3 + 10;
 
 struct Console {
     info: StartInfo,
@@ -132,6 +166,8 @@ struct Console {
     drawn: [[u32; MAX_COLS]; MAX_ROWS],
 
     history: [[u8; MAX_COLS]; HISTORY],
+    /// Each history row's colours: the shell's, or the log's.
+    row_attr: [u8; HISTORY],
     /// The row being written, in ring order.
     newest: usize,
     /// Rows started since this driver began (the first counts as 1).
@@ -141,10 +177,19 @@ struct Console {
     back: usize,
     /// Bytes of the system log read so far.
     read: u64,
+    /// At the start of a line, looking for the shell's prefix: the bytes
+    /// that match it so far, held back until it is clear whether they do.
+    line_start: bool,
+    pending: [u8; SHELL_PREFIX_MAX],
+    pending_len: usize,
 
-    /// The pointer: shown once the mouse first moves; where it is, in
-    /// pixels (text mode: as if a cell were 8 x 16 pixels too), and the
-    /// cell that holds it.
+    /// The line being typed (INPUT), once the shell has sent one.
+    typing: bool,
+    input: [u8; MAX_INPUT],
+    input_len: usize,
+
+    /// The pointer: shown once the mouse first moves; where it is on the
+    /// 640 x 400 field, and the cell that holds it.
     pointer: bool,
     px: i64,
     py: i64,
@@ -181,6 +226,8 @@ fn main(_arg: u64) -> u64 {
     c.log_top = (info.log_top as usize).min(c.rows.saturating_sub(2));
     c.total = 1;
     c.history[0] = [b' '; MAX_COLS];
+    c.row_attr[0] = LOG_ATTR;
+    c.line_start = true;
     if !map_all(&[(SCREEN, SCREEN_AT)]) {
         return 2;
     }
@@ -189,6 +236,7 @@ fn main(_arg: u64) -> u64 {
     read_log(c);
     draw_panel(c);
     draw_log(c);
+    draw_input(c);
     let mut line = Line::<96>::new();
     line.str(b"started: ").dec(c.cols as u64).str(b"x").dec(c.rows as u64).str(b" cells, ");
     line.str(if info.graphics != 0 { b"graphics" } else { b"text mode" });
@@ -233,6 +281,10 @@ fn handle_call(c: &mut Console, msg: &Message) {
             pointer(c, msg.words[1] as i64, msg.words[2] as i64, msg.words[3]);
             freya::reply([0; 4], NO_CAP);
         }
+        REQUEST_INPUT => {
+            input(c, msg.words[1], [msg.words[2], msg.words[3]]);
+            freya::reply([0; 4], NO_CAP);
+        }
         _ => {
             freya::reply([freya::ERR_BAD_ARGUMENT as u64, 0, 0, 0], NO_CAP);
         }
@@ -248,16 +300,11 @@ fn handle_call(c: &mut Console, msg: &Message) {
 fn pointer(c: &mut Console, dx: i64, dy: i64, word: u64) {
     let buttons = (word & 7) as u8;
     let wheel = (word >> 8) as u8 as i8 as i64;
-    let (width, height) = if c.info.graphics != 0 {
-        (c.info.width as i64, c.info.height as i64)
-    } else {
-        ((c.cols * GLYPH_W) as i64, (c.rows * GLYPH_H) as i64)
-    };
     let first = !c.pointer;
     if first {
         c.pointer = true;
-        c.px = width / 2;
-        c.py = height / 2;
+        c.px = FIELD_W / 2;
+        c.py = FIELD_H / 2;
     }
     let mut rows = 0;
     if buttons & MIDDLE_BUTTON != 0 {
@@ -266,11 +313,11 @@ fn pointer(c: &mut Console, dx: i64, dy: i64, word: u64) {
         c.scroll_carry -= rows * COUNTS_PER_ROW;
     } else {
         c.scroll_carry = 0;
-        c.px = (c.px + dx).clamp(0, width - 1);
-        c.py = (c.py - dy).clamp(0, height - 1);
+        c.px = (c.px + dx).clamp(0, FIELD_W - 1);
+        c.py = (c.py - dy).clamp(0, FIELD_H - 1);
     }
     rows -= wheel * ROWS_PER_NOTCH;
-    let cell = ((c.py as usize) / GLYPH_H, (c.px as usize) / GLYPH_W);
+    let cell = (c.py as usize * c.rows / FIELD_H as usize, c.px as usize * c.cols / FIELD_W as usize);
     let moved = first || cell != (c.pointer_row, c.pointer_col);
     let pressed = buttons != c.buttons;
     (c.pointer_row, c.pointer_col) = cell;
@@ -285,6 +332,7 @@ fn pointer(c: &mut Console, dx: i64, dy: i64, word: u64) {
         // cells, or the view the scroll moved.
         draw_panel(c);
         draw_log(c);
+        draw_input(c);
     }
     if rows != 0 {
         note_view(c);
@@ -311,8 +359,9 @@ fn pointer(c: &mut Console, dx: i64, dy: i64, word: u64) {
 // The log
 // ---------------------------------------------------------------------------
 
+/// The log's rows: below the status rows, above the input row.
 fn log_rows(c: &Console) -> usize {
-    c.rows - c.log_top
+    c.rows - c.log_top - 1
 }
 
 fn kept(c: &Console) -> usize {
@@ -347,12 +396,67 @@ fn read_log(c: &mut Console) {
 }
 
 fn add_byte(c: &mut Console, b: u8) {
+    if c.line_start {
+        // Hold the line's first bytes back while they could be the shell's
+        // prefix; drop them if they are, put them in if they aren't.
+        c.pending[c.pending_len] = b;
+        c.pending_len += 1;
+        match shell_prefix(&c.pending[..c.pending_len]) {
+            Some(false) => return,
+            Some(true) => {
+                c.line_start = false;
+                c.pending_len = 0;
+                c.row_attr[c.newest] = SHELL_ATTR;
+                return;
+            }
+            None => {
+                c.line_start = false;
+                let held = c.pending;
+                let n = c.pending_len;
+                c.pending_len = 0;
+                for &h in &held[..n] {
+                    put_byte(c, h);
+                }
+                return;
+            }
+        }
+    }
+    put_byte(c, b);
+}
+
+/// Some(true): `p` is the whole of the shell's prefix; Some(false): it is
+/// the start of it; None: it isn't.
+fn shell_prefix(p: &[u8]) -> Option<bool> {
+    let n = p.len().min(SHELL_HEAD.len());
+    if p[..n] != SHELL_HEAD[..n] {
+        return None;
+    }
+    let rest = &p[n..];
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    if rest.is_empty() || (digits == rest.len() && digits <= 3) {
+        return Some(false); // more digits may follow
+    }
+    if digits == 0 || digits > 3 {
+        return None;
+    }
+    let tail = &rest[digits..];
+    let n = tail.len().min(SHELL_TAIL.len());
+    if tail[..n] != SHELL_TAIL[..n] {
+        return None;
+    }
+    Some(tail.len() == SHELL_TAIL.len())
+}
+
+fn put_byte(c: &mut Console, b: u8) {
     match b {
         b'\r' => {}
-        b'\n' => new_row(c),
+        b'\n' => {
+            new_row(c, false);
+            c.line_start = true;
+        }
         _ => {
             if c.col >= c.cols {
-                new_row(c); // wrap
+                new_row(c, true); // wrap
             }
             let (row, col) = (c.newest, c.col);
             c.history[row][col] = if (0x20..0x7F).contains(&b) { b } else { b'.' };
@@ -361,9 +465,13 @@ fn add_byte(c: &mut Console, b: u8) {
     }
 }
 
-fn new_row(c: &mut Console) {
+/// A new row: after a newline, or (`wrapped`) the rest of a long line,
+/// which keeps its line's colours.
+fn new_row(c: &mut Console, wrapped: bool) {
+    let attr = if wrapped { c.row_attr[c.newest] } else { LOG_ATTR };
     c.newest = (c.newest + 1) % HISTORY;
     c.history[c.newest] = [b' '; MAX_COLS];
+    c.row_attr[c.newest] = attr;
     c.total += 1;
     c.col = 0;
     if c.back > 0 {
@@ -381,19 +489,27 @@ fn scroll(c: &mut Console, action: u64) {
     };
 }
 
+/// Where in the history the row shown on screen row `r` of the log is,
+/// if there is one.
+fn view_index(c: &Console, r: usize) -> Option<usize> {
+    let age = log_rows(c) - 1 - r + c.back;
+    (age < kept(c)).then(|| (c.newest + HISTORY - age) % HISTORY)
+}
+
 /// The history row shown on screen row `r` of the log, if there is one.
 fn view_row(c: &Console, r: usize) -> Option<&[u8; MAX_COLS]> {
-    let age = log_rows(c) - 1 - r + c.back;
-    (age < kept(c)).then(|| &c.history[(c.newest + HISTORY - age) % HISTORY])
+    view_index(c, r).map(|i| &c.history[i])
 }
 
 fn draw_log(c: &mut Console) {
     let rows = log_rows(c);
     let cols = c.cols;
     for r in 0..rows {
+        let index = view_index(c, r);
+        let attr = index.map_or(LOG_ATTR, |i| c.row_attr[i]);
         for col in 0..cols {
-            let ch = view_row(c, r).map_or(b' ', |row| row[col]);
-            put(c, c.log_top + r, col, ch, LOG_ATTR);
+            let ch = index.map_or(b' ', |i| c.history[i][col]);
+            put(c, c.log_top + r, col, ch, attr);
         }
     }
     if c.back > 0 {
@@ -435,6 +551,51 @@ fn row_text(c: &Console, line: &mut Line<256>, row: Option<&[u8; MAX_COLS]>) {
         let row = &row[..c.cols.min(NOTE_ROW_CHARS)];
         let end = row.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
         line.str(&row[..end]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The line being typed (Entry 23)
+// ---------------------------------------------------------------------------
+
+/// INPUT: `bytes` (16 of them) go at the offset in `place`'s bits 0 to
+/// 15, in a line `place`'s bits 16 to 31 long. The shell sends a line from
+/// its start, 16 bytes a call: the call with its last bytes leaves a note.
+fn input(c: &mut Console, place: u64, bytes: [u64; 2]) {
+    let offset = (place & 0xFFFF) as usize;
+    let len = ((place >> 16) & 0xFFFF) as usize;
+    c.typing = true;
+    c.input_len = len.min(MAX_INPUT);
+    for i in 0..freya::INPUT_CHUNK {
+        let at = offset + i;
+        if at < c.input_len {
+            c.input[at] = (bytes[i / 8] >> (8 * (i % 8))) as u8;
+        }
+    }
+    draw_input(c);
+    if offset + freya::INPUT_CHUNK >= len {
+        let mut line = Line::<160>::new();
+        line.str(b"input row: ").str(&c.input[..c.input_len]).str(b"\n");
+        freya::note(CONSOLE, line.as_bytes());
+    }
+}
+
+/// The last row: the line being typed, and the cursor after it (the line's
+/// end if it is wider than the screen); blank until there is a shell.
+fn draw_input(c: &mut Console) {
+    let row = c.rows - 1;
+    let cols = c.cols;
+    let start = (c.input_len + 1).saturating_sub(cols);
+    for col in 0..cols {
+        let at = start + col;
+        let (ch, attr) = match at {
+            _ if !c.typing => (b' ', LOG_ATTR),
+            _ if at < c.input_len => (c.input[at], SHELL_ATTR),
+            _ if at == c.input_len => (b' ', CURSOR_ATTR),
+            _ => (b' ', LOG_ATTR),
+        };
+        let ch = if (0x20..0x7F).contains(&ch) { ch } else { b'.' };
+        put(c, row, col, ch, attr);
     }
 }
 

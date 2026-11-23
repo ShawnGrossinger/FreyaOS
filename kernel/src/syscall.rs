@@ -35,6 +35,13 @@
 //!  17 mint(endpoint, rights, badge)    -> slot of a narrower copy  (cap.rs)
 //!  18 drop(slot)                       -> 0: the capability let go of
 //!  19 irq_bind(irq, endpoint)          -> 0: the line signals there  (irq.rs)
+//!  20 signal(endpoint)                 -> 0: the capability's badge set as
+//!                                         signal bits there, never blocking
+//!                                         (ipc.rs, Entry 23)
+//!  21 info(info, ptr, len)             -> bytes: uptime, memory, tasks
+//!                                                             (info.rs)
+//!  22 cap_info(slot)                   -> kind, and in RDI, RSI, RDX what
+//!                                         the caller's own slot holds
 //!
 //! Message registers: send/call take the four words in RSI, RDX, R10, R8
 //! and in R9 the slot of a capability to pass along (-1 for none). recv and
@@ -44,7 +51,9 @@
 //! The kernel never trusts a pointer from a process. A buffer must lie in
 //! user space, and every page of it must be mapped for ring 3 in the
 //! caller's address space; the kernel then copies it through the physical
-//! map, never through the user address itself.
+//! map, never through the user address itself. A buffer the kernel writes
+//! (info) must also be writable, and the caller's own: never memory it
+//! only borrows.
 
 use crate::cap::Cap;
 use crate::ipc::{self, Message};
@@ -71,6 +80,9 @@ pub const SYS_ENDPOINT: u64 = 16;
 pub const SYS_MINT: u64 = 17;
 pub const SYS_DROP: u64 = 18;
 pub const SYS_IRQ_BIND: u64 = 19;
+pub const SYS_SIGNAL: u64 = 20;
+pub const SYS_INFO: u64 = 21;
+pub const SYS_CAP_INFO: u64 = 22;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
 /// write, note: the slot doesn't hold the console capability; map: it
@@ -212,6 +224,15 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
         SYS_MINT => crate::cap::mint(f.rdi, f.rsi, f.rdx),
         SYS_DROP => crate::cap::drop_cap(f.rdi),
         SYS_IRQ_BIND => crate::irq::bind(f.rdi, f.rsi),
+        SYS_SIGNAL => ipc::signal_through(f.rdi),
+        SYS_INFO => crate::info::info(f.rdi, f.rsi, f.rdx),
+        SYS_CAP_INFO => {
+            let (kind, a, b, c) = crate::info::cap_info(f.rdi);
+            if kind >= 0 {
+                (f.rdi, f.rsi, f.rdx) = (a, b, c);
+            }
+            kind
+        }
         _ => ERR_BAD_SYSCALL,
     };
     f.rax = result as u64;
@@ -336,6 +357,40 @@ pub fn copy_from_user(ptr: u64, buf: &mut [u8]) -> Result<(), i64> {
             core::ptr::copy_nonoverlapping(
                 crate::paging::phys_to_virt(frame + offset),
                 buf.as_mut_ptr().add(done as usize),
+                n as usize,
+            );
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+/// Copy `buf` into the caller's memory at `ptr`, page by page, checking
+/// each page is the caller's own and writable (vmm::user_page: never a
+/// page it only borrows, such as the system log, which it may only read).
+/// Through the physical map, never the user address. On a bad page the
+/// pages before it may already hold their part.
+pub fn copy_to_user(ptr: u64, buf: &[u8]) -> Result<(), i64> {
+    let len = buf.len() as u64;
+    if len == 0 {
+        return Ok(());
+    }
+    if !vmm::is_user_range(ptr, len) {
+        return Err(ERR_BAD_ADDRESS);
+    }
+    let space = unsafe { AddressSpace::from_root(sched::current_space()) };
+    let mut done = 0;
+    while done < len {
+        let va = ptr + done;
+        let Some(frame) = space.user_page(va & !0xFFF, true) else {
+            return Err(ERR_BAD_ADDRESS);
+        };
+        let offset = va & 0xFFF;
+        let n = (0x1000 - offset).min(len - done);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buf.as_ptr().add(done as usize),
+                crate::paging::phys_to_virt(frame + offset),
                 n as usize,
             );
         }

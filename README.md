@@ -23,33 +23,36 @@ Bridge, 16 GB), booted from a USB stick.
 | Interrupts | A gate for all 256 vectors, the local APIC timer at 100 Hz, the I/O APIC routed from ACPI tables; interrupts nobody set up are survived and reported |
 | Tasks | Kernel threads, preemptive round-robin scheduling, sleeping, joining, a mutex |
 | User mode | Ring 3 processes in their own address spaces, written in assembly or Rust; `SYSCALL`, SMEP and SMAP where the CPU has them; a fault ends only the process |
-| Capabilities and IPC | 32 capability slots per process; synchronous call/reply IPC that can pass capabilities (with GRANT) and badges; signals; memory lent through Memory capabilities; narrower copies (mint) and letting go (drop) |
-| Init | The only process the kernel starts: it holds the drivers' capabilities and a Factory capability, starts each driver with exactly what it needs, and starts one again if it ends |
+| Capabilities and IPC | 32 capability slots per process; synchronous call/reply IPC that can pass capabilities (with GRANT) and badges; signals, from the kernel or from a process holding a badged capability; memory lent through Memory capabilities; narrower copies (mint) and letting go (drop) |
+| Init | The only process the kernel starts: it holds the drivers' capabilities and a Factory capability, starts each driver and the shell with exactly what it needs, and starts one again if it ends |
 | Drivers | I/O-port, interrupt-line and memory capabilities, and interrupts delivered as signals; a console driver, a PS/2 driver (keyboard and controller) and a mouse driver, all in Rust, running as user processes, started by init |
-| Power | Restart and switch-off through ACPI, behind a Power capability (Ctrl+Alt+Del, Ctrl+Alt+End) |
-| Not yet | UEFI boot, mouse, disk, network, file system, multiple CPUs |
+| Shell | A first shell in Rust: line editing with history, and built-in commands (help, echo, ps, caps, uptime, mem, restart, off), holding six capabilities and nothing else |
+| Power | Restart and switch-off through ACPI, behind a Power capability (Ctrl+Alt+Del, Ctrl+Alt+End, or the shell's restart and off) |
+| Not yet | UEFI boot, disk, network, file system, starting programs from the shell, multiple CPUs |
 
-Every boot runs **88 self-tests** and shows the result on screen. `make test`
-checks the disk image and boots **33 configurations** headless, checking each
+Every boot runs **90 self-tests** and shows the result on screen. `make test`
+checks the disk image and boots **36 configurations** headless, checking each
 one.
 
 ## Design in brief
 
 - **Microkernel.** Only scheduling, memory, address spaces, interrupts, IPC
   and capabilities live in the kernel. Drivers and services are processes.
-- **Capabilities.** Each process has 16 slots. Kinds: `Console` (write to
+- **Capabilities.** Each process has 32 slots. Kinds: `Console` (write to
   the log), `Endpoint` (rights SEND, RECV, GRANT, plus a badge), `IoPorts` (a
   port range), `Irq` (an interrupt line), `Power`, `Memory` (physical
-  pages a process may map: writable or not, write-combining or uncached), and
-  `Factory` (may start built-in programs and make endpoints). Authority only
+  pages a process may map: writable or not, write-combining or uncached),
+  `Factory` (may start built-in programs and make endpoints), and `Info` (may
+  read uptime, memory and every task's state). Authority only
   moves by being copied into a process its holder starts, or passed in an IPC
   message through an endpoint with GRANT. An endpoint capability can be copied
   with fewer rights and a badge (mint), and any capability let go of (drop).
 - **Init decides, the kernel enforces.** At the end of boot the kernel starts
   one process, init, with every capability the drivers will need. Init mints
-  narrower copies, starts the console, PS/2 and mouse drivers with exactly the
-  slots each needs, and is signalled when one ends, so it can start it again
-  (three times at most; then it lets go of what only that driver used).
+  narrower copies, starts the console, PS/2 and mouse drivers and the shell
+  with exactly the slots each needs, and is signalled when one ends, so it can
+  start it again (three times at most; then it lets go of what only that one
+  used).
 - **Drivers own their devices.** The console driver draws the screen through
   three Memory capabilities: the framebuffer (or VGA text memory), the
   kernel's log, and the kernel's status rows, the last two read-only, plus a
@@ -57,6 +60,10 @@ one.
   signals on its endpoint; the PS/2 driver asks it to scroll with an IPC
   call. The kernel draws the screen until a process maps it, and takes it
   back for a crash or when that process ends.
+- **Servers never wait for their clients.** The PS/2 driver answers every
+  call at once and signals the mouse driver and the shell (through
+  capabilities whose badge is the signal bit) when they have something to
+  read; each then asks.
 - **System calls** (`SYSCALL`, number in `rax`):
 
   | # | Call | Needs |
@@ -76,6 +83,9 @@ one.
   | 17 | mint(cap, rights, badge): a narrower copy | Endpoint |
   | 18 | drop(slot): let go of a capability | anything |
   | 19 | irq_bind(irq, endpoint): the line's interrupts become signals there | Irq, Endpoint with RECV |
+  | 20 | signal(endpoint): set the capability's badge as signal bits there, without waiting | Endpoint with SEND and a badge |
+  | 21 | info(cap, buf, len): uptime, memory and every task, into the caller's buffer | Info |
+  | 22 | cap_info(slot): what one of the caller's own slots holds | nothing |
 
 ## Repository layout
 
@@ -84,7 +94,7 @@ bootloader/BIOS/   stage1.asm (MBR), stage2.asm (loader, E820, VESA mode, long m
 bootloader/UEFI/   placeholder for a later UEFI loader
 kernel/            Rust kernel: entry.asm, kernel.ld, src/*.rs
 user/              user programs in NASM (test programs)
-user/rust/         user programs in Rust (init; the console, PS/2 and mouse drivers) and their library
+user/rust/         user programs in Rust (init; the console, PS/2 and mouse drivers; the shell) and their library
 build/             Makefile, test.sh, write-usb.sh
 docs/              development journal, roadmap and design notes
 ```
@@ -104,7 +114,7 @@ Then, from `build/`:
 ```bash
 make            # builds out/freya-os.img (1 MiB disk image); "make build" too
 make run        # boots it in QEMU, serial output in the terminal
-make test       # every test case, headless; expect "34 passed, 0 failed"
+make test       # every test case, headless; expect "36 passed, 0 failed"
 TEXT_MODE=1 make   # an image that stays in 80x25 text mode
 ```
 
@@ -122,29 +132,46 @@ mode instead.
 
 The top of the screen lists each subsystem as OK or FAIL, then the self-test
 count, a banner, and an uptime counter; in graphics mode the mode and a
-16-colour swatch are at the top right. Everything below row 17 is a log of
-everything the kernel prints (7 rows in text mode, 32 at 1280x800). Once boot
-is done the console driver draws all of this; the log says so ("process 4
-('console') draws the screen from here on", after init's "started the console
-driver (process 4), the PS/2 driver (process 5) and the mouse driver (process
-6)"). A failed
-self-test is repeated there, so a photo of the screen is a usable report on a
-machine without a serial port.
+16-colour swatch are at the top right. Below row 17 is a log of everything the
+kernel and the processes print (6 rows in text mode, 31 at 1280x800), and on
+the last row the line being typed, after the shell's prompt `freya>`. Once
+boot is done the console driver draws all of this; the log says so ("process
+4 ('console') draws the screen from here on", after init's "started the
+console driver (process 4), the PS/2 driver (process 5), the mouse driver
+(process 6) and the shell (process 7)"). A failed self-test is repeated there,
+so a photo of the screen is a usable report on a machine without a serial
+port.
 
-Keys, handled by the PS/2 driver:
+Keys the PS/2 driver handles itself, so they work whatever the shell does:
 
 - **Ctrl+Alt+Del** restarts.
 - **Ctrl+Alt+End** switches off (ACPI S5).
 - **PageUp** / **PageDown** scroll the log back and forward a page at a time,
   through the last 400 rows. A bar across the top of the log says how far back
   the view is; lines that arrive meanwhile don't move it.
-- Typing a line and pressing **Enter** echoes it back (and returns the log to
-  its newest line first).
+
+Everything else goes to the shell. Type a line and press **Enter**: the log
+goes back to its newest line, the line appears after the prompt, and the
+command runs. **Backspace** deletes, **Esc** clears the line, **Up** and
+**Down** go through the last 8 lines entered.
+
+| Command | What it does |
+|---|---|
+| `help` | lists the commands |
+| `echo TEXT` | prints TEXT |
+| `ps` | every task: what it is doing, and how many capabilities it holds |
+| `caps` | the shell's own capabilities: everything it may do |
+| `uptime` | time since the timer started, task switches, system calls |
+| `mem` | memory free |
+| `restart`, `off` | restart or switch off the machine |
+
+The shell's lines are shown in white, without the "[user 7 'shell']" the
+kernel puts in front of every line a process writes (serial keeps it).
 
 The mouse (on the T430, the TrackPoint and the touchpad) moves a pointer, a
-cell drawn with its colours swapped. Holding the middle button while moving
-scrolls the log, the way a ThinkPad's TrackPoint scrolls; a wheel, if there
-is one, scrolls 3 rows a notch.
+cell drawn with its colours swapped, at the same speed in every mode. Holding
+the middle button while moving scrolls the log, the way a ThinkPad's
+TrackPoint scrolls; a wheel, if there is one, scrolls 3 rows a notch.
 
 If the kernel ever stops on a CPU exception or a panic, it takes the screen
 back from the console driver, and the top of the screen shows the exception,
@@ -161,6 +188,9 @@ headless and checks its serial log:
 - `bios-if-on`: the bootloader behaves like a BIOS that leaves interrupts on
 - `keyboard`, `restart`, `shutdown`, `restart-q35`: keys pressed through
   QEMU's monitor
+- `shell`: the shell's commands and editing keys (Backspace, Esc, Up twice),
+  `ps` and `caps` checked line by line, and a screenshot of the line being
+  typed and of the shell's last line
 - `scroll`: PageUp and PageDown, checked step by step, and a screenshot whose
   size and colours must match the mode the kernel reported
 - `edid-1366`, `edid-1440`, `no-edid`, `cirrus-24bit`: the mode stage 2
@@ -175,12 +205,14 @@ headless and checks its serial log:
   scrolled back: the view must stay put (checked in the console driver's
   notes and in screenshots), and the history must stop at 400 rows
 - `mouse`: QEMU's mouse moved, clicked, wheeled and middle-dragged through
-  the monitor; the console driver's notes must follow every step, typing
-  must still work, and a screenshot must show the pointer where it says
+  the monitor; the console driver's notes must follow every step, the shell
+  must still answer, and a screenshot must show the pointer where it says
 - `kill-console`, `kill-console-often`, `kill-init`: the console driver is
   killed, and init must start it again; killed four times, after which init
   must leave it stopped and let go of it; or killed after init itself: the
-  kernel must take the screen back and the keyboard must still work
+  kernel must take the screen back and the shell must still answer
+- `kill-shell`: the shell is killed, and the one init starts again must
+  answer
 - one case per built-in fault demo, each of which must be caught and reported
   (the page-fault and panic cases also check the crash screen in a screenshot)
 
@@ -188,7 +220,8 @@ The fault demos can also be run by hand: `FREYA_DEMO=<name> make run`, with
 `<name>` one of `ud2`, `page_fault`, `stack_overflow`, `task_stack_overflow`,
 `smap`, `smep`, `nx`, `use_after_unmap`, `write_read_only`,
 `heap_double_free`, `panic`; `log_flood`, `kill_console`,
-`kill_console_often` and `kill_init` exercise the console driver and init.
+`kill_console_often`, `kill_init` and `kill_shell` exercise the console
+driver, init and the shell.
 
 ## Running on real hardware
 
@@ -227,6 +260,7 @@ why. `TEXT_MODE=1 make usb DEV=/dev/sdX` writes a stick that always does.
 
 ## Next
 
-The mouse on the T430. Then one of: the capability layer (revoking what was
-handed out; capabilities for memory and address spaces), a first shell, or
-read-only disks on a spare machine.
+The shell on the T430. Then one of: the shell starting programs (with a
+Factory narrowed to just those), the capability layer (revoking what was
+handed out; capabilities for memory and address spaces), or read-only disks
+on a spare machine.

@@ -32,7 +32,7 @@ use crate::syscall::{copy_from_user, ERR_BAD_ARGUMENT, ERR_NO_CAPABILITY, ERR_NO
 /// The programs spawn can start, by number (user/freya.inc and
 /// user/rust/src/lib.rs: PROGRAM_*). The kernel's test programs aren't
 /// among them: only its own self-tests start those.
-pub static PROGRAMS: [&Program; 4] = [&process::HELLO, &process::CONSOLE, &process::PS2, &process::MOUSE];
+pub static PROGRAMS: [&Program; 5] = [&process::HELLO, &process::CONSOLE, &process::PS2, &process::MOUSE, &process::SHELL];
 
 /// "No capability here" in spawn's slot list.
 pub const NO_SLOT_BYTE: u8 = 0xFF;

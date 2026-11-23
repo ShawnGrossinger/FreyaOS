@@ -35,6 +35,29 @@
 //!   bit 2  irq_wait on the line once it is bound: refused
 //!   then 5 signals, each bit (1 << 16) alone (the kernel raises the line
 //!   once before this starts, then once each time it waits)
+//!
+//! SIGNAL (4, Entry 23), with slot 0 Console, 1 an endpoint (SEND + RECV,
+//! no badge), 2 the same endpoint with SEND and badge 0x5, 3 the same with
+//! RECV only and badge 0x2, 4 an endpoint nobody can receive on (SEND,
+//! badge 1) (kernel/src/ipc.rs checks it exits with 0xF):
+//!   bit 0  signal through slot 2, twice, then recv: one signal, 0x5 (the
+//!          two merged), and signal never waited for a receiver
+//!   bit 1  through slot 1, which has no badge: refused (bad argument)
+//!   bit 2  through slot 3 (no SEND), or the console: refused
+//!   bit 3  through slot 4: peer-gone
+//!
+//! INFO (5, Entry 23), with slot 0 Console, 1 Info, 2 an endpoint (SEND +
+//! RECV, badge 0x2A) (kernel/src/info.rs checks it exits with 0x1F):
+//!   bit 0  info: the header (100 ticks a second, some ticks so far, free
+//!          memory no more than the usable) and a record for captest itself:
+//!          running, a process, 3 capabilities
+//!   bit 1  a buffer with room for the header only: the header, no records
+//!   bit 2  refused: the console where Info should be; a buffer too small
+//!          for the header
+//!   bit 3  refused (bad address): a buffer at a kernel address; one in its
+//!          own code, which it may read but not write
+//!   bit 4  cap_info: slot 0 the console, 1 Info, 2 the endpoint with SEND
+//!          + RECV and badge 0x2A, 3 empty; slot 32 refused
 
 #![no_std]
 #![no_main]
@@ -50,6 +73,8 @@ const EP: u64 = 2;
 const SPAWN: u64 = 1;
 const MINT: u64 = 2;
 const BIND: u64 = 3;
+const SIGNAL: u64 = 4;
+const INFO: u64 = 5;
 const TEST_LINE: u64 = 16;
 
 fn main(arg: u64) -> u64 {
@@ -57,6 +82,8 @@ fn main(arg: u64) -> u64 {
         SPAWN => spawn_tests(),
         MINT => mint_tests(),
         BIND => bind_tests(),
+        SIGNAL => signal_tests(),
+        INFO => info_tests(),
         _ => 0,
     }
 }
@@ -148,4 +175,48 @@ fn bind_tests() -> u64 {
         }
     }
     bit(0, not_a_line) | bit(1, no_recv) | bit(2, no_wait) | signals << 8
+}
+
+fn signal_tests() -> u64 {
+    const OWN: u64 = 1;
+    const BADGED: u64 = 2;
+    const RECV_ONLY: u64 = 3;
+    const NOBODY: u64 = 4;
+    let sent = signal(BADGED) == 0 && signal(BADGED) == 0;
+    let merged = sent && matches!(recv(OWN), Ok(m) if m.badge == SIGNAL_BADGE && m.words[0] == 0x5);
+    let no_badge = signal(OWN) == ERR_BAD_ARGUMENT;
+    let no_send = signal(RECV_ONLY) == ERR_WRONG_CAPABILITY && signal(CONSOLE_SLOT) == ERR_WRONG_CAPABILITY;
+    let gone = signal(NOBODY) == ERR_PEER_GONE;
+    bit(0, merged) | bit(1, no_badge) | bit(2, no_send) | bit(3, gone)
+}
+
+/// Room for the header and every task there can be.
+static mut BUF: [u8; INFO_HEADER + 32 * INFO_RECORD] = [0; INFO_HEADER + 32 * INFO_RECORD];
+
+fn info_tests() -> u64 {
+    const INFO_SLOT: u64 = 1;
+    let buf = unsafe { &mut *(&raw mut BUF) };
+    let mine = match info(INFO_SLOT, buf) {
+        Ok(sys) => {
+            let me = (0..sys.tasks).map(|i| task_info(buf, i)).find(|t| t.name() == b"captest");
+            sys.ticks_per_second == 100
+                && sys.ticks > 0
+                && sys.free_frames > 0
+                && sys.free_frames <= sys.usable_frames
+                && me.is_some_and(|t| t.what == TASK_RUNNING && t.flags & TASK_FLAG_PROCESS != 0 && t.caps == 3)
+        }
+        Err(_) => false,
+    };
+    let header_only = matches!(info(INFO_SLOT, &mut buf[..INFO_HEADER + INFO_RECORD - 1]), Ok(sys) if sys.tasks == 0);
+    let refused = info(CONSOLE_SLOT, buf).err() == Some(ERR_WRONG_CAPABILITY)
+        && info(INFO_SLOT, &mut buf[..INFO_HEADER - 1]).err() == Some(ERR_BAD_ARGUMENT);
+    let code_start = main as *const () as u64 & !0xFFF;
+    let bad_address = info_raw(INFO_SLOT, 0xFFFF_8000_0000_0000, 4096) == ERR_BAD_ADDRESS
+        && info_raw(INFO_SLOT, code_start, 4096) == ERR_BAD_ADDRESS;
+    let caps = cap_info(0) == Ok((KIND_CONSOLE, 0, 0, 0))
+        && cap_info(1) == Ok((KIND_INFO, 0, 0, 0))
+        && matches!(cap_info(2), Ok((KIND_ENDPOINT, _, rights, 0x2A)) if rights == SEND | RECV)
+        && cap_info(3) == Ok((KIND_NONE, 0, 0, 0))
+        && cap_info(32) == Err(ERR_BAD_ARGUMENT);
+    bit(0, mine) | bit(1, header_only) | bit(2, refused) | bit(3, bad_address) | bit(4, caps)
 }

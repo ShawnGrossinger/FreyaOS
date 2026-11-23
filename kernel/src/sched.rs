@@ -678,6 +678,79 @@ pub fn name(id: TaskId) -> &'static str {
     without_interrupts(|| table()[id % MAX_TASKS].name.unwrap_or(""))
 }
 
+/// What a task is doing, as info.rs reports it (Entry 23): `what` is one
+/// of the TASK_* codes below, `detail` the endpoint, task, line or tick it
+/// waits for.
+#[derive(Clone, Copy)]
+pub struct Summary {
+    pub what: u32,
+    pub detail: u64,
+    pub name: &'static str,
+    pub slices: u64,
+    /// Capabilities it holds.
+    pub caps: u32,
+    /// A process (its own address space), not a kernel task.
+    pub process: bool,
+    /// The idle task (runs when nothing else can).
+    pub idle: bool,
+}
+
+pub const TASK_RUNNING: u32 = 1;
+pub const TASK_READY: u32 = 2;
+pub const TASK_SLEEPING: u32 = 3;
+pub const TASK_JOINING: u32 = 4;
+pub const TASK_SENDING: u32 = 5;
+pub const TASK_RECEIVING: u32 = 6;
+pub const TASK_AWAITING_REPLY: u32 = 7;
+pub const TASK_LOCK: u32 = 8;
+pub const TASK_IRQ: u32 = 9;
+pub const TASK_FINISHED: u32 = 10;
+pub const TASK_STARTING: u32 = 11;
+
+/// Task `id`, if the slot holds one.
+pub fn summary(id: TaskId) -> Option<Summary> {
+    if id >= MAX_TASKS {
+        return None;
+    }
+    without_interrupts(|| {
+        let t = &table()[id];
+        let (what, detail) = match t.state {
+            State::Free => return None,
+            State::Creating => (TASK_STARTING, 0),
+            State::Ready => (TASK_READY, 0),
+            State::Running => (TASK_RUNNING, 0),
+            State::Sleeping(until) => (TASK_SLEEPING, until),
+            State::Joining(other, _) => (TASK_JOINING, other as u64),
+            State::Sending(ep) => (TASK_SENDING, ep as u64),
+            State::Receiving(ep) => (TASK_RECEIVING, ep as u64),
+            State::AwaitingReply(server) => (TASK_AWAITING_REPLY, server as u64),
+            State::MutexWait(_) => (TASK_LOCK, 0),
+            State::IrqWait(line) => (TASK_IRQ, line as u64),
+            State::Finished => (TASK_FINISHED, 0),
+        };
+        Some(Summary {
+            what,
+            detail,
+            name: t.name.unwrap_or(""),
+            slices: t.slices,
+            caps: t.caps.iter().filter(|&&c| c != Cap::None).count() as u32,
+            process: t.space != 0,
+            idle: id == idle_id(),
+        })
+    })
+}
+
+/// A task called `name` that hasn't finished, if there is one (the
+/// kill-shell demo looks for the shell this way).
+pub fn find(name: &str) -> Option<TaskId> {
+    without_interrupts(|| {
+        (0..MAX_TASKS).find(|&i| {
+            let t = &table()[i];
+            t.name == Some(name) && !matches!(t.state, State::Free | State::Creating | State::Finished)
+        })
+    })
+}
+
 /// True while task `id` waits in IPC (sending, receiving, or for a reply).
 pub fn blocked_in_ipc(id: TaskId) -> bool {
     without_interrupts(|| matches!(task(id).state, State::Sending(_) | State::Receiving(_) | State::AwaitingReply(_)))

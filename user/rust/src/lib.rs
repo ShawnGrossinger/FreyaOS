@@ -88,6 +88,9 @@ pub const SYS_ENDPOINT: u64 = 16;
 pub const SYS_MINT: u64 = 17;
 pub const SYS_DROP: u64 = 18;
 pub const SYS_IRQ_BIND: u64 = 19;
+pub const SYS_SIGNAL: u64 = 20;
+pub const SYS_INFO: u64 = 21;
+pub const SYS_CAP_INFO: u64 = 22;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
 pub const ERR_NO_CAPABILITY: i64 = -2;
@@ -113,6 +116,7 @@ pub const PROGRAM_HELLO: u64 = 0;
 pub const PROGRAM_CONSOLE: u64 = 1;
 pub const PROGRAM_PS2: u64 = 2;
 pub const PROGRAM_MOUSE: u64 = 3;
+pub const PROGRAM_SHELL: u64 = 4;
 
 // ===========================================================================
 // Driver protocols: the first word of a call says what is asked
@@ -128,6 +132,13 @@ pub const SCROLL_TO_END: u64 = 2;
 /// up, as signed numbers), word 3 its buttons (bit 0 left, 1 right, 2
 /// middle) and, in bits 8 to 15, the wheel (signed: negative is up).
 pub const CONSOLE_POINTER: u64 = 2;
+/// INPUT (Entry 23): the line being typed, shown on the screen's last row.
+/// Word 1: an offset into the line (bits 0 to 15) and the line's whole
+/// length (bits 16 to 31); words 2 and 3: the 16 bytes of the line from
+/// that offset (as many as it has). The shell sends the whole line this
+/// way, 16 bytes a call, each time it changes.
+pub const CONSOLE_INPUT: u64 = 3;
+pub const INPUT_CHUNK: usize = 16;
 
 /// To the PS/2 driver (src/bin/ps2.rs), from the mouse driver. READ:
 /// answered, at once or when some arrive, with the mouse's bytes: word 0
@@ -136,6 +147,31 @@ pub const CONSOLE_POINTER: u64 = 2;
 /// (0xFA, ...) arrives among the bytes READ returns.
 pub const PS2_READ: u64 = 1;
 pub const PS2_SEND_TO_MOUSE: u64 = 2;
+/// READ_KEYS (Entry 23), from the shell: answered at once with the keys
+/// typed since the last READ_KEYS, packed as READ packs bytes (up to 24).
+/// Since Entry 23 the PS/2 driver answers every call at once, READ with
+/// what it has, even nothing: it signals the mouse driver and the shell
+/// when there is something to read (SIGNAL_BYTES, SIGNAL_KEYS).
+pub const PS2_READ_KEYS: u64 = 3;
+/// Most bytes or keys one READ or READ_KEYS answer holds.
+pub const READ_MAX: usize = 24;
+
+/// The keys READ_KEYS hands over: printable ASCII as typed, and these.
+pub const KEY_ENTER: u8 = b'\n';
+pub const KEY_BACKSPACE: u8 = 0x08;
+pub const KEY_ESCAPE: u8 = 0x1B;
+pub const KEY_UP: u8 = 0x80;
+pub const KEY_DOWN: u8 = 0x81;
+
+/// Signal bits init's capabilities set (system call signal, Entry 23). On
+/// the shell's endpoint: keys are waiting (from the PS/2 driver); the
+/// console driver started again, so the line being typed must be sent
+/// again (from init). On the mouse driver's: its bytes are waiting. No
+/// process id is 0 or 1, so the kernel's exit signals (bit 1 << id) never
+/// use these bits.
+pub const SIGNAL_KEYS: u64 = 1 << 0;
+pub const SIGNAL_REDRAW: u64 = 1 << 1;
+pub const SIGNAL_BYTES: u64 = 1 << 0;
 /// "No capability here" in spawn's slot list.
 pub const NO_SLOT: u8 = 0xFF;
 
@@ -286,6 +322,12 @@ pub fn power(slot: u64, action: u64) -> i64 {
 pub const POWER_RESTART: u64 = 0;
 pub const POWER_OFF: u64 = 1;
 
+/// Set the bits of the badge of the endpoint capability in `slot` (which
+/// needs SEND) as signals for whoever receives there; never waits.
+pub fn signal(slot: u64) -> i64 {
+    syscall3(SYS_SIGNAL, slot, 0, 0)
+}
+
 /// Let go of the capability in `slot`.
 pub fn drop_cap(slot: u64) -> i64 {
     syscall3(SYS_DROP, slot, 0, 0)
@@ -389,6 +431,145 @@ pub fn reply(words: [u64; 4], xfer: u64) -> i64 {
         );
     }
     result
+}
+
+// ===========================================================================
+// What the system says about itself (Entry 23: kernel/src/info.rs)
+// ===========================================================================
+
+/// What cap_info says a slot holds.
+pub const KIND_NONE: i64 = 0;
+pub const KIND_CONSOLE: i64 = 1;
+pub const KIND_ENDPOINT: i64 = 2;
+pub const KIND_IO_PORTS: i64 = 3;
+pub const KIND_IRQ: i64 = 4;
+pub const KIND_POWER: i64 = 5;
+pub const KIND_MEMORY: i64 = 6;
+pub const KIND_FACTORY: i64 = 7;
+pub const KIND_INFO: i64 = 8;
+
+/// The capability in the caller's own `slot`: Ok((kind, a, b, c)), where
+/// an endpoint's a, b, c are its number, rights and badge; a port range's
+/// its base and count; an interrupt's its line; memory's its pages and
+/// flags.
+pub fn cap_info(slot: u64) -> Result<(i64, u64, u64, u64), i64> {
+    let (kind, a, b, c): (i64, u64, u64, u64);
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") SYS_CAP_INFO => kind,
+            inlateout("rdi") slot => a,
+            lateout("rsi") b,
+            lateout("rdx") c,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    if kind < 0 {
+        return Err(kind);
+    }
+    Ok((kind, a, b, c))
+}
+
+/// The snapshot's header, and one record per task after it.
+pub const INFO_HEADER: usize = 64;
+pub const INFO_RECORD: usize = 48;
+
+/// What a task is doing (TaskInfo::what).
+pub const TASK_RUNNING: u32 = 1;
+pub const TASK_READY: u32 = 2;
+pub const TASK_SLEEPING: u32 = 3;
+pub const TASK_JOINING: u32 = 4;
+pub const TASK_SENDING: u32 = 5;
+pub const TASK_RECEIVING: u32 = 6;
+pub const TASK_AWAITING_REPLY: u32 = 7;
+pub const TASK_LOCK: u32 = 8;
+pub const TASK_IRQ: u32 = 9;
+pub const TASK_FINISHED: u32 = 10;
+pub const TASK_STARTING: u32 = 11;
+
+pub const TASK_FLAG_PROCESS: u32 = 1 << 0;
+pub const TASK_FLAG_IDLE: u32 = 1 << 1;
+
+pub struct SystemInfo {
+    pub tasks: usize,
+    pub ticks: u64,
+    pub ticks_per_second: u64,
+    pub free_frames: u64,
+    pub usable_frames: u64,
+    pub switches: u64,
+    pub syscalls: u64,
+}
+
+pub struct TaskInfo {
+    pub id: u32,
+    pub what: u32,
+    /// The endpoint, task, interrupt line or tick it waits for.
+    pub detail: u64,
+    pub name: [u8; 16],
+    pub slices: u64,
+    pub caps: u32,
+    pub flags: u32,
+}
+
+impl TaskInfo {
+    /// The name, without the zeros after it.
+    pub fn name(&self) -> &[u8] {
+        let end = self.name.iter().position(|&b| b == 0).unwrap_or(16);
+        &self.name[..end]
+    }
+}
+
+fn u32_at(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+fn u64_at(b: &[u8], at: usize) -> u64 {
+    u32_at(b, at) as u64 | (u32_at(b, at + 4) as u64) << 32
+}
+
+/// A snapshot of the system into `buf`, with the Info capability in
+/// `slot`: the header, then as many tasks as fit. Returns the header, or
+/// the error.
+pub fn info(slot: u64, buf: &mut [u8]) -> Result<SystemInfo, i64> {
+    let n = syscall3(SYS_INFO, slot, buf.as_mut_ptr() as u64, buf.len() as u64);
+    if n < 0 {
+        return Err(n);
+    }
+    if n < INFO_HEADER as i64 || &buf[..8] != b"FREYAINF" || u32_at(buf, 8) != 1 {
+        return Err(ERR_BAD_ARGUMENT);
+    }
+    Ok(SystemInfo {
+        tasks: u32_at(buf, 12) as usize,
+        ticks: u64_at(buf, 16),
+        ticks_per_second: u64_at(buf, 24),
+        free_frames: u64_at(buf, 32),
+        usable_frames: u64_at(buf, 40),
+        switches: u64_at(buf, 48),
+        syscalls: u64_at(buf, 56),
+    })
+}
+
+/// Raw info, for the self-tests that pass bad buffers.
+pub fn info_raw(slot: u64, ptr: u64, len: u64) -> i64 {
+    syscall3(SYS_INFO, slot, ptr, len)
+}
+
+/// Task record `i` of a snapshot info() wrote into `buf`.
+pub fn task_info(buf: &[u8], i: usize) -> TaskInfo {
+    let r = &buf[INFO_HEADER + i * INFO_RECORD..INFO_HEADER + (i + 1) * INFO_RECORD];
+    let mut name = [0u8; 16];
+    name.copy_from_slice(&r[16..32]);
+    TaskInfo {
+        id: u32_at(r, 0),
+        what: u32_at(r, 4),
+        detail: u64_at(r, 8),
+        name,
+        slices: u64_at(r, 32),
+        caps: u32_at(r, 40),
+        flags: u32_at(r, 44),
+    }
 }
 
 // ===========================================================================

@@ -38,10 +38,15 @@ ROOT=out/test
 #        "keyboard ready", or for a crash report to end. The mouse (Entry
 #        22): "mouse:DX:DY" moves it (y down, as on screen), "wheel:N" turns
 #        its wheel (positive is up), "button:MASK" sets its buttons (1 left,
-#        2 right, 4 middle).
+#        2 right, 4 middle). "pointerdump" checks the pointer is drawn where
+#        the console driver says; "shelldump" (Entry 23) that the line being
+#        typed is on the last row with the cursor after it, and the shell's
+#        last line above it in white, without the kernel's "[user N]".
+#        Typed lines go to the shell (Entry 23): "e c h o spc h i ret" is
+#        "echo hi", and the shell answers "hi".
 CASES=(
   "image||||"   # not booted: checks the disk image's layout (see check_image)
-  "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;\\[user 3 'init'\\] started the console driver \\(process 4\\), the PS/2 driver \\(process 5\\) and the mouse driver \\(process 6\\);;\\[console\\] process [0-9]+ \\('console'\\) draws the screen from here on;;\\[display\\] VESA graphics [0-9]+x[0-9]+, 32-bit;;reads back pixel for pixel \\(128 pixels, [0-9]+ lit, 0 wrong\\); framebuffer mapped write-combining \\(PAT entry 4\\): PASS;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!;;'probe' killed by vector 14 #PF;;\\[user [0-9]+ 'ipc'\\] printed for me by the log server;;driver handled 10"
+  "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;\\[user 3 'init'\\] started the console driver \\(process 4\\), the PS/2 driver \\(process 5\\), the mouse driver \\(process 6\\) and the shell \\(process 7\\);;\\[user 7 'shell'\\] shell ready: type help;;\\[console\\] process [0-9]+ \\('console'\\) draws the screen from here on;;\\[display\\] VESA graphics [0-9]+x[0-9]+, 32-bit;;reads back pixel for pixel \\(128 pixels, [0-9]+ lit, 0 wrong\\); framebuffer mapped write-combining \\(PAT entry 4\\): PASS;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!;;'probe' killed by vector 14 #PF;;\\[user [0-9]+ 'ipc'\\] printed for me by the log server;;driver handled 10"
   "bios-if-on|bios-if-on|128M|BIOS had left them ON after its disk calls; stage 2 turned them off\\): PASS;;self-tests: [0-9]+ passed, 0 failed"
   "dirty-ram||128M-dirty|self-tests: [0-9]+ passed, 0 failed;;init complete"
   "boot-4G||4G|physical map at 0xffff800000000000: 4096 MiB;;init complete - boot thread done; scheduler and timer running"
@@ -51,15 +56,15 @@ CASES=(
   "task_stack_overflow|task_stack_overflow|128M|vector 8 #DF Double Fault;;TASK STACK OVERFLOW \(task [0-9]+ 'overflow-demo';;running task: [0-9]+ 'overflow-demo'"
   "smap|smap|128M|vector 14 #PF Page Fault;;cr2=0x0000000040000000;;protection violation, read, supervisor mode;;kernel touched user memory|-cpu max"
   "smep|smep|128M|vector 14 #PF Page Fault;;cr2=0x0000000040000000;;protection violation, instruction fetch, supervisor mode;;kernel touched user memory|-cpu max"
-  "keyboard||128M|keyboard ready;;typed: hello World||delete end ctrl-delete alt-end ctrl-end alt-delete h e l l o spc shift-w o r l d ret"
-  "scroll||128M|scrolling checked: [0-9 ]+;;typed: hi;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette||pgdn pgup pgup pgdn pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup h i ret screendump"
-  "text-mode|text-mode|128M|text mode, 80x25: built with TEXT_MODE=1;;a character put in the last cell of text mode is in VGA memory .*: PASS;;\\[console note\\] view 6 rows back;;\\[console note\\] view 12 rows back;;screendump matches the mode: 720x400||pgup pgup screendump"
+  "keyboard||128M|keyboard ready;;\\[console note\\] input row: freya> echo hello World$;;'shell'\\] freya> echo hello World$;;'shell'\\] hello World$||delete end ctrl-delete alt-end ctrl-end alt-delete ctrl-x alt-y e c h o spc h e l l o spc shift-w o r l d ret"
+  "scroll||128M|scrolling checked: [0-9 ]+;;'shell'\\] hi$;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette||pgdn pgup pgup pgdn pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup e c h o spc h i ret screendump"
+  "text-mode|text-mode|128M|text mode, 80x25: built with TEXT_MODE=1;;a character put in the last cell of text mode is in VGA memory .*: PASS;;\\[console note\\] view 5 rows back;;\\[console note\\] view 10 rows back;;'shell'\\] hi$;;screendump matches the mode: 720x400||pgup pgup screendump e c h o spc h i ret"
   "edid-1366||128M|display's own resolution 1366x768 \\(EDID\\);;VESA graphics 1280x768, 32-bit;;screendump matches the mode: 1280x768, and the colour swatch is the VGA palette;;the screen changed since the last screendump|-vga none -device VGA,xres=1366,yres=768|screendump pause screendiff"
   "edid-1440||128M|display's own resolution 1440x900 \\(EDID\\);;VESA graphics 1440x900, 32-bit|-vga none -device VGA,xres=1440,yres=900|"
   "no-edid||128M|display's own resolution unknown \\(no EDID: modes up to 1024x768\\);;VESA graphics 1024x768, 32-bit;;screendump matches the mode: 1024x768, and the colour swatch|-vga none -device VGA,edid=off|screendump"
   "cirrus-24bit||128M|VESA graphics 1024x768, 24-bit;;reads back pixel for pixel \\(128 pixels, [0-9]+ lit, 0 wrong\\);;screendump matches the mode: 1024x768, and the colour swatch|-vga cirrus|screendump"
-  "shift||128M|display: status 0x02;;text mode, 80x25: Shift held while booting;;a character put in the last cell of text mode is in VGA memory .*: PASS;;typed: hi|-global i8042.kbd-throttle=on|hold-shift h i ret"
-  "held-key||128M|VESA graphics [0-9]+x[0-9]+;;typed: hi|-global i8042.kbd-throttle=on|hold-ctrl h i ret"
+  "shift||128M|display: status 0x02;;text mode, 80x25: Shift held while booting;;a character put in the last cell of text mode is in VGA memory .*: PASS;;'shell'\\] hi$|-global i8042.kbd-throttle=on|hold-shift e c h o spc h i ret"
+  "held-key||128M|VESA graphics [0-9]+x[0-9]+;;'shell'\\] hi$|-global i8042.kbd-throttle=on|hold-ctrl e c h o spc h i ret"
   "restart||128M|\\[power\\] Restarting;;restart through the keyboard controller;;QEMU exited by itself||ctrl-alt-delete"
   "shutdown||128M|switching the firmware to ACPI mode;;\\[power\\] ACPI soft off \\(S5\\);;QEMU exited by itself||ctrl-alt-end"
   "restart-q35||128M|restart through the ACPI reset register;;QEMU exited by itself|-machine q35|ctrl-alt-delete"
@@ -69,10 +74,12 @@ CASES=(
   "heap_double_free|heap_double_free|128M|\[heap\] FATAL: double free"
   "panic|panic|128M|\[kernel\] PANIC at src/main.rs:[0-9]+: FREYA_DEMO=panic;;crash screen: red at the top||crashdump"
   "vbe-lies|vbe-lies|128M|display's own resolution 1280x800 \\(EDID\\);;VESA graphics 800x600, 32-bit;;screendump matches the mode: 800x600, and the colour swatch is the VGA palette|-vga none -device VGA,xres=1280,yres=800|screendump"
-  "kill-console|kill_console|128M|\\[demo\\] console driver killed;;ended: the kernel draws the screen again;;\\[user [0-9]+ 'init'\\] the console driver \\(process [0-9]+\\) ended: started it again as process [0-9]+ \\(1 of 3\\);;started again: it draws and scrolls;;typed: hi;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette||screendump pause pgup h i ret"
-  "kill-console-often|kill_console_often|128M|\\[demo\\] console driver killed \\(4 of 4\\);;started it again as process [0-9]+ \\(3 of 3\\);;started again 3 times already, so it stays stopped;;typed: hi;;no console notes after it stayed stopped;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette;;the screen changed since the last screendump||screendump pause pause pgup h i ret pause screendiff"
-  "kill-init|kill_init|128M|\\[demo\\] init killed;;\\[demo\\] console driver killed;;ended: the kernel draws the screen again;;typed: hi;;no console notes after it ended;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette;;the screen changed since the last screendump||screendump pause pgup h i ret pause screendiff"
-  "mouse||128M|mouse ready: 4-byte packets, with a wheel;;mouse checked: ;;typed: hi;;the pointer is drawn where the console says||pause mouse:80:48 button:1 button:0 wheel:1 wheel:-1 button:4 mouse:0:-64 button:0 mouse:0:64 mouse:127:127 mouse:127:127 mouse:127:127 mouse:127:127 mouse:127:127 mouse:-40:-200 h i ret pointerdump"
+  "kill-console|kill_console|128M|\\[demo\\] console driver killed;;ended: the kernel draws the screen again;;\\[user [0-9]+ 'init'\\] the console driver \\(process [0-9]+\\) ended: started it again as process [0-9]+ \\(1 of 3\\);;started again: it draws and scrolls;;started again: the shell sent it the line being typed;;'shell'\\] hi$;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette||screendump pause pgup e c h o spc h i ret"
+  "kill-console-often|kill_console_often|128M|\\[demo\\] console driver killed \\(4 of 4\\);;started it again as process [0-9]+ \\(3 of 3\\);;started again 3 times already, so it stays stopped;;'shell'\\] hi$;;no console notes after it stayed stopped;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette;;the screen changed since the last screendump||screendump pause pause pgup e c h o spc h i ret pause screendiff"
+  "kill-init|kill_init|128M|\\[demo\\] init killed;;\\[demo\\] console driver killed;;ended: the kernel draws the screen again;;'shell'\\] hi$;;no console notes after it ended;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette;;the screen changed since the last screendump||screendump pause pgup e c h o spc h i ret pause screendiff"
+  "mouse||128M|mouse ready: 4-byte packets, with a wheel;;mouse checked: ;;'shell'\\] hi$;;the pointer is drawn where the console says||pause mouse:80:48 button:1 button:0 wheel:1 wheel:-1 button:4 mouse:0:-64 button:0 mouse:0:64 mouse:127:127 mouse:127:127 mouse:127:127 mouse:127:127 mouse:127:127 mouse:-40:-30 e c h o spc h i ret pointerdump"
+  "shell||128M|shell ready: type help;;'shell'\\]   echo TEXT  print TEXT$;;'shell'\\] freya> echo two$;;'shell'\\]   3  init          29  waiting for a message on endpoint [0-9]+$;;'shell'\\]   4  console        6  waiting for a message on endpoint [0-9]+$;;'shell'\\]   5  ps2           10  waiting for a message on endpoint [0-9]+$;;'shell'\\]   6  mouse          4  waiting for a message on endpoint [0-9]+$;;'shell'\\]   7  shell          6  running$;;'shell'\\] [0-9]+ tasks: 5 processes, [0-9]+ in the kernel$;;'shell'\\] slot  0  Console: writes to the log$;;'shell'\\] slot  1  Endpoint [0-9]+: receive$;;'shell'\\] slot  2  Endpoint [0-9]+: send, badge 4$;;'shell'\\] slot  3  Endpoint [0-9]+: send, badge 4$;;'shell'\\] slot  4  Info: reads uptime, memory, the tasks$;;'shell'\\] slot  5  Power: restarts, switches off$;;'shell'\\] 6 of 32 slots hold a capability;;'shell'\\] up 0 h 0 min [0-9]+ s \\([0-9]+ timer ticks, 100 a second\\);;'shell'\\] memory: [0-9]+ MiB free of 127 MiB usable;;'shell'\\] foo: no such command \\(help lists them\\)$;;shell checked: ;;the line being typed is on the last row||h e l p ret e c h o o backspace spc o n e ret x y z esc e c h o spc t w o ret up up ret p s ret c a p s ret u p t i m e ret m e m ret f o o ret e c h o shelldump"
+  "kill-shell|kill_shell|128M|\\[demo\\] shell killed;;\\[user 3 'init'\\] the shell \\(process 7\\) ended: started it again as process [0-9]+ \\(1 of 3\\);;'shell'\\] hi$;;the shell started again answered||pause e c h o spc h i ret"
   "log-flood|log_flood|128M|flood 600;;tick 1;;flood checked: ;;screendump matches the mode: 1280x800, and the colour swatch is the VGA palette;;the log below the bar did not change||pause pgup screendump pause logsame pgdn pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup"
 )
 COMMON="self-tests: [0-9]+ passed, 0 failed"
@@ -181,6 +188,10 @@ boot() { # boot <image> <ram> <serial log> <keys> [extra QEMU arguments...]
         pointerdump)
           take_screendump "${log%/*}/screen.ppm" "$mon.in"
           check_pointer "${log%/*}/screen.ppm" "$log" "$notes"
+          continue ;;
+        shelldump)
+          take_screendump "${log%/*}/screen.ppm" "$mon.in"
+          check_shell_screen "${log%/*}/screen.ppm" "$log" "$notes"
           continue ;;
         logsame)
           take_screendump "${log%/*}/screen2.ppm" "$mon.in"
@@ -326,8 +337,10 @@ check_log_same() { # check_log_same <earlier ppm> <later ppm> <notes file>
 check_pointer() { # check_pointer <ppm> <serial log> <notes file>
   # The cell the console driver last said the pointer is in must be drawn
   # with its colours swapped (Entry 22). The mouse case leaves it on a
-  # blank cell of the log: grey (0xaaaaaa) swapped, black otherwise. Its
-  # top-left pixel is background in every glyph of the font.
+  # blank cell of the log: black otherwise, swapped the colour of the
+  # row's text, grey (0xaaaaaa), or white (0xffffff) on a row of the
+  # shell's (Entry 23). Its top-left pixel is background in every glyph of
+  # the font.
   local ppm=$1 log=$2 out=$3 w hdr col row off seen
   read -r col row < <(grep -a '^\[console note\] pointer at column' "$log" | tail -1 | sed 's/.*column \([0-9]*\), row \([0-9]*\);.*/\1 \2/')
   w=$(head -c 40 "$ppm" 2>/dev/null | tr '\n' ' ' | awk '$1 == "P6" { print $2 }')
@@ -338,7 +351,7 @@ check_pointer() { # check_pointer <ppm> <serial log> <notes file>
   hdr=$(head -c 40 "$ppm" | head -3 | wc -c)
   off=$((hdr + (row * 16 * w + col * 8) * 3))
   seen=$(od -An -v -t x1 -j "$off" -N 3 "$ppm" | tr -d ' \n')
-  if [ "$seen" = aaaaaa ]; then
+  if [ "$seen" = aaaaaa ] || [ "$seen" = ffffff ]; then
     echo "[test.sh] the pointer is drawn where the console says (column $col, row $row)" >> "$out"
   else
     echo "[test.sh] the pointer's cell (column $col, row $row) is $seen, not swapped" >> "$out"
@@ -346,12 +359,15 @@ check_pointer() { # check_pointer <ppm> <serial log> <notes file>
 }
 
 check_mouse() { # check_mouse <serial log>: the mouse case's moves
-  # From the middle of 1280x800 (cell 80, 25): 80 right and 48 down is
-  # column 90, row 28; left pressed and let go there; the wheel up a notch
-  # (3 rows back) and down again (0); the middle button held and 64 up
-  # (4 rows back, the pointer staying put); let go, 64 down (row 32);
-  # five steps of 127 right and down, past the corner (159, 49); then 40
-  # left and 200 up (154, 37). (QEMU's PS/2 mouse sends at most 127 a
+  # The pointer moves over a field of 640 x 400 counts in every mode, laid
+  # over the screen's cells (Entry 23): on 1280x800's 160 x 50 cells, a
+  # cell is 4 counts wide and 8 high. From the middle (320, 200: cell 80,
+  # 25): 80 right and 48 down is (400, 248), column 100, row 31; left
+  # pressed and let go there; the wheel up a notch (3 rows back) and down
+  # again (0); the middle button held and 64 up (4 rows back, the pointer
+  # staying put); let go, 64 down (312: row 39); five steps of 127 right
+  # and down, past the corner (159, 49); then 40 left and 30 up (599,
+  # 369: column 149, row 46). (QEMU's PS/2 mouse sends at most 127 a
   # packet and only a few packets per move; the rest waits for the next
   # move, so the case moves in steps.)
   local pointers views why
@@ -359,19 +375,76 @@ check_mouse() { # check_mouse <serial log>: the mouse case's moves
   views=$(sed -n '/mouse ready/,$ s/^\[console note\] view \([0-9]*\) rows back.*/\1/p' "$1" | tr '\n' ' ')
   why=$(awk -v p="$pointers" -v v="$views" 'BEGIN {
       n = split(p, at, " "); m = split(v, view, " ")
-      if (at[1] != "90,28,none") { print "first: " at[1]; exit }
-      if (at[2] != "90,28,left" || at[3] != "90,28,none") { print "click: " at[2] " " at[3]; exit }
+      if (at[1] != "100,31,none") { print "first: " at[1]; exit }
+      if (at[2] != "100,31,left" || at[3] != "100,31,none") { print "click: " at[2] " " at[3]; exit }
       if (m < 3 || view[1] != 3 || view[2] != 0 || view[3] != 4) { print "scrolling: " v; exit }
-      if (at[4] != "90,28,middle" || at[5] != "90,28,none" || at[6] != "90,32,none") { print "middle: " at[4] " " at[5] " " at[6]; exit }
+      if (at[4] != "100,31,middle" || at[5] != "100,31,none" || at[6] != "100,39,none") { print "middle: " at[4] " " at[5] " " at[6]; exit }
       corner = 0; for (i = 7; i <= n; i++) if (at[i] == "159,49,none") corner = 1
       if (!corner) { print "never reached the corner (159, 49)"; exit }
-      if (at[n] != "154,37,none") { print "last: " at[n]; exit }
+      if (at[n] != "149,46,none") { print "last: " at[n]; exit }
       print "ok"
     }')
   if [ "$why" = ok ]; then
     echo "[test.sh] mouse checked: ${pointers}| views ${views}" >> "$1"
   else
     echo "[test.sh] mouse wrong: $why ($pointers | $views)" >> "$1"
+  fi
+}
+
+cell_pixels() { # cell_pixels <ppm> <header bytes> <width> <row> <col>: a cell's 8 x 16 pixels, in hex
+  local y
+  for y in $(seq 0 15); do
+    od -An -v -t x1 -j $(($2 + ((($4 * 16 + y) * $3) + $5 * 8) * 3)) -N 24 "$1"
+  done | tr -d ' \n'
+}
+
+check_shell_screen() { # check_shell_screen <ppm> <serial log> <notes file>
+  # The shell case ends with "echo" typed (Entry 23). The screen's last
+  # row must be the line the console driver last noted ("input row:
+  # freya> echo"), with the cursor after it: grey (0xaaaaaa) at its top-left
+  # pixel. Two rows up, above the log's row in progress, is the shell's
+  # last line, "foo: no such command": drawn without the kernel's "[user N
+  # 'shell'] " and in bright white, its first cell is the same 'f', pixel
+  # for pixel, as the prompt's on the last row, and has white (0xffffff)
+  # in it.
+  local ppm=$1 log=$2 out=$3 w h hdr text rows off seen prompt last
+  # (Read while QEMU runs: its lines still end in \r.)
+  text=$(grep -a '^\[console note\] input row: ' "$log" | tail -1 | sed 's/^\[console note\] input row: //; s/\r$//')
+  read -r w h < <(head -c 40 "$ppm" 2>/dev/null | tr '\n' ' ' | awk '$1 == "P6" { print $2, $3 }')
+  if [ -z "$w" ] || [ -z "$text" ]; then
+    echo "[test.sh] shelldump: no screendump, or no input row note" >> "$out"
+    return
+  fi
+  hdr=$(head -c 40 "$ppm" | head -3 | wc -c)
+  rows=$((h / 16))
+  off=$((hdr + ((rows - 1) * 16 * w + ${#text} * 8) * 3))
+  seen=$(od -An -v -t x1 -j "$off" -N 3 "$ppm" | tr -d ' \n')
+  prompt=$(cell_pixels "$ppm" "$hdr" "$w" $((rows - 1)) 0)
+  last=$(cell_pixels "$ppm" "$hdr" "$w" $((rows - 3)) 0)
+  if [ "$text" != "freya> echo" ]; then
+    echo "[test.sh] shelldump: the input row is '$text', not 'freya> echo'" >> "$out"
+  elif [ "$seen" != aaaaaa ]; then
+    echo "[test.sh] shelldump: the cursor's cell (column ${#text}) is $seen, not grey" >> "$out"
+  elif [ "$prompt" != "$last" ] || [[ $last != *ffffff* ]]; then
+    echo "[test.sh] shelldump: the shell's last line doesn't start with a white 'f' like the prompt's" >> "$out"
+  else
+    echo "[test.sh] the line being typed is on the last row, the cursor after it, and the shell's lines are white and unprefixed" >> "$out"
+  fi
+}
+
+check_shell() { # check_shell <serial log>: the shell case's editing keys
+  # "echoo", Backspace, " one": "echo one", once. "xyz", Esc, "echo two":
+  # no xyz. Up twice goes back past "echo two" to "echo one", which runs
+  # again: two of each "freya> echo one" and "one", one "freya> echo two".
+  local one ones two xyz
+  one=$(grep -c "^\[user [0-9]* 'shell'\] freya> echo one$" "$1")
+  ones=$(grep -c "^\[user [0-9]* 'shell'\] one$" "$1")
+  two=$(grep -c "^\[user [0-9]* 'shell'\] freya> echo two$" "$1")
+  xyz=$(grep -c "^\[user [0-9]* 'shell'\] .*xyz" "$1")
+  if [ "$one" = 2 ] && [ "$ones" = 2 ] && [ "$two" = 1 ] && [ "$xyz" = 0 ]; then
+    echo "[test.sh] shell checked: Backspace, Esc, and Up twice to the line before last" >> "$1"
+  else
+    echo "[test.sh] shell wrong: 'echo one' entered $one times (answered $ones), 'echo two' $two, lines with xyz $xyz" >> "$1"
   fi
 }
 
@@ -533,12 +606,25 @@ for entry in "${CASES[@]}"; do
   [ "$name" = scroll ] && check_scroll "$dir/serial.log"
   [ "$name" = log-flood ] && check_flood "$dir/serial.log"
   [ "$name" = mouse ] && check_mouse "$dir/serial.log"
+  [ "$name" = shell ] && check_shell "$dir/serial.log"
   # After the console driver is killed: init starts it again (kill-console),
   # or, with init gone too, nothing does (kill-init).
   after=$(sed -n '/console driver killed/,$ p' "$dir/serial.log" | grep '^\[console note\] ')
   if [ "$name" = kill-console ] && echo "$after" | grep -q '^\[console note\] started' \
       && echo "$after" | sed -n '/started/,$ p' | grep -q '^\[console note\] view [1-9]'; then
     echo "[test.sh] started again: it draws and scrolls" >> "$dir/serial.log"
+  fi
+  # The first line-being-typed note from the new console driver is the
+  # bare prompt: init told the shell, which sent it before any key.
+  if [ "$name" = kill-console ] && [ "$(echo "$after" | sed -n '/started/,$ p' | grep -m1 '^\[console note\] input row: ')" = "[console note] input row: freya> " ]; then
+    echo "[test.sh] started again: the shell sent it the line being typed" >> "$dir/serial.log"
+  fi
+  # The shell killed (Entry 23): the one init started again answers.
+  if [ "$name" = kill-shell ]; then
+    new=$(sed -n "s/.*the shell (process [0-9]*) ended: started it again as process \([0-9]*\) .*/\1/p" "$dir/serial.log" | head -1)
+    if [ -n "$new" ] && grep -q "^\[user $new 'shell'\] hi$" "$dir/serial.log"; then
+      echo "[test.sh] the shell started again answered" >> "$dir/serial.log"
+    fi
   fi
   if [ "$name" = kill-init ] && [ -z "$after" ]; then
     echo "[test.sh] no console notes after it ended" >> "$dir/serial.log"

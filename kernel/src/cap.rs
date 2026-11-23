@@ -27,6 +27,10 @@
 //!     kernel and new endpoints (system calls spawn and endpoint,
 //!     factory.rs). Held by init (Entry 21), which builds the rest of the
 //!     system with it.
+//!   - Info: may read the system's state: how long it has been up, how
+//!     much memory is free, and every task with its state (system call
+//!     info, info.rs). Read-only; what the shell's ps, uptime and mem show
+//!     (Entry 23).
 //!
 //! Capabilities are values; copying one into another table (spawn, or a
 //! transfer in a message) copies the authority. Endpoints are reference
@@ -59,6 +63,8 @@ pub enum Cap {
     Memory { base: u64, pages: u32, flags: u8 },
     /// May create processes and endpoints (factory.rs).
     Factory,
+    /// May read the system's state: uptime, memory, tasks (info.rs).
+    Info,
 }
 
 /// Memory capability flags.

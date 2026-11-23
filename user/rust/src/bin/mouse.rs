@@ -8,10 +8,17 @@
 //!                       bytes, and a way to send it bytes
 //!   slot 2  Endpoint    the console driver's (SEND, badge 3): where the
 //!                       pointer is drawn
+//!   slot 3  Endpoint    its own (RECV, Entry 23): where the PS/2 driver
+//!                       signals that bytes are waiting
 //!
 //! It owns no port and no interrupt: the PS/2 driver (src/bin/ps2.rs)
 //! owns the controller and keeps the mouse's bytes until they are asked
-//! for. This driver speaks the mouse's own protocol: it sets the defaults,
+//! for. Since Entry 23 it answers at once, with nothing if nothing came,
+//! and signals this driver's endpoint when bytes arrive: so this driver
+//! asks, and if there was nothing, waits there and asks again. A signal
+//! that comes between the empty answer and the wait isn't lost: it waits
+//! on the endpoint for the next receive. This driver speaks the mouse's
+//! own protocol: it sets the defaults,
 //! looks for a wheel (the IntelliMouse sequence: sample rates 200, 100,
 //! 80, then the id: 3 or 4 means a wheel and 4-byte packets), switches
 //! reporting on, then turns each packet into movement, buttons and wheel
@@ -23,7 +30,8 @@
 //! found; bytes 1 and 2 are x and y (y up); a 4th, the wheel, in its low
 //! four bits.
 //!
-//! If the PS/2 driver goes, this ends, and init starts it again.
+//! If the PS/2 driver goes, this waits (for bytes, or for the call to be
+//! answered) until init has started it again.
 
 #![no_std]
 #![no_main]
@@ -35,6 +43,7 @@ freya::entry!(main);
 const CONSOLE: u64 = 0;
 const PS2: u64 = 1;
 const CONSOLE_EP: u64 = 2;
+const OWN: u64 = 3;
 
 // The mouse's answers.
 const ACK: u8 = 0xFA;
@@ -53,7 +62,7 @@ const NO_ACK: i64 = -100;
 
 /// The mouse's bytes, as the PS/2 driver hands them over.
 struct Input {
-    bytes: [u8; 24],
+    bytes: [u8; READ_MAX],
     next: usize,
     len: usize,
 }
@@ -64,8 +73,12 @@ impl Input {
         while self.next == self.len {
             let m = call(PS2, [PS2_READ, 0, 0, 0], NO_CAP)?;
             let n = m.words[0];
-            if n > 24 {
+            if n > READ_MAX as u64 {
                 return Err(n as i64); // an error, not a count
+            }
+            if n == 0 {
+                recv(OWN)?; // nothing yet: wait for the PS/2 driver's signal
+                continue;
             }
             for i in 0..n as usize {
                 self.bytes[i] = (m.words[1 + i / 8] >> (8 * (i % 8))) as u8;
@@ -105,7 +118,7 @@ impl Input {
 }
 
 fn main(_arg: u64) -> u64 {
-    let mut input = Input { bytes: [0; 24], next: 0, len: 0 };
+    let mut input = Input { bytes: [0; READ_MAX], next: 0, len: 0 };
     let wheel = match setup(&mut input) {
         Ok(w) => w,
         Err(e) => {

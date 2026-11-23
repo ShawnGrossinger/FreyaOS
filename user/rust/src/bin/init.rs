@@ -1,5 +1,5 @@
-//! init — the first process (Entry 21): it starts the drivers, and starts
-//! them again if they end.
+//! init — the first process (Entry 21): it starts the drivers and the
+//! shell, and starts them again if they end.
 //!
 //! The kernel starts init and nothing else, with every capability it used
 //! to hand out to drivers itself (kernel/src/main.rs: start_init):
@@ -9,14 +9,21 @@
 //!   slot 4  the screen   5  the system log  6  the status rows
 //!   slot 7  the screen's description
 //!   slot 8  Irq 1        9  IoPorts 0x60   10  IoPorts 0x64   11  Power
-//!   slot 12 Irq 12 (Entry 22)
+//!   slot 12 Irq 12 (Entry 22)            13 Info (Entry 23)
 //!
-//! It makes one endpoint itself, the PS/2 driver's (Entry 22), and mints
-//! narrower copies of both endpoints: RECV for the driver that receives
-//! on each, and SEND with a badge for each caller (the PS/2 driver 1 and
-//! the mouse driver 3 on the console's; the mouse driver 2 on the PS/2
-//! driver's), so each driver can tell who asks. Then it starts each driver
-//! with exactly the slots it needs, asking the kernel to signal its own
+//! It makes the other endpoints itself: the PS/2 driver's (Entry 22), the
+//! mouse driver's and the shell's (Entry 23). It mints narrower copies of
+//! each: RECV for the one that receives there, and SEND with a badge for
+//! each caller, so each can tell who asks: on the console driver's, the
+//! PS/2 driver 1, the mouse driver 3, the shell 4; on the PS/2 driver's,
+//! the mouse driver 2, the shell 4. And copies that only signal (system
+//! call signal: the badge is the bits set): the PS/2 driver's to say bytes
+//! are waiting for the mouse driver (SIGNAL_BYTES) and keys for the shell
+//! (SIGNAL_KEYS), and its own to tell the shell the console driver started
+//! again (SIGNAL_REDRAW), so it sends the line being typed again.
+//!
+//! Then it starts each with exactly the slots it needs, asking the kernel
+//! to signal its own
 //! endpoint with bit (1 << id) when one ends, and waits there. A driver
 //! that ends is started again, at most MAX_RESTARTS times; after that init
 //! says so, leaves it stopped, and lets go of what only it would have
@@ -30,7 +37,7 @@
 #![no_std]
 #![no_main]
 
-use freya::{Line, MAX_CAPS, NO_CAP, NO_SLOT, RECV, SEND, SIGNAL_BADGE};
+use freya::{Line, MAX_CAPS, NO_CAP, NO_SLOT, RECV, SEND, SIGNAL_BADGE, SIGNAL_BYTES, SIGNAL_KEYS, SIGNAL_REDRAW};
 
 freya::entry!(main);
 
@@ -47,11 +54,17 @@ const KEYBOARD_DATA: u8 = 9;
 const KEYBOARD_STATUS: u8 = 10;
 const POWER: u8 = 11;
 const MOUSE_IRQ: u8 = 12;
+const INFO: u8 = 13;
 
 /// Badges: who is calling, on the endpoint called.
 const PS2_TO_CONSOLE: u64 = 1;
 const MOUSE_TO_PS2: u64 = 2;
 const MOUSE_TO_CONSOLE: u64 = 3;
+const SHELL_TO_PS2: u64 = 4;
+const SHELL_TO_CONSOLE: u64 = 4;
+
+/// Its place in the driver list, below.
+const CONSOLE_DRIVER: usize = 0;
 
 /// Times a driver is started again before init leaves it stopped.
 const MAX_RESTARTS: u32 = 3;
@@ -117,19 +130,36 @@ fn minted(slot: u8, rights: u64, badge: u64) -> u8 {
     }
 }
 
-fn main(_arg: u64) -> u64 {
-    let ps2_ep = match freya::endpoint(FACTORY) {
+/// A new endpoint, in a slot spawn's list can name; NO_SLOT if it
+/// couldn't be made (and then what needs it can't start, and says so).
+fn new_endpoint(whose: &[u8]) -> u8 {
+    match freya::endpoint(FACTORY) {
         slot if slot >= 0 => slot as u8,
         _ => {
-            say(b"couldn't make the PS/2 driver's endpoint\n");
+            let mut line = Line::<96>::new();
+            line.str(b"couldn't make the ").str(whose).str(b" endpoint\n");
+            say(line.as_bytes());
             NO_SLOT
         }
-    };
+    }
+}
+
+fn main(_arg: u64) -> u64 {
+    let ps2_ep = new_endpoint(b"PS/2 driver's");
+    let mouse_ep = new_endpoint(b"mouse driver's");
+    let shell_ep = new_endpoint(b"shell's");
     let console_recv = minted(CONSOLE_EP as u8, RECV, 0);
     let ps2_to_console = minted(CONSOLE_EP as u8, SEND, PS2_TO_CONSOLE);
     let mouse_to_console = minted(CONSOLE_EP as u8, SEND, MOUSE_TO_CONSOLE);
+    let shell_to_console = minted(CONSOLE_EP as u8, SEND, SHELL_TO_CONSOLE);
     let ps2_recv = minted(ps2_ep, RECV, 0);
     let mouse_to_ps2 = minted(ps2_ep, SEND, MOUSE_TO_PS2);
+    let shell_to_ps2 = minted(ps2_ep, SEND, SHELL_TO_PS2);
+    let mouse_recv = minted(mouse_ep, RECV, 0);
+    let bytes_for_mouse = minted(mouse_ep, SEND, SIGNAL_BYTES);
+    let shell_recv = minted(shell_ep, RECV, 0);
+    let keys_for_shell = minted(shell_ep, SEND, SIGNAL_KEYS);
+    let redraw_for_shell = minted(shell_ep, SEND, SIGNAL_REDRAW);
 
     let mut drivers = [
         Driver {
@@ -144,7 +174,18 @@ fn main(_arg: u64) -> u64 {
         Driver {
             name: b"PS/2 driver",
             program: freya::PROGRAM_PS2,
-            slots: slots(&[CONSOLE, KEYBOARD_IRQ, KEYBOARD_DATA, KEYBOARD_STATUS, POWER, ps2_to_console, ps2_recv, MOUSE_IRQ]),
+            slots: slots(&[
+                CONSOLE,
+                KEYBOARD_IRQ,
+                KEYBOARD_DATA,
+                KEYBOARD_STATUS,
+                POWER,
+                ps2_to_console,
+                ps2_recv,
+                MOUSE_IRQ,
+                bytes_for_mouse,
+                keys_for_shell,
+            ]),
             id: None,
             restarts: 0,
             drop_when_stopped: [ps2_ep, ps2_recv],
@@ -153,16 +194,25 @@ fn main(_arg: u64) -> u64 {
         Driver {
             name: b"mouse driver",
             program: freya::PROGRAM_MOUSE,
-            slots: slots(&[CONSOLE, mouse_to_ps2, mouse_to_console]),
+            slots: slots(&[CONSOLE, mouse_to_ps2, mouse_to_console, mouse_recv]),
             id: None,
             restarts: 0,
-            drop_when_stopped: [NO_SLOT, NO_SLOT],
+            drop_when_stopped: [mouse_ep, mouse_recv],
             without: b"no pointer",
+        },
+        Driver {
+            name: b"shell",
+            program: freya::PROGRAM_SHELL,
+            slots: slots(&[CONSOLE, shell_recv, shell_to_ps2, shell_to_console, INFO, POWER]),
+            id: None,
+            restarts: 0,
+            drop_when_stopped: [shell_ep, shell_recv],
+            without: b"no shell: Ctrl+Alt+Del still restarts and Ctrl+Alt+End switches off",
         },
     ];
 
     // One line for everything started, so it reads as one step.
-    let mut line = Line::<160>::new();
+    let mut line = Line::<200>::new();
     line.str(b"started");
     let mut started = 0;
     let last = drivers.len() - 1;
@@ -193,7 +243,7 @@ fn main(_arg: u64) -> u64 {
             continue; // nobody else has this endpoint; ignore anything odd
         }
         let ended = msg.words[0];
-        for d in drivers.iter_mut() {
+        for (i, d) in drivers.iter_mut().enumerate() {
             let Some(id) = d.id else { continue };
             if ended & (1 << id) == 0 {
                 continue;
@@ -216,6 +266,11 @@ fn main(_arg: u64) -> u64 {
                     line.str(b": started it again as process ").dec(new);
                     line.str(b" (").dec(d.restarts as u64).str(b" of ").dec(MAX_RESTARTS as u64).str(b")\n");
                     say(line.as_bytes());
+                    if i == CONSOLE_DRIVER && redraw_for_shell != NO_SLOT {
+                        // A new console driver has a blank input row: the
+                        // shell sends the line being typed again.
+                        freya::signal(redraw_for_shell as u64);
+                    }
                 }
                 Err(e) => {
                     line.str(b"\n");

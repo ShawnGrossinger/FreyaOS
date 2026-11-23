@@ -34,12 +34,16 @@ SYS_ENDPOINT equ 16                 ; endpoint(factory): slot of a new endpoint 
 SYS_MINT     equ 17                 ; mint(endpoint, rights, badge): slot of a narrower copy
 SYS_DROP     equ 18                 ; drop(slot): let go of a capability
 SYS_IRQ_BIND equ 19                 ; irq_bind(irq, endpoint): the line's interrupts become signals there
+SYS_SIGNAL   equ 20                 ; signal(endpoint): its badge's bits set as signals there (Entry 23)
+SYS_INFO     equ 21                 ; info(info, ptr, len): uptime, memory, tasks into a buffer
+SYS_CAP_INFO equ 22                 ; cap_info(slot): what the caller's own slot holds
 
 ; Programs spawn can start (kernel/src/factory.rs), and endpoint rights.
 PROGRAM_HELLO    equ 0
 PROGRAM_CONSOLE  equ 1
 PROGRAM_PS2      equ 2
 PROGRAM_MOUSE    equ 3
+PROGRAM_SHELL    equ 4
 RIGHT_SEND   equ 1
 RIGHT_RECV   equ 2
 RIGHT_GRANT  equ 4
