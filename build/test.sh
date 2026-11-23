@@ -78,9 +78,10 @@ CASES=(
   "kill-console-often|kill_console_often|128M|\\[demo\\] console driver killed \\(4 of 4\\);;started it again as process [0-9]+ \\(3 of 3\\);;started again 3 times already, so it stays stopped;;'shell'\\] hi$;;no console notes after it stayed stopped;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette;;the screen changed since the last screendump||screendump pause pause pgup e c h o spc h i ret pause screendiff"
   "kill-init|kill_init|128M|\\[demo\\] init killed;;\\[demo\\] console driver killed;;ended: the kernel draws the screen again;;'shell'\\] hi$;;no console notes after it ended;;screendump matches the mode: [0-9]+x[0-9]+, and the colour swatch is the VGA palette;;the screen changed since the last screendump||screendump pause pgup e c h o spc h i ret pause screendiff"
   "mouse||128M|mouse ready: 4-byte packets, with a wheel;;mouse checked: ;;'shell'\\] hi$;;the pointer is drawn where the console says||pause mouse:80:48 button:1 button:0 wheel:1 wheel:-1 button:4 mouse:0:-64 button:0 mouse:0:64 mouse:127:127 mouse:127:127 mouse:127:127 mouse:127:127 mouse:127:127 mouse:-40:-30 e c h o spc h i ret pointerdump"
-  "shell||128M|shell ready: type help;;'shell'\\]   echo TEXT  print TEXT$;;'shell'\\] freya> echo two$;;'shell'\\]   3  init          27  waiting for a message on endpoint [0-9]+$;;'shell'\\]   4  console        6  waiting for a message on endpoint [0-9]+$;;'shell'\\]   5  ps2           10  waiting for a message on endpoint [0-9]+$;;'shell'\\]   6  mouse          4  waiting for a message on endpoint [0-9]+$;;'shell'\\]   7  shell          8  running$;;'shell'\\] [0-9]+ tasks: 5 processes, [0-9]+ in the kernel$;;'shell'\\] slot  0  Console: writes to the log$;;'shell'\\] slot  1  Endpoint [0-9]+: receive$;;'shell'\\] slot  2  Endpoint [0-9]+: send, badge 4$;;'shell'\\] slot  3  Endpoint [0-9]+: send, badge 4$;;'shell'\\] slot  4  Info: reads uptime, memory, the tasks$;;'shell'\\] slot  5  Power: restarts, switches off$;;'shell'\\] slot  6  Factory: starts hello, spin, crash, ticker, relay$;;'shell'\\] slot  7  Endpoint [0-9]+: send$;;'shell'\\] 8 of 32 slots hold a capability;;'shell'\\] up 0 h 0 min [0-9]+ s \\([0-9]+ timer ticks, 100 a second\\);;'shell'\\] memory: [0-9]+ MiB free of 127 MiB usable;;'shell'\\] foo: no such command \\(help lists them\\)$;;shell checked: ;;the line being typed is on the last row||h e l p ret e c h o o backspace spc o n e ret x y z esc e c h o spc t w o ret up up ret p s ret c a p s ret u p t i m e ret m e m ret f o o ret e c h o shelldump"
+  "shell||128M|shell ready: type help;;'shell'\\]   echo TEXT  print TEXT$;;'shell'\\] freya> echo two$;;'shell'\\]   3  init          29  waiting for a message on endpoint [0-9]+$;;'shell'\\]   4  console        6  waiting for a message on endpoint [0-9]+$;;'shell'\\]   5  ps2           10  waiting for a message on endpoint [0-9]+$;;'shell'\\]   6  mouse          4  waiting for a message on endpoint [0-9]+$;;'shell'\\]   7  shell          9  running$;;'shell'\\] [0-9]+ tasks: 5 processes, [0-9]+ in the kernel$;;'shell'\\] slot  0  Console: writes to the log$;;'shell'\\] slot  1  Endpoint [0-9]+: receive$;;'shell'\\] slot  2  Endpoint [0-9]+: send, badge 4$;;'shell'\\] slot  3  Endpoint [0-9]+: send, badge 4$;;'shell'\\] slot  4  Info: reads uptime, memory, the tasks$;;'shell'\\] slot  5  Power: restarts, switches off$;;'shell'\\] slot  6  Factory: starts hello, spin, crash, ticker, relay, hog$;;'shell'\\] slot  7  Endpoint [0-9]+: send$;;'shell'\\] slot  8  Budget: 4096 KiB of memory, 0 KiB in use$;;'shell'\\] 9 of 32 slots hold a capability;;'shell'\\] up 0 h 0 min [0-9]+ s \\([0-9]+ timer ticks, 100 a second\\);;'shell'\\] memory: [0-9]+ MiB free of 127 MiB usable;;'shell'\\] foo: no such command \\(help lists them\\)$;;shell checked: ;;the line being typed is on the last row||h e l p ret e c h o o backspace spc o n e ret x y z esc e c h o spc t w o ret up up ret p s ret c a p s ret u p t i m e ret m e m ret f o o ret e c h o shelldump"
   "programs||128M|'shell'\\] started spin as process 8$;;'shell'\\]   8  spin           1  ready to run$;;'shell'\\] process 5: this shell holds no capability for it;;'shell'\\] stopping spin \\(process 8\\)$;;'shell'\\] spin \\(process 8\\) ended: stopped \\(kill\\)$;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!$;;'shell'\\] hello \\(process [0-9]+\\) ended: exit code 19$;;\\[user\\] task [0-9]+ 'crash' killed by vector 14 #PF Page Fault .*cr2=0xffff800000100000 \\(protection violation, write, user mode\\)$;;'shell'\\] crash \\(process [0-9]+\\) ended: stopped by the CPU: exception 14 \\(page fault\\)$;;'shell'\\] console: this shell's Factory capability doesn't cover it;;'shell'\\] no programs started from this shell are running$;;programs checked: ||r u n spc s p i n ret pause p s ret j o b s ret k i l l spc 5 ret k i l l spc 8 ret pause r u n spc s p i n ret r u n spc s p i n ret k i l l spc s p i n ret pause r u n spc h e l l o ret pause r u n spc c r a s h ret pause r u n spc c o n s o l e ret j o b s ret p s ret"
-  "revoke||128M|'shell'\\] started ticker as process 8$;;\\[user 8 'ticker'\\] ticker: tick 1$;;'shell'\\] slot  0  Console: writes to the log; 2 copies made from it$;;'shell'\\] slot  8  Console: writes to the log; lent to ticker \\(process 8\\); 1 copy made from it$;;'shell'\\] slot  9  Process 8 \\(ticker\\): asks how it is doing, stops it$;;'shell'\\] took back what this shell lent ticker \\(process 8\\): 1 capability$;;'shell'\\] ticker \\(process 8\\) ended: exit code -2 \\(no capability\\)$;;'relay'\\] relay: started ticker as process [0-9]+, with my console$;;'shell'\\] +[0-9]+  relay +2  ;;'shell'\\] +[0-9]+  ticker +1  ;;'shell'\\] slot  8  Console: writes to the log; lent to relay \\(process [0-9]+\\); 2 copies made from it$;;'shell'\\] slot  6  Factory: starts hello, spin, crash, ticker, relay; 2 copies made from it$;;'shell'\\] slot  9  Factory: starts ticker; lent to relay \\(process [0-9]+\\); 1 copy made from it$;;'shell'\\] took back what this shell lent relay \\(process [0-9]+\\): 3 capabilities$;;'shell'\\] relay \\(process [0-9]+\\) ended: exit code -2 \\(no capability\\)$;;'shell'\\] relay \\(process [0-9]+\\) ended: stopped \\(kill\\); took back 1 capability it had passed on$;;'shell'\\] process 3: this shell lent it nothing;;'shell'\\] 8 of 32 slots hold a capability;;revoke checked: ||r u n spc t i c k e r ret pause pause c a p s ret r e v o k e spc 8 ret pause pause r u n spc r e l a y ret pause p s ret c a p s ret r e v o k e spc r e l a y ret pause pause r u n spc r e l a y ret pause k i l l spc r e l a y ret pause pause p s ret r e v o k e spc 3 ret c a p s ret"
+  "revoke||128M|'shell'\\] started ticker as process 8$;;\\[user 8 'ticker'\\] ticker: tick 1$;;'shell'\\] slot  0  Console: writes to the log; 2 copies made from it$;;'shell'\\] slot  9  Console: writes to the log; lent to ticker \\(process 8\\); 1 copy made from it$;;'shell'\\] slot 10  Process 8 \\(ticker\\): asks how it is doing, stops it$;;'shell'\\] took back what this shell lent ticker \\(process 8\\): 1 capability$;;'shell'\\] ticker \\(process 8\\) ended: exit code -2 \\(no capability\\)$;;'relay'\\] relay: started ticker as process [0-9]+, with my console$;;'shell'\\] +[0-9]+  relay +2  ;;'shell'\\] +[0-9]+  ticker +1  ;;'shell'\\] slot  9  Console: writes to the log; lent to relay \\(process [0-9]+\\); 2 copies made from it$;;'shell'\\] slot  6  Factory: starts hello, spin, crash, ticker, relay, hog; 2 copies made from it$;;'shell'\\] slot 10  Factory: starts ticker; lent to relay \\(process [0-9]+\\); 1 copy made from it$;;'shell'\\] took back what this shell lent relay \\(process [0-9]+\\): 3 capabilities$;;'shell'\\] relay \\(process [0-9]+\\) ended: exit code -2 \\(no capability\\)$;;'shell'\\] relay \\(process [0-9]+\\) ended: stopped \\(kill\\); took back 1 capability it had passed on$;;'shell'\\] process 3: this shell lent it nothing;;'shell'\\] 9 of 32 slots hold a capability;;revoke checked: ||r u n spc t i c k e r ret pause pause c a p s ret r e v o k e spc 8 ret pause pause r u n spc r e l a y ret pause p s ret c a p s ret r e v o k e spc r e l a y ret pause pause r u n spc r e l a y ret pause k i l l spc r e l a y ret pause pause p s ret r e v o k e spc 3 ret c a p s ret"
+  "heap||128M|'shell'\\] started hog as process 8$;;\\[user 8 'hog'\\] hog: holding 1024 KiB$;;\\[user 8 'hog'\\] hog: my budget won't give more; holding 1024 KiB, and reading it back every second$;;'shell'\\] slot  8  Budget: 4096 KiB of memory, 1024 KiB in use; 2 copies made from it$;;'shell'\\] slot 10  Budget: 1024 KiB of memory, 1024 KiB in use; lent to hog \\(process 8\\); 1 copy made from it$;;'shell'\\] took back what this shell lent hog \\(process 8\\): 2 capabilities$;;\\[user\\] task 8 'hog' killed by vector 14 #PF Page Fault at rip=0x[0-9a-f]+ cr2=0x0000410000000000 \\(page not present, read, user mode\\);;'shell'\\] hog \\(process 8\\) ended: stopped by the CPU: exception 14 \\(page fault\\)$;;'shell'\\] slot  8  Budget: 4096 KiB of memory, 4096 KiB in use; 10 copies made from it$;;'shell'\\] hog \\(process [0-9]+\\) ended: stopped \\(kill\\)$;;'shell'\\] slot  8  Budget: 4096 KiB of memory, 0 KiB in use$;;'shell'\\] 9 of 32 slots hold a capability;;heap checked: ||m e m ret r u n spc h o g ret pause pause c a p s ret r e v o k e spc h o g ret pause pause r u n spc h o g ret r u n spc h o g ret r u n spc h o g ret r u n spc h o g ret r u n spc h o g ret pause pause pause c a p s ret k i l l spc h o g ret pause pause c a p s ret m e m ret"
   "kill-shell|kill_shell|128M|\\[demo\\] shell killed;;\\[user 3 'init'\\] the shell \\(process 7\\) ended: started it again as process [0-9]+ \\(1 of 3\\);;'shell'\\] hi$;;the shell started again answered||pause e c h o spc h i ret"
   "log-flood|log_flood|128M|flood 600;;tick 1;;flood checked: ;;screendump matches the mode: 1280x800, and the colour swatch is the VGA palette;;the log below the bar did not change||pause pgup screendump pause logsame pgdn pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup pgup"
 )
@@ -453,15 +454,16 @@ check_shell() { # check_shell <serial log>: the shell case's editing keys
 check_programs() { # check_programs <serial log>: the programs case
   # Three spins stopped through the shell's Process capabilities (kill 8,
   # then kill spin for two at once); while the first ran, the shell held
-  # two more capabilities (10: its Process capability, Entry 24, and the
+  # two more capabilities (11: its Process capability, Entry 24, and the
   # console lent to it, Entry 25), and at the end, with every program gone,
-  # it is back to its 8: each one let go of.
+  # it is back to its 9 (8 before Entry 26 gave it a Budget): each one let
+  # go of.
   local stopped first last
   stopped=$(grep -c "^\\[user [0-9]* 'shell'\\] spin (process [0-9]*) ended: stopped (kill)$" "$1")
   first=$(grep "^\\[user [0-9]* 'shell'\\]   7  shell " "$1" | head -1 | awk '{print $6}')
   last=$(grep "^\\[user [0-9]* 'shell'\\]   7  shell " "$1" | tail -1 | awk '{print $6}')
-  if [ "$stopped" = 3 ] && [ "$first" = 10 ] && [ "$last" = 8 ]; then
-    echo "[test.sh] programs checked: 3 spins stopped; the shell held 10 capabilities with one running, 8 after" >> "$1"
+  if [ "$stopped" = 3 ] && [ "$first" = 11 ] && [ "$last" = 9 ]; then
+    echo "[test.sh] programs checked: 3 spins stopped; the shell held 11 capabilities with one running, 9 after" >> "$1"
   else
     echo "[test.sh] programs wrong: $stopped spins stopped; the shell held $first, then $last capabilities" >> "$1"
   fi
@@ -471,17 +473,32 @@ check_revoke() { # check_revoke <serial log>: the revoke case (Entry 25)
   # After each take-back (revoke ticker, revoke relay, the relay killed),
   # no ticker writes another line until a relay is started again: what
   # the shell lent is gone from every process that had it. And the last ps
-  # has no ticker or relay left, with the shell back to its 8 capabilities.
+  # has no ticker or relay left, with the shell back to its 9 capabilities.
   local late left shell
   # Only the shell's and the tickers' own lines: a console driver note
   # quotes rows of the screen, and can hold a take-back and a tick at once.
   late=$(awk '/^\[user [0-9]+ '"'"'shell'"'"'\] .*took back /{quiet=1} /^\[user [0-9]+ '"'"'shell'"'"'\] started relay as process/{quiet=0} quiet && /^\[user [0-9]+ '"'"'ticker'"'"'\] ticker: tick/{n++} END{print n+0}' "$1")
   left=$(awk '/'"'"'shell'"'"'\] freya> ps$/{block=""} {block=block"\n"$0} END{print block}' "$1" | grep -cE "^\[user [0-9]+ 'shell'\] +[0-9]+  (ticker|relay) ")
   shell=$(grep "^\[user [0-9]* 'shell'\]   7  shell " "$1" | tail -1 | awk '{print $6}')
-  if [ "$late" = 0 ] && [ "$left" = 0 ] && [ "$shell" = 8 ]; then
-    echo "[test.sh] revoke checked: no tick after a take-back; the last ps has no ticker or relay; the shell holds 8 again" >> "$1"
+  if [ "$late" = 0 ] && [ "$left" = 0 ] && [ "$shell" = 9 ]; then
+    echo "[test.sh] revoke checked: no tick after a take-back; the last ps has no ticker or relay; the shell holds 9 again" >> "$1"
   else
     echo "[test.sh] revoke wrong: $late ticks after a take-back; $left tickers or relays left; the shell holds $shell" >> "$1"
+  fi
+}
+
+check_heap() { # check_heap <serial log>: the heap case (Entry 26)
+  # The five hogs started after the first was revoked share the shell's
+  # 4 MiB: each says what it holds once its budget won't give more, and
+  # together that is 4096 KiB, none over its own 1024. And once they are
+  # killed, the machine has as many free pages as before the first hog.
+  local holds most pages
+  holds=$(awk '/^\[user [0-9]+ '"'"'shell'"'"'\] took back what this shell lent hog/{after=1} after && /^\[user [0-9]+ '"'"'hog'"'"'\] hog: my budget won.t give more; holding/{for(i=1;i<=NF;i++) if($i=="holding"){n++; sum+=$(i+1); if($(i+1)>most) most=$(i+1)}} END{print n+0, sum+0, most+0}' "$1")
+  pages=$(grep -oE "^\[user [0-9]+ 'shell'\] memory: .* \(([0-9]+) of" "$1" | grep -oE "\(([0-9]+)" | tr -d '(' | sort -u | wc -l)
+  if [ "$holds" = "5 4096 1024" ] && [ "$pages" = 1 ]; then
+    echo "[test.sh] heap checked: five hogs held 4096 KiB between them, none over 1024; as many pages free after as before" >> "$1"
+  else
+    echo "[test.sh] heap wrong: hogs (how many, KiB in all, most): $holds; distinct free-page counts: $pages" >> "$1"
   fi
 }
 
@@ -646,6 +663,7 @@ for entry in "${CASES[@]}"; do
   [ "$name" = shell ] && check_shell "$dir/serial.log"
   [ "$name" = programs ] && check_programs "$dir/serial.log"
   [ "$name" = revoke ] && check_revoke "$dir/serial.log"
+  [ "$name" = heap ] && check_heap "$dir/serial.log"
   # After the console driver is killed: init starts it again (kill-console),
   # or, with init gone too, nothing does (kill-init).
   after=$(sed -n '/console driver killed/,$ p' "$dir/serial.log" | grep '^\[console note\] ')

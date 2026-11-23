@@ -19,19 +19,19 @@ Bridge, 16 GB), booted from a USB stick.
 |---|---|
 | Boot | Stage 1 MBR (with a partition table) loads stage 2, which loads the kernel (up to 1 MiB), collects the E820 memory map, sets a graphics mode and enters long mode |
 | Screen | A VESA graphics mode with a linear framebuffer, as large as the display shows (read from its EDID) up to 1920x1280; text in the VGA ROM's own 8x16 font, drawn through a write-combining mapping. 80x25 text mode on request. Drawn by a console driver process from the end of boot, with 400 rows of the log to scroll back through |
-| Memory | Kernel-owned page tables, NX, a guard page under the kernel stack, a higher-half map of all RAM, a frame allocator, a page-mapping API, a kernel heap |
+| Memory | Kernel-owned page tables, NX, a guard page under the kernel stack, a higher-half map of all RAM, a frame allocator, a page-mapping API, a kernel heap; heaps for programs, grown through a Budget capability, with Box, Vec and String in Rust programs |
 | Interrupts | A gate for all 256 vectors, the local APIC timer at 100 Hz, the I/O APIC routed from ACPI tables; interrupts nobody set up are survived and reported |
 | Tasks | Kernel threads, preemptive round-robin scheduling, sleeping, joining, a mutex |
 | User mode | Ring 3 processes in their own address spaces, written in assembly or Rust; `SYSCALL`, SMEP and SMAP where the CPU has them; a fault ends only the process |
-| Capabilities and IPC | 32 capability slots per process; synchronous call/reply IPC that can pass capabilities (with GRANT) and badges; signals, from the kernel or from a process holding a badged capability; memory lent through Memory capabilities; narrower copies (mint) and letting go (drop); every copy remembers its original, so whatever was lent can be taken back (revoke), from every process it reached |
+| Capabilities and IPC | 32 capability slots per process; synchronous call/reply IPC that can pass capabilities (with GRANT) and badges; signals, from the kernel or from a process holding a badged capability; memory lent through Memory capabilities; narrower copies (mint) and letting go (drop); every copy remembers its original, so whatever was lent can be taken back (revoke), from every process it reached; memory budgets that nest the same way |
 | Init | The only process the kernel starts: it holds the drivers' capabilities and a Factory capability, starts each driver and the shell with exactly what it needs, and starts one again if it ends |
 | Drivers | I/O-port, interrupt-line and memory capabilities, and interrupts delivered as signals; a console driver, a PS/2 driver (keyboard and controller) and a mouse driver, all in Rust, running as user processes, started by init |
-| Shell | A first shell in Rust: line editing with history, built-in commands (help, echo, ps, caps, uptime, mem, restart, off), programs started and stopped (run, jobs, kill), and what it lent them taken back (revoke), holding eight capabilities and nothing else |
+| Shell | A first shell in Rust: line editing with history, built-in commands (help, echo, ps, caps, uptime, mem, restart, off), programs started and stopped (run, jobs, kill), and what it lent them taken back (revoke), holding nine capabilities and nothing else |
 | Power | Restart and switch-off through ACPI, behind a Power capability (Ctrl+Alt+Del, Ctrl+Alt+End, or the shell's restart and off) |
 | Not yet | UEFI boot, disk, network, file system, memory that grows as a program runs, multiple CPUs |
 
-Every boot runs **94 self-tests** and shows the result on screen. `make test`
-checks the disk image and boots **38 configurations** headless, checking each
+Every boot runs **96 self-tests** and shows the result on screen. `make test`
+checks the disk image and boots **39 configurations** headless, checking each
 one.
 
 ## Design in brief
@@ -59,6 +59,15 @@ one.
   revoked. A Memory capability revoked or dropped takes its mapping with it,
   and a capability revoked while its message waits, or while its process is
   being made, is never delivered. A process that ends holds nothing.
+- **Memory a program can use is a capability too.** A Budget capability
+  says how many pages its holder may have: `heap` grows a heap of fresh,
+  zeroed pages at a place fixed for its slot, as far as the budget allows,
+  and the budget counts every budget copied from it. Init gets one for all
+  the memory the kernel can spare, lends the shell 4 MiB, and the shell
+  lends a program 1 MiB of that: a program can't take more than its lender
+  has left. Revoking a Budget frees its heap; the program's next touch of
+  it is a page fault. Rust programs get Box, Vec and String from it
+  (`freya::heap`).
 - **Init decides, the kernel enforces.** At the end of boot the kernel starts
   one process, init, with every capability the drivers will need. Init mints
   narrower copies, starts the console, PS/2 and mouse drivers and the shell
@@ -103,6 +112,7 @@ one.
   | 25 | copy(slot): a copy, derived from it, to lend | anything |
   | 26 | revoke(slot): remove everything derived from it, in every process | anything |
   | 27 | sleep(ticks): wait that many timer ticks | nothing |
+  | 28 | heap(slot, pages): make that Budget's heap so long; returns where it is | Budget |
 
 ## Repository layout
 
@@ -111,7 +121,7 @@ bootloader/BIOS/   stage1.asm (MBR), stage2.asm (loader, E820, VESA mode, long m
 bootloader/UEFI/   placeholder for a later UEFI loader
 kernel/            Rust kernel: entry.asm, kernel.ld, src/*.rs
 user/              user programs in NASM (test programs)
-user/rust/         user programs in Rust (init; the console, PS/2 and mouse drivers; the shell; spin, crash, ticker and relay) and their library
+user/rust/         user programs in Rust (init; the console, PS/2 and mouse drivers; the shell; spin, crash, ticker, relay and hog), and their library with its allocator
 build/             Makefile, test.sh, write-usb.sh
 docs/              development journal, roadmap and design notes
 ```
@@ -131,7 +141,7 @@ Then, from `build/`:
 ```bash
 make            # builds out/freya-os.img (1 MiB disk image); "make build" too
 make run        # boots it in QEMU, serial output in the terminal
-make test       # every test case, headless; expect "38 passed, 0 failed"
+make test       # every test case, headless; expect "39 passed, 0 failed"
 TEXT_MODE=1 make   # an image that stays in 80x25 text mode
 ```
 
@@ -180,13 +190,13 @@ command runs. **Backspace** deletes, **Esc** clears the line, **Up** and
 | `caps` | the shell's own capabilities: everything it may do, what it has lent and to whom, and how many copies are out |
 | `uptime` | time since the timer started, task switches, system calls |
 | `mem` | memory free |
-| `run NAME` | start a program in the background: `hello`, `spin` (runs until stopped), `crash` (writes to the kernel's memory, and is stopped), `ticker` (a line a second while it holds the console) or `relay` (lends the console on to a ticker of its own) |
+| `run NAME` | start a program in the background: `hello`, `spin` (runs until stopped), `crash` (writes to the kernel's memory, and is stopped), `ticker` (a line a second while it holds the console), `relay` (lends the console on to a ticker of its own) or `hog` (takes memory until its 1 MiB budget says no, then reads it back every second) |
 | `jobs` | the programs started from the shell that are still running |
 | `kill ID`, `kill NAME` | stop one of them, or every one of that name |
 | `revoke ID`, `revoke NAME` | take back what the shell lent it, from it and from anyone it passed it to |
 | `restart`, `off` | restart or switch off the machine |
 
-The shell's Factory capability covers only those five programs: `run
+The shell's Factory capability covers only those six programs: `run
 console` is refused by the kernel. When a program ends, the shell says how
 (its exit code, the CPU exception that stopped it, or `kill`). It can stop
 only what it started: `kill 5` gets "this shell holds no capability for it".
@@ -199,6 +209,13 @@ relay's Factory), and both end on their own, since they can't write any
 more. Revoking doesn't stop a program: `spin` doesn't notice. When a program
 ends, the shell takes back whatever it had passed on, so a relay that is
 killed doesn't leave its ticker writing.
+
+`hog` is lent a Budget of 1 MiB, minted from the shell's 4 MiB: `run hog`,
+and it says what it holds every 256 KiB, then that its budget won't give
+more at 1024 KiB. `caps` shows the shell's Budget with that in use. `revoke
+hog` frees its memory, and its next read of it is a page fault, which the
+shell reports. Five hogs at once share the shell's 4 MiB: 4096 KiB between
+them, the last ones getting less.
 
 The shell's lines are shown in white, without the "[user 7 'shell']" the
 kernel puts in front of every line a process writes (serial keeps it).
@@ -233,7 +250,11 @@ headless and checks its serial log:
   `revoke 8` (1 capability; the ticker ends with "no capability"), `run
   relay`, `ps` and `caps`, `revoke relay` (3 capabilities, in two
   processes), then a relay killed (the shell takes back its ticker's
-  console); no tick after any take-back, and the shell back to its 8
+  console); no tick after any take-back, and the shell back to its 9
+- `heap`: `run hog` until its budget is used up, `caps` (1 MiB of the
+  shell's 4 MiB in use), `revoke hog` (its next read a page fault), five
+  hogs at once (4096 KiB between them, none over 1024), all killed, and as
+  many pages free as before the first
 - `scroll`: PageUp and PageDown, checked step by step, and a screenshot whose
   size and colours must match the mode the kernel reported
 - `edid-1366`, `edid-1440`, `no-edid`, `cirrus-24bit`: the mode stage 2
@@ -303,8 +324,7 @@ why. `TEXT_MODE=1 make usb DEV=/dev/sdX` writes a stick that always does.
 
 ## Next
 
-Programs from the shell and revocation on the T430. Then one of: memory for
-programs (a heap through a capability), more of the capability layer
-(capabilities for address spaces; a process passing on only part of what it
-holds), arguments and output for programs, or read-only disks on a spare
-machine.
+Programs from the shell, revocation and memory budgets on the T430. Then
+one of: arguments and output for programs, more of the capability layer
+(a program told when something it holds is revoked; capabilities for
+address spaces), or read-only disks on a spare machine.

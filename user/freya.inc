@@ -9,7 +9,7 @@ CODE_BASE   equ 0x40000000          ; code, read + execute (org of every program
 DATA_BASE   equ 0x40100000          ; data, read + write, zeroed
 DATA_SIZE   equ 4096
 MAP_BASE    equ 0x100000000         ; memory capabilities are mapped from here...
-MAP_END     equ 0x7F0000000000      ; ...to here (system call map)
+MAP_END     equ 0x400000000000      ; ...to here (system call map; heaps above, Entry 26)
 STACK_TOP   equ 0x00007FFF00000000  ; RSP at entry (16 KiB of stack below)
 
 ; System calls: number in RAX, arguments in RDI, RSI, RDX, result in RAX.
@@ -42,6 +42,7 @@ SYS_STATUS   equ 24                 ; status(process): running, or how it ended
 SYS_COPY     equ 25                 ; copy(slot): a copy derived from it, for lending (Entry 25)
 SYS_REVOKE   equ 26                 ; revoke(slot): everything derived from it, everywhere, removed
 SYS_SLEEP    equ 27                 ; sleep(ticks): wait that many timer ticks
+SYS_HEAP     equ 28                 ; heap(budget, pages): the heap that long, its address (Entry 26)
 
 ; Programs spawn can start (kernel/src/factory.rs), and endpoint rights.
 PROGRAM_HELLO    equ 0
@@ -53,6 +54,7 @@ PROGRAM_SPIN     equ 5
 PROGRAM_CRASH    equ 6
 PROGRAM_TICKER   equ 7
 PROGRAM_RELAY    equ 8
+PROGRAM_HOG      equ 9
 RIGHT_SEND   equ 1
 RIGHT_RECV   equ 2
 RIGHT_GRANT  equ 4
@@ -83,6 +85,7 @@ ERR_NO_REPLY         equ -8
 ERR_BAD_ARGUMENT     equ -9
 ERR_NO_MEMORY        equ -10
 ERR_NO_SLOT          equ -11
+ERR_OVER_BUDGET      equ -12          ; the Budget won't allow that much (Entry 26)
 
 ; Capability slots. A process gets only what its creator hands it; the
 ; kernel's tests use these slots.

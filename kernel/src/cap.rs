@@ -90,6 +90,11 @@ pub enum Cap {
     Process { id: u8, generation: u32 },
     /// May read the system's state: uptime, memory, tasks (info.rs).
     Info,
+    /// May have up to `pages` pages of fresh memory in use at once (Entry
+    /// 26), counting its own heap and the heaps of everything copied from
+    /// it; and so may every Budget it was copied from, each counting its
+    /// own. Its holder grows a heap with it (mem.rs: heap).
+    Budget { pages: u32 },
 }
 
 /// Memory capability flags.
@@ -179,6 +184,14 @@ pub fn mint(slot: u64, rights: u64, badge: u64) -> i64 {
             }
             Cap::Factory { rights: rights as u32 }
         }
+        // Entry 26: `rights` is how many pages; its heap counts against the
+        // original's too.
+        Cap::Budget { pages: have } => {
+            if rights == 0 || rights > have as u64 || badge != 0 {
+                return ERR_BAD_ARGUMENT; // none, more than it has, or a badge
+            }
+            Cap::Budget { pages: rights as u32 }
+        }
         _ => return ERR_WRONG_CAPABILITY,
     };
     match put_current(copy, origin) {
@@ -214,6 +227,8 @@ pub fn drop_cap(slot: u64) -> i64 {
 //            (0: none). A parent always exists: when one is removed, its
 //            children are handed to its own parent.
 //   MAPPINGS where a Memory capability is mapped in its task (0: nowhere)
+//   HEAPS    how many pages long a Budget capability's heap is (Entry 26);
+//            where it is follows from the slot (mem.rs: heap_base)
 // All of it is touched with interrupts off only.
 
 use crate::cpu::without_interrupts;
@@ -225,6 +240,7 @@ const _: () = assert!(POSITIONS < u16::MAX as usize);
 static mut SERIALS: [u32; POSITIONS] = [0; POSITIONS];
 static mut PARENTS: [u16; POSITIONS] = [0; POSITIONS];
 static mut MAPPINGS: [u64; POSITIONS] = [0; POSITIONS];
+static mut HEAPS: [u32; POSITIONS] = [0; POSITIONS];
 static mut NEXT_SERIAL: u32 = 1;
 
 fn serials() -> &'static mut [u32; POSITIONS] {
@@ -237,6 +253,10 @@ fn parents() -> &'static mut [u16; POSITIONS] {
 
 fn mappings() -> &'static mut [u64; POSITIONS] {
     unsafe { &mut *(&raw mut MAPPINGS) }
+}
+
+fn heaps() -> &'static mut [u32; POSITIONS] {
+    unsafe { &mut *(&raw mut HEAPS) }
 }
 
 /// Where a copy comes from: the original's position and serial number.
@@ -292,6 +312,7 @@ pub fn put(task: TaskId, slot: usize, cap: Cap, from: Origin) -> bool {
     *next = next.wrapping_add(1).max(1);
     parents()[p] = parent;
     mappings()[p] = 0;
+    heaps()[p] = 0;
     true
 }
 
@@ -310,9 +331,10 @@ pub fn put_current(cap: Cap, from: Origin) -> Result<usize, i64> {
 }
 
 /// Take the capability out of `task`'s `slot`: what was copied from it is
-/// handed to its parent, a mapping made with it is undone (unless `unmap`
-/// is false: the whole address space is going), and its references are
-/// released. Returns what was there. Interrupts off.
+/// handed to its parent, a mapping made with it is undone and a heap grown
+/// with it freed (unless `unmap` is false: the whole address space is
+/// going, and takes them with it), and its references are released.
+/// Returns what was there. Interrupts off.
 pub fn remove(task: TaskId, slot: usize, unmap: bool) -> Cap {
     if slot >= MAX_CAPS {
         return Cap::None;
@@ -334,23 +356,115 @@ pub fn remove(task: TaskId, slot: usize, unmap: bool) -> Cap {
     serials()[p] = 0;
     parents()[p] = 0;
     mappings()[p] = 0;
+    heaps()[p] = 0;
     release(cap);
     cap
 }
 
 /// Undo the mapping made with the Memory capability at position `p`, if
 /// there is one. The pages were only lent: none is freed.
+///
+/// For a Budget capability (Entry 26): its heap's pages are unmapped and
+/// freed. They were the heap's own; nobody else maps them. The task whose
+/// heap it is isn't running (one CPU), or is the caller, in which case
+/// unmap flushes the TLB entry; any other's are flushed when its address
+/// space is next loaded (no PCIDs, no global user pages).
 fn unmap_mapping(task: TaskId, p: usize, cap: Cap) {
-    let at = mappings()[p];
-    let Cap::Memory { pages, .. } = cap else { return };
     let root = crate::sched::space_of(task);
-    if at == 0 || root == 0 {
+    if root == 0 {
         return;
     }
     let mut space = unsafe { crate::vmm::AddressSpace::from_root(root) };
-    for i in 0..pages as u64 {
-        let _ = unsafe { space.unmap(at + i * crate::pmm::PAGE_SIZE) };
+    match cap {
+        Cap::Memory { pages, .. } => {
+            let at = mappings()[p];
+            if at == 0 {
+                return;
+            }
+            for i in 0..pages as u64 {
+                let _ = unsafe { space.unmap(at + i * crate::pmm::PAGE_SIZE) };
+            }
+        }
+        Cap::Budget { .. } => {
+            let base = crate::mem::heap_base((p % MAX_CAPS) as u64);
+            for i in 0..heaps()[p] as u64 {
+                if let Ok(frame) = unsafe { space.unmap(base + i * crate::pmm::PAGE_SIZE) } {
+                    unsafe { crate::pmm::free_frame(frame as usize) };
+                }
+            }
+            heaps()[p] = 0;
+        }
+        _ => {}
     }
+}
+
+// ===========================================================================
+// Budgets (Entry 26): what a heap may grow to
+// ===========================================================================
+//
+// A Budget's limit covers its own heap and the heaps of everything copied
+// from it, so the derivation tree is the hierarchy of budgets: the shell's
+// budget, minted from init's, holds every budget the shell lends, and a
+// program can't grow past what its lender has left. Nothing is reserved:
+// pages are taken from the frame allocator as a heap grows, and the
+// budgets only say how far each may.
+
+/// The Budget capability in the current task's `slot`, its serial number
+/// and how long its heap is. Interrupts off.
+pub fn heap_state(slot: u64) -> Result<(u32, u64), i64> {
+    let me = crate::sched::current();
+    if slot >= MAX_CAPS as u64 {
+        return Err(crate::syscall::ERR_NO_CAPABILITY);
+    }
+    let p = position(me, slot as usize);
+    match crate::sched::task(me).caps[slot as usize] {
+        Cap::Budget { .. } => Ok((serials()[p], heaps()[p] as u64)),
+        Cap::None => Err(crate::syscall::ERR_NO_CAPABILITY),
+        _ => Err(crate::syscall::ERR_WRONG_CAPABILITY),
+    }
+}
+
+/// Record that the heap of the Budget in the current task's `slot` is now
+/// `pages` long. Interrupts off.
+pub fn set_heap(slot: u64, pages: u64) {
+    let p = position(crate::sched::current(), slot as usize);
+    heaps()[p] = pages as u32;
+}
+
+/// How many heap pages position `p` and everything copied from it have.
+fn in_use(p: usize) -> u64 {
+    (0..POSITIONS)
+        .filter(|&q| heaps()[q] != 0 && (q == p || derived_from(q, p)))
+        .map(|q| heaps()[q] as u64)
+        .sum()
+}
+
+/// May the heap of the Budget in the current task's `slot` grow by `more`
+/// pages? Only if that keeps it, and every Budget it was copied from,
+/// within its limit. Interrupts off.
+pub fn budget_allows(slot: u64, more: u64) -> bool {
+    let mut p = position(crate::sched::current(), slot as usize);
+    // Up the tree: a parent always exists while its children do, and is
+    // older, so this ends; the bound is only a guard.
+    for _ in 0..POSITIONS {
+        if let Cap::Budget { pages: limit } = crate::sched::task(p / MAX_CAPS).caps[p % MAX_CAPS] {
+            if in_use(p) + more > limit as u64 {
+                return false;
+            }
+        }
+        match parents()[p] {
+            0 => return true,
+            up => p = up as usize - 1,
+        }
+    }
+    false
+}
+
+/// For cap_info: a Budget's pages in use (its heap and everything copied
+/// from it) and its own heap's.
+pub fn budget_numbers(task: TaskId, slot: usize) -> (u64, u64) {
+    let p = position(task, slot);
+    (in_use(p), heaps()[p] as u64)
 }
 
 /// True if position `q` was copied, directly or not, from position `p`.

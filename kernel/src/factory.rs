@@ -47,7 +47,7 @@ use crate::syscall::{copy_from_user, ERR_BAD_ARGUMENT, ERR_NO_CAPABILITY, ERR_NO
 /// The programs spawn can start, by number (user/freya.inc and
 /// user/rust/src/lib.rs: PROGRAM_*). The kernel's test programs aren't
 /// among them: only its own self-tests start those.
-pub static PROGRAMS: [&Program; 9] = [
+pub static PROGRAMS: [&Program; 10] = [
     &process::HELLO,
     &process::CONSOLE,
     &process::PS2,
@@ -57,6 +57,7 @@ pub static PROGRAMS: [&Program; 9] = [
     &process::CRASH,
     &process::TICKER,
     &process::RELAY,
+    &process::HOG,
 ];
 const _: () = assert!(PROGRAMS.len() <= 16, "a Factory's rights have 16 program bits");
 

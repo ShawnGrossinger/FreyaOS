@@ -52,6 +52,7 @@ pub const KIND_MEMORY: i64 = 6;
 pub const KIND_FACTORY: i64 = 7;
 pub const KIND_INFO: i64 = 8;
 pub const KIND_PROCESS: i64 = 9;
+pub const KIND_BUDGET: i64 = 10;
 
 /// info(slot, ptr, len): the snapshot, if `slot` holds Info and `len` has
 /// room for the header at least.
@@ -120,6 +121,10 @@ pub fn cap_info(slot: u64) -> (i64, u64, u64, u64, u64) {
         Cap::Factory { rights } => (KIND_FACTORY, rights as u64, 0, 0),
         Cap::Info => (KIND_INFO, 0, 0, 0),
         Cap::Process { id, generation } => (KIND_PROCESS, id as u64, generation as u64, 0),
+        Cap::Budget { pages } => {
+            let (used, own) = crate::cpu::without_interrupts(|| crate::cap::budget_numbers(sched::current(), slot as usize));
+            (KIND_BUDGET, pages as u64, used, own)
+        }
     };
     (kind, a, b, c, derived)
 }

@@ -136,6 +136,13 @@ pub static RELAY: Program = Program {
     image: include_bytes!(concat!(env!("OUT_DIR"), "/relay.bin")),
 };
 
+/// Takes memory from its Budget until it can't, and reads it back
+/// (user/rust/src/bin/hog.rs, Entry 26).
+pub static HOG: Program = Program {
+    name: "hog",
+    image: include_bytes!(concat!(env!("OUT_DIR"), "/hog.bin")),
+};
+
 /// Test program: its argument picks one thing to try (user/probe.asm).
 pub static PROBE: Program = Program {
     name: "probe",

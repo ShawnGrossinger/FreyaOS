@@ -23,15 +23,16 @@
 //! again (SIGNAL_REDRAW), so it sends the line being typed again.
 //!
 //! For the shell (Entry 24) it also mints a Factory that can start only
-//! hello, spin, crash, ticker and relay (Entry 25), and makes no
-//! endpoints, and a SEND copy of the
-//! shell's own endpoint, where the programs the shell starts signal when
-//! they end. Then it lets go of the full copies of the four endpoints it
-//! has minted from: it won't mint again, and every RECV it still holds is
-//! a minted one, so letting go of that is enough to stop anyone waiting
-//! for a driver it has given up on. That leaves it 27 of its 32 slots in
-//! use: the kernel's 14, three endpoints and fourteen copies made, less
-//! the four let go of (29 at Entry 23).
+//! hello, spin, crash, ticker, relay (Entry 25) and hog (Entry 26), and
+//! makes no endpoints; a SEND copy of the shell's own endpoint, where the
+//! programs the shell starts signal when they end; and (Entry 26) a Budget
+//! of SHELL_BUDGET pages, minted from the kernel's, for the memory of the
+//! programs the shell lends it to. Then it lets go of the full copies of
+//! the four endpoints it has minted from: it won't mint again, and every
+//! RECV it still holds is a minted one, so letting go of that is enough to
+//! stop anyone waiting for a driver it has given up on. That leaves it 29
+//! of its 32 slots in use: the kernel's 15, three endpoints and fifteen
+//! copies made, less the four let go of (27 at Entry 25).
 //!
 //! Then it starts each with exactly the slots it needs, asking the kernel
 //! to signal its own
@@ -66,6 +67,10 @@ const KEYBOARD_STATUS: u8 = 10;
 const POWER: u8 = 11;
 const MOUSE_IRQ: u8 = 12;
 const INFO: u8 = 13;
+/// Every page the kernel could spare at boot (Entry 26).
+const BUDGET: u8 = 14;
+/// What the shell may lend in all: 4 MiB.
+const SHELL_BUDGET: u64 = 1024;
 
 /// Badges: who is calling, on the endpoint called.
 const PS2_TO_CONSOLE: u64 = 1;
@@ -177,14 +182,19 @@ fn main(_arg: u64) -> u64 {
         | (1 << freya::PROGRAM_SPIN)
         | (1 << freya::PROGRAM_CRASH)
         | (1 << freya::PROGRAM_TICKER)
-        | (1 << freya::PROGRAM_RELAY);
+        | (1 << freya::PROGRAM_RELAY)
+        | (1 << freya::PROGRAM_HOG);
     let factory_for_shell = minted(FACTORY as u8, programs_for_shell, 0);
-    // Everything is minted: the full copies go (see the top of this file).
+    // Every endpoint copy is minted: the full copies go (see the top of
+    // this file). That has to come first: until then all 32 slots are full.
     for full in [CONSOLE_EP as u8, ps2_ep, mouse_ep, shell_ep] {
         if full != NO_SLOT {
             freya::drop_cap(full as u64);
         }
     }
+    // SHELL_BUDGET, or all there is on a machine with less to spare.
+    let spare = freya::cap_info(BUDGET as u64).map_or(0, |(_, pages, _, _)| pages);
+    let budget_for_shell = if spare > 0 { minted(BUDGET, SHELL_BUDGET.min(spare), 0) } else { NO_SLOT };
 
     let mut drivers = [
         Driver {
@@ -228,7 +238,17 @@ fn main(_arg: u64) -> u64 {
         Driver {
             name: b"shell",
             program: freya::PROGRAM_SHELL,
-            slots: slots(&[CONSOLE, shell_recv, shell_to_ps2, shell_to_console, INFO, POWER, factory_for_shell, exits_for_shell]),
+            slots: slots(&[
+                CONSOLE,
+                shell_recv,
+                shell_to_ps2,
+                shell_to_console,
+                INFO,
+                POWER,
+                factory_for_shell,
+                exits_for_shell,
+                budget_for_shell,
+            ]),
             id: None,
             restarts: 0,
             drop_when_stopped: [shell_recv, NO_SLOT],

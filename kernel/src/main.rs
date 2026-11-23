@@ -623,8 +623,9 @@ pub extern "C" fn rust_start() -> ! {
         let factory = factory::selftest();
         let info = info::selftest();
         let caps = cap::selftest();
+        let budgets = mem::selftest();
         let drivers = irq::selftest();
-        mutex && ipc && factory && info && caps && drivers
+        mutex && ipc && factory && info && caps && budgets && drivers
     };
 
     // --- VGA status display (screen was cleared at entry) ---
@@ -714,6 +715,10 @@ pub extern "C" fn rust_start() -> ! {
     }
 }
 
+/// Pages kept out of init's Budget (Entry 26): 4 MiB for the kernel's own
+/// needs (task stacks, page tables, endpoints) whatever the heaps take.
+const INIT_RESERVE: u64 = 1024;
+
 /// Init's task id, once it runs (for the demos).
 static INIT_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
 
@@ -727,6 +732,8 @@ static INIT_TASK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 ///   8 Irq 1 (the keyboard)            9 IoPorts 0x60   10 IoPorts 0x64
 ///  11 Power                         12 Irq 12 (the mouse, Entry 22)
 ///  13 Info (for the shell, Entry 23)
+///  14 Budget (Entry 26): every page free now but INIT_RESERVE, for the
+///     heaps of whoever init lends it to
 ///
 /// A slot is left empty if the kernel has nothing to put there (no screen
 /// to lend, interrupts not routed); init then can't start what needs it,
@@ -751,6 +758,7 @@ fn start_init(ioapic_ready: bool) -> bool {
         Cap::Power,
         if ioapic_ready { Cap::Irq { line: 12 } } else { Cap::None },
         Cap::Info,
+        Cap::Budget { pages: crate::pmm::free_frames().saturating_sub(INIT_RESERVE).min(u32::MAX as u64) as u32 },
     ]);
     let started = process::spawn(&process::INIT, 0, caps);
     // init's table holds the endpoints now (or nothing does, and they go).

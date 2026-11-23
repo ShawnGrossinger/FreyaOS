@@ -13,10 +13,11 @@
 //!                      on Enter (SCROLL)
 //!   slot 4  Info       uptime, memory and the tasks (ps, uptime, mem)
 //!   slot 5  Power      restart and off
-//!   slot 6  Factory    (Entry 24) starts hello, spin, crash, ticker and
-//!                      relay (Entry 25), nothing else
+//!   slot 6  Factory    (Entry 24) starts hello, spin, crash, ticker,
+//!                      relay (Entry 25) and hog (Entry 26), nothing else
 //!   slot 7  Endpoint   its own again (SEND): where the programs it starts
 //!                      signal when they end (bit 1 << id)
+//!   slot 8  Budget     (Entry 26) 4 MiB of memory, all it may lend
 //!
 //! No port, no interrupt, no screen: it can't reach a device, and a fault
 //! in it ends only it (init starts it again). Its Factory starts only the
@@ -24,7 +25,9 @@
 //!
 //! Loans (Entry 25): a program isn't given the shell's own console, but a
 //! copy of it (copy), which the shell keeps in a slot of its own; relay is
-//! also lent a Factory that starts only ticker (mint). Whatever the program
+//! also lent a Factory that starts only ticker (mint), and hog (Entry 26) a
+//! Budget of HOG_BUDGET pages, minted from the shell's, so that every hog's
+//! heap counts against the shell's 4 MiB as well. Whatever the program
 //! makes of them, passes on or hands to a program it starts is derived from
 //! those loans, so revoke ID takes all of it back in one call, from every
 //! process that has it, and tells how many capabilities went. The program
@@ -64,9 +67,14 @@ const INFO: u64 = 4;
 const POWER_SLOT: u64 = 5;
 const FACTORY: u64 = 6;
 const EXITS: u64 = 7;
+const BUDGET: u64 = 8;
 
-/// Programs running from this shell at once, at most.
-const MAX_JOBS: usize = 8;
+/// What hog is lent: 1 MiB (Entry 26).
+const HOG_BUDGET: u64 = 256;
+
+/// Programs running from this shell at once, at most: 9 slots of its own,
+/// and up to 3 for each (what it is lent, and its Process capability).
+const MAX_JOBS: usize = 7;
 
 #[derive(Clone, Copy)]
 struct Job {
@@ -78,7 +86,8 @@ struct Job {
     loans: [u64; LOANS],
 }
 
-/// A program is lent the console; relay also a Factory for tickers.
+/// A program is lent the console; relay also a Factory for tickers, hog a
+/// Budget.
 const LOANS: usize = 2;
 const NOT_LENT: u64 = u64::MAX;
 
@@ -264,7 +273,8 @@ const HELP: &[&[u8]] = &[
     b"  uptime     time since the timer started\n",
     b"  mem        memory free\n",
     b"  run NAME   start a program: hello, spin (runs until stopped), crash (writes to the kernel),\n",
-    b"             ticker (a line a second while it holds the console), relay (lends it to a ticker)\n",
+    b"             ticker (a line a second while it holds the console), relay (lends it to a ticker),\n",
+    b"             hog (takes memory until its budget, 1 MiB, says no)\n",
     b"  jobs       the programs started here that are still running\n",
     b"  kill ID    stop one of them (or kill NAME: every one of that name)\n",
     b"  revoke ID  take back what this shell lent it, from it and from whoever it passed it to\n",
@@ -515,6 +525,16 @@ fn lend(program: u64) -> Result<[u64; LOANS], i64> {
         }
         loans[1] = tickers as u64;
     }
+    if program == PROGRAM_HOG {
+        // HOG_BUDGET, or what the shell has, if less.
+        let have = cap_info(BUDGET).map_or(0, |(_, pages, _, _)| pages);
+        let budget = mint(BUDGET, HOG_BUDGET.min(have).max(1), 0);
+        if budget < 0 {
+            let_go(&loans);
+            return Err(budget);
+        }
+        loans[1] = budget as u64;
+    }
     Ok(loans)
 }
 
@@ -546,6 +566,7 @@ fn error_name(code: i64) -> &'static [u8] {
         ERR_PEER_GONE => b" (peer gone)",
         ERR_INTERRUPTED => b" (interrupted)",
         ERR_NO_SLOT => b" (no free slot)",
+        ERR_OVER_BUDGET => b" (over budget)",
         _ => b"",
     }
 }
@@ -684,6 +705,15 @@ fn caps(&self) {
             KIND_IRQ => l.str(b"Irq: interrupt line ").dec(a),
             KIND_POWER => l.str(b"Power: restarts, switches off"),
             KIND_MEMORY => l.str(b"Memory: ").dec(a).str(if b & 1 != 0 { b" pages, writable" } else { b" pages, read-only" }),
+            KIND_BUDGET => {
+                // Entry 26: a, b, c are pages: the limit, in use by it and
+                // its copies, its own heap.
+                l.str(b"Budget: ").dec(a * 4).str(b" KiB of memory, ").dec(b * 4).str(b" KiB in use");
+                if c != 0 {
+                    l.str(b" (").dec(c * 4).str(b" KiB by this shell)");
+                }
+                &mut l
+            }
             KIND_FACTORY => {
                 l.str(b"Factory: starts");
                 let mut first = true;

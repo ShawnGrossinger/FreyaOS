@@ -52,8 +52,13 @@
 //!                                         from it were removed, everywhere
 //!  27 sleep(ticks)                     -> 0, that many timer ticks later
 //!                                         (acts on the caller only)
+//!  28 heap(budget, pages)              -> where the heap starts, once it
+//!                                         is that many pages long (mem.rs,
+//!                                         Entry 26)
 //!
 //! cap_info's R10 (Entry 25): how many capabilities are derived from it.
+//! For a Budget (Entry 26): RDI its limit in pages, RSI the pages in use by
+//! it and everything copied from it, RDX its own heap's pages.
 //!
 //! spawn's R9 (Entry 24): flags in (bit 0: hand back a Process capability)
 //! and that capability's slot out (-1 for none).
@@ -103,6 +108,7 @@ pub const SYS_STATUS: u64 = 24;
 pub const SYS_COPY: u64 = 25;
 pub const SYS_REVOKE: u64 = 26;
 pub const SYS_SLEEP: u64 = 27;
+pub const SYS_HEAP: u64 = 28;
 
 /// Longest sleep: a day.
 const MAX_SLEEP_TICKS: u64 = 24 * 3600 * crate::apic::TIMER_HZ;
@@ -132,6 +138,8 @@ pub const ERR_BAD_ARGUMENT: i64 = -9;
 pub const ERR_NO_MEMORY: i64 = -10;
 /// Every capability slot is taken (endpoint, mint).
 pub const ERR_NO_SLOT: i64 = -11;
+/// The Budget, or one it was copied from, won't allow that much (Entry 26).
+pub const ERR_OVER_BUDGET: i64 = -12;
 
 /// Longest write in one call; longer ones are cut (the return value says
 /// how much was written).
@@ -266,6 +274,7 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
             sched::sleep_ticks(f.rdi.min(MAX_SLEEP_TICKS));
             0
         }
+        SYS_HEAP => crate::mem::heap(f.rdi, f.rsi),
         SYS_KILL => crate::factory::kill(f.rdi),
         SYS_STATUS => {
             let (how, value) = crate::factory::status(f.rdi);

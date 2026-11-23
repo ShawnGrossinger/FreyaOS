@@ -2,15 +2,21 @@
 //!
 //! Everything a program needs and nothing more: the entry point, the system
 //! calls (the same numbers and registers as user/freya.inc and
-//! kernel/src/syscall.rs), and a panic handler. No allocator, no files, no
-//! threads: a program gets its memory from user.ld's fixed layout and its
-//! authority from the capability slots its creator filled.
+//! kernel/src/syscall.rs), a panic handler, and (Entry 26) an allocator. No
+//! files, no threads: a program gets its fixed memory from user.ld's
+//! layout, any more from a Budget capability it was lent (heap.rs: Box,
+//! Vec and String once it calls heap::use_budget), and its authority from
+//! the capability slots its creator filled.
 //!
 //! A program is a binary in src/bin/ that names its main function with
 //! `freya::entry!`. It starts with the argument its creator chose and every
 //! other register clear; whatever main returns is its exit code.
 
 #![no_std]
+
+extern crate alloc;
+
+pub mod heap;
 
 use core::arch::asm;
 
@@ -59,9 +65,13 @@ macro_rules! entry {
 // ===========================================================================
 
 /// Where memory capabilities may be mapped (system call map): from 4 GiB up
-/// to the bottom of the stack's region.
+/// to the heaps (Entry 26: lowered from 0x7F00_0000_0000).
 pub const MAP_BASE: u64 = 0x0000_0001_0000_0000;
-pub const MAP_END: u64 = 0x0000_7F00_0000_0000;
+pub const MAP_END: u64 = 0x0000_4000_0000_0000;
+/// Heaps (Entry 26): the heap of the Budget in slot n is at HEAP_BASE +
+/// n * HEAP_SPAN (system call heap).
+pub const HEAP_BASE: u64 = MAP_END;
+pub const HEAP_SPAN: u64 = 0x0000_0100_0000_0000;
 pub const PAGE: u64 = 4096;
 
 // ===========================================================================
@@ -96,6 +106,7 @@ pub const SYS_STATUS: u64 = 24;
 pub const SYS_COPY: u64 = 25;
 pub const SYS_REVOKE: u64 = 26;
 pub const SYS_SLEEP: u64 = 27;
+pub const SYS_HEAP: u64 = 28;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
 pub const ERR_NO_CAPABILITY: i64 = -2;
@@ -108,6 +119,8 @@ pub const ERR_NO_REPLY: i64 = -8;
 pub const ERR_BAD_ARGUMENT: i64 = -9;
 pub const ERR_NO_MEMORY: i64 = -10;
 pub const ERR_NO_SLOT: i64 = -11;
+/// The Budget, or one it was copied from, won't allow that much (Entry 26).
+pub const ERR_OVER_BUDGET: i64 = -12;
 
 /// Capability slots per process.
 pub const MAX_CAPS: usize = 32;
@@ -126,9 +139,10 @@ pub const PROGRAM_SPIN: u64 = 5;
 pub const PROGRAM_CRASH: u64 = 6;
 pub const PROGRAM_TICKER: u64 = 7;
 pub const PROGRAM_RELAY: u64 = 8;
+pub const PROGRAM_HOG: u64 = 9;
 /// The programs' names, by number (kernel/src/process.rs).
-pub const PROGRAM_NAMES: [&[u8]; 9] =
-    [b"hello", b"console", b"ps2", b"mouse", b"shell", b"spin", b"crash", b"ticker", b"relay"];
+pub const PROGRAM_NAMES: [&[u8]; 10] =
+    [b"hello", b"console", b"ps2", b"mouse", b"shell", b"spin", b"crash", b"ticker", b"relay", b"hog"];
 
 /// ticker's and relay's argument (Entry 25): bits 0 to 15 the ticks between
 /// lines (0: 100, a second), and this bit for quiet: no lines, only a look
@@ -413,6 +427,15 @@ pub fn sleep(ticks: u64) {
     syscall3(SYS_SLEEP, ticks, 0, 0);
 }
 
+/// Make the heap of the Budget capability in `slot` `pages` pages long
+/// (Entry 26): where it starts, or an error (ERR_OVER_BUDGET, ERR_NO_MEMORY,
+/// ERR_NO_CAPABILITY, ERR_WRONG_CAPABILITY), the heap then as it was.
+/// heap(slot, 0) gives up the whole heap. Most programs let heap.rs call
+/// this.
+pub fn heap(slot: u64, pages: u64) -> i64 {
+    syscall3(SYS_HEAP, slot, pages, 0)
+}
+
 /// Let go of the capability in `slot`.
 pub fn drop_cap(slot: u64) -> i64 {
     syscall3(SYS_DROP, slot, 0, 0)
@@ -533,6 +556,9 @@ pub const KIND_MEMORY: i64 = 6;
 pub const KIND_FACTORY: i64 = 7;
 pub const KIND_INFO: i64 = 8;
 pub const KIND_PROCESS: i64 = 9;
+/// Entry 26: cap_info gives its limit, the pages in use by it and what was
+/// copied from it, and its own heap's pages.
+pub const KIND_BUDGET: i64 = 10;
 
 /// The capability in the caller's own `slot`: Ok((kind, a, b, c)), where
 /// an endpoint's a, b, c are its number, rights and badge; a port range's

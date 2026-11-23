@@ -121,10 +121,44 @@
 //!                result
 //!   RECEIVE_ONE  receives once; exits with 0x10 | the kind it brought (0:
 //!                none: the capability revoked on the way wasn't delivered)
+//!
+//! HEAP (12, Entry 26), with slot 0 Console, 1 Factory, 2 an endpoint
+//! (SEND + RECV), 3 a Budget of 256 pages (kernel/src/mem.rs checks it
+//! exits with 0x1F):
+//!   bit 0  heap grows to 4 pages at its fixed place, which keep what is
+//!          written; shrunk to 2, those two still hold it; grown to 4 again,
+//!          the new two are zeros, every byte (pages come to a heap fresh:
+//!          nothing of another process's is left in them); cap_info counts
+//!          them; 0 gives it up
+//!   bit 1  limits: 257 pages refused, the heap as it was; all 256 allowed;
+//!          a Budget of 64 minted from it refuses 65 and allows 64, and then
+//!          the original allows only 192 more; dropping the copy frees its
+//!          heap; with the original using 200, another copy of 64 may have
+//!          only 56 (the limit above it counts); refused: the console, an
+//!          empty slot, minting more or none, a heap bigger than its place
+//!   bit 2  a copy's heap goes when the copy is revoked, or dropped
+//!   bit 3  the allocator (freya::heap): Box, a Vec of 10,000, a String of
+//!          100 pieces, a BTreeMap of 1,000, then 2 MiB more refused (the
+//!          budget is 1 MiB) without changing the heap; all freed, the heap
+//!          is one free block; then one allocation of all 1 MiB but 16
+//!          bytes, which fits only if the free block at the heap's end is
+//!          counted; and the heap given back (release), which it isn't
+//!          while anything on it is in use
+//!   bit 4  across processes: hog lent a Budget of 32 pages minted from
+//!          this one fills it; revoking it frees hog's 32 pages, and hog's
+//!          next read of them is a page fault that ends it
+//! It ends with 8 pages on its heap, for the kernel to see freed when a
+//! process ends.
 
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
 use freya::*;
 
 freya::entry!(main);
@@ -144,6 +178,7 @@ const RECEIVE: u64 = 8;
 const GIVE: u64 = 9;
 const GIVE_LATE: u64 = 10;
 const RECEIVE_ONE: u64 = 11;
+const HEAP: u64 = 12;
 const TEST_LINE: u64 = 16;
 
 fn main(arg: u64) -> u64 {
@@ -159,6 +194,7 @@ fn main(arg: u64) -> u64 {
         RECEIVE_ONE => receive(false),
         GIVE => give(true),
         GIVE_LATE => give(false),
+        HEAP => heap_tests(),
         _ => 0,
     }
 }
@@ -489,4 +525,150 @@ fn receive(twice: bool) -> u64 {
         return 0xBAD;
     }
     brought | kind(first.cap_slot) << 8
+}
+
+/// HEAP (12, Entry 26): see the top of this file.
+fn heap_tests() -> u64 {
+    const BUDGET: u64 = 3;
+    const PAGES: u64 = 256;
+    let info = |slot: u64| cap_info(slot).unwrap_or((0, 0, 0, 0));
+    let word = |at: i64, page: u64| (at as u64 + page * PAGE) as *mut u64;
+    let read = |at: i64, page: u64| unsafe { word(at, page).read_volatile() };
+    let fill = |at: i64, page: u64, v: u64| unsafe { word(at, page).write_volatile(v) };
+
+    // bit 0
+    let at = heap(BUDGET, 4);
+    let placed = at == (HEAP_BASE + BUDGET * HEAP_SPAN) as i64;
+    let grow_shrink = placed && {
+        for i in 0..4 {
+            fill(at, i, 0x1111 * (i + 1));
+        }
+        heap(BUDGET, 2) == at
+            && (0..2).all(|i| read(at, i) == 0x1111 * (i + 1))
+            && heap(BUDGET, 4) == at
+            && (2..4).all(|i| (0..PAGE / 8).all(|w| unsafe { word(at, i).add(w as usize).read_volatile() } == 0))
+            && info(BUDGET) == (KIND_BUDGET, PAGES, 4, 4)
+            && heap(BUDGET, 0) == at
+            && info(BUDGET) == (KIND_BUDGET, PAGES, 0, 0)
+    };
+
+    // bit 1
+    let over = heap(BUDGET, PAGES + 1) == ERR_OVER_BUDGET && info(BUDGET).3 == 0;
+    let all = heap(BUDGET, PAGES) == at && heap(BUDGET, 0) == at;
+    let m = mint(BUDGET, 64, 0);
+    let narrower = m >= 0 && {
+        let m = m as u64;
+        heap(m, 65) == ERR_OVER_BUDGET
+            && heap(m, 64) == (HEAP_BASE + m * HEAP_SPAN) as i64
+            && heap(BUDGET, PAGES - 64 + 1) == ERR_OVER_BUDGET
+            && heap(BUDGET, PAGES - 64) == at
+            && info(BUDGET) == (KIND_BUDGET, PAGES, PAGES, PAGES - 64)
+            && info(m) == (KIND_BUDGET, 64, 64, 64)
+            && heap(BUDGET, 0) == at
+            && drop_cap(m) == 0
+            && info(BUDGET).2 == 0
+    };
+    let m2 = mint(BUDGET, 64, 0);
+    let above = m2 >= 0 && {
+        let m2 = m2 as u64;
+        heap(BUDGET, 200) == at
+            && heap(m2, 64) == ERR_OVER_BUDGET
+            && heap(m2, 56) > 0
+            && info(BUDGET).2 == PAGES
+            && heap(m2, 0) > 0
+            && heap(BUDGET, 0) == at
+            && drop_cap(m2) == 0
+    };
+    let refused = heap(CONSOLE_SLOT, 1) == ERR_WRONG_CAPABILITY
+        && heap(20, 1) == ERR_NO_CAPABILITY
+        && heap(40, 1) == ERR_NO_CAPABILITY
+        && mint(BUDGET, PAGES + 1, 0) == ERR_BAD_ARGUMENT
+        && mint(BUDGET, 0, 0) == ERR_BAD_ARGUMENT
+        && heap(BUDGET, 1 << 40) == ERR_BAD_ARGUMENT;
+    let limits = over && all && narrower && above && refused;
+
+    // bit 2
+    let c = copy(BUDGET);
+    let revoked = c >= 0
+        && heap(c as u64, 8) > 0
+        && info(BUDGET).2 == 8
+        && revoke(BUDGET) == 1
+        && info(BUDGET).2 == 0
+        && !holds(c as u64, KIND_BUDGET);
+    let d = copy(BUDGET);
+    let dropped = d >= 0 && heap(d as u64, 8) > 0 && info(BUDGET).2 == 8 && drop_cap(d as u64) == 0 && info(BUDGET).2 == 0;
+
+    // bit 3
+    let ready = heap::use_budget(BUDGET).is_ok();
+    let used = ready && {
+        let boxed = Box::new(0x5A5A_u64);
+        let numbers: Vec<u64> = (0..10_000).collect();
+        let mut text = String::new();
+        for _ in 0..100 {
+            text.push_str("piece ");
+        }
+        let mut squares = BTreeMap::new();
+        for i in 0..1000u64 {
+            squares.insert(i, i * i);
+        }
+        for i in (0..1000u64).step_by(2) {
+            squares.remove(&i);
+        }
+        let before = heap::stats().bytes;
+        let too_much = Vec::<u8>::new().try_reserve_exact(2 << 20).is_err();
+        let kept = !heap::release() && heap::stats().bytes == before;
+        *boxed == 0x5A5A
+            && numbers.iter().sum::<u64>() == 49_995_000
+            && text.len() == 600
+            && squares.len() == 500
+            && squares.get(&999) == Some(&998_001)
+            && too_much
+            && kept
+            && heap::stats().bytes == before
+    };
+    let st = heap::stats();
+    let freed = used && st.in_use == 0 && st.free_blocks == 1 && st.free == st.bytes && st.bytes > 0 && info(BUDGET).3 == st.bytes / PAGE;
+    let whole = {
+        let mut all = Vec::<u8>::new();
+        all.try_reserve_exact((PAGES * PAGE - 16) as usize).is_ok() && heap::stats().bytes == PAGES * PAGE
+    };
+    let released = heap::release() && heap::stats().bytes == 0 && info(BUDGET).3 == 0;
+    let allocator = freed && whole && released;
+
+    // bit 4
+    let lent = mint(BUDGET, 32, 0);
+    let across = lent >= 0 && {
+        let lent = lent as u64;
+        let mut slots = [NO_SLOT; MAX_CAPS];
+        slots[0] = CONSOLE_SLOT as u8;
+        slots[1] = lent as u8;
+        match spawn_process(FACTORY, PROGRAM_HOG, TICKER_QUIET | 1, &slots, EP) {
+            Ok((id, process)) => {
+                let mut full = false;
+                for _ in 0..200 {
+                    if info(lent).2 == 32 {
+                        full = true;
+                        break;
+                    }
+                    sleep(1);
+                }
+                let before = info(BUDGET).2;
+                let ok = full
+                    && revoke(lent) == 1
+                    && info(BUDGET).2 == before - 32
+                    && wait_exit(id)
+                    && status(process) == Ok((STATUS_FAULT, 14));
+                drop_cap(process);
+                ok
+            }
+            Err(_) => false,
+        }
+    };
+    if lent >= 0 {
+        drop_cap(lent as u64);
+    }
+
+    // Left for the end of this process to free.
+    heap(BUDGET, 8);
+    bit(0, grow_shrink) | bit(1, limits) | bit(2, revoked && dropped) | bit(3, allocator) | bit(4, across)
 }

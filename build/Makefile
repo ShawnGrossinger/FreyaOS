@@ -58,7 +58,7 @@ KERNEL_SRCS := $(shell find $(KERNDIR)/src -name '*.rs') \
 USERRS          := ../user/rust
 USER_RS_SRCS    := $(shell find $(USERRS)/src -name '*.rs') $(USERRS)/Cargo.toml \
                    $(USERRS)/user.ld $(USERRS)/x86_64-freya-user.json
-USER_RS_PROGRAMS := console init captest ps2 mouse shell spin crash ticker relay
+USER_RS_PROGRAMS := console init captest ps2 mouse shell spin crash ticker relay hog
 USER_RS_STAMP   := $(OUTDIR)/user/.built
 
 $(USER_RS_STAMP): $(USER_RS_SRCS) | $(OUTDIR)
@@ -69,7 +69,7 @@ $(USER_RS_STAMP): $(USER_RS_SRCS) | $(OUTDIR)
 	  cargo +nightly build \
 	    --target x86_64-freya-user.json \
 	    --release \
-	    -Z build-std=core,compiler_builtins \
+	    -Z build-std=core,compiler_builtins,alloc \
 	    -Z build-std-features=compiler-builtins-mem \
 	    -Z json-target-spec
 	for p in $(USER_RS_PROGRAMS); do \
