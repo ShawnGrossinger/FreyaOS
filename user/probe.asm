@@ -72,6 +72,7 @@ table:
     dq spin                     ; 11
     dq isolate                  ; 12
     dq mxcsr                    ; 13
+    dq console_scroll           ; 14
 table_end:
 
 ring:                           ; exit(CS & 3): 3 in ring 3; 0xD1D if we started dirty
@@ -201,6 +202,14 @@ mxcsr:                          ; unmask every SSE exception, yield, read it bac
     mov rax, DATA_BASE
     stmxcsr [rax]
     mov edi, [rax]
+    jmp exit
+
+console_scroll:                 ; console_scroll(slot 0, action `value`): exit with the result
+    mov eax, SYS_CONSOLE_SCROLL
+    mov edi, CONSOLE
+    mov rsi, rbx
+    syscall
+    mov rdi, rax
     jmp exit
 
 bad_mode:

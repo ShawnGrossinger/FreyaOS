@@ -81,6 +81,9 @@ pub fn user_spaces() -> u64 {
 const ENTRIES: usize = 512;
 const WRITE_THROUGH: u64 = 1 << 3; // PWT
 const CACHE_DISABLE: u64 = 1 << 4; // PCD
+/// In a 4 KiB leaf, bit 7 selects PAT entries 4-7. With PCD and PWT clear
+/// it picks entry 4, which display.rs makes write-combining (Entry 18).
+const PAT_4K: u64 = 1 << 7;
 
 // ===========================================================================
 // Flags
@@ -101,6 +104,10 @@ impl PageFlags {
     /// Read + write, no execute, uncached. For device registers, which
     /// must see every access in order and never be served from cache.
     pub const MMIO: PageFlags = PageFlags(WRITABLE | NO_EXECUTE | CACHE_DISABLE | WRITE_THROUGH);
+    /// Read + write, no execute, PAT entry 4. Write-combining once
+    /// display.rs has set that entry: for a framebuffer, which is only
+    /// ever written, in long runs. (Uncached would be several times slower.)
+    pub const FRAMEBUFFER: PageFlags = PageFlags(WRITABLE | NO_EXECUTE | PAT_4K);
     /// Ring 3: read + execute. For a program's code.
     pub const USER_CODE: PageFlags = PageFlags(USER);
     /// Ring 3: read + write, no execute. Data and stacks.
@@ -571,6 +578,14 @@ static NEXT_DEVICE_VA: AtomicU64 = AtomicU64::new(DEVICE_WINDOW_BASE);
 /// # Safety
 /// `phys` must be device memory the caller is entitled to drive.
 pub unsafe fn map_mmio(phys: u64, bytes: u64) -> Result<u64, MapError> {
+    map_device(phys, bytes, PageFlags::MMIO)
+}
+
+/// map_mmio with other flags (PageFlags::FRAMEBUFFER).
+///
+/// # Safety
+/// As map_mmio.
+pub unsafe fn map_device(phys: u64, bytes: u64, flags: PageFlags) -> Result<u64, MapError> {
     let first = phys & !(PAGE_SIZE - 1);
     let end = (phys + bytes + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let pages = (end - first) / PAGE_SIZE;
@@ -578,9 +593,20 @@ pub unsafe fn map_mmio(phys: u64, bytes: u64) -> Result<u64, MapError> {
 
     let mut ks = AddressSpace::kernel();
     for i in 0..pages {
-        ks.map(va + i * PAGE_SIZE, first + i * PAGE_SIZE, PageFlags::MMIO)?;
+        ks.map(va + i * PAGE_SIZE, first + i * PAGE_SIZE, flags)?;
     }
     Ok(va + (phys - first))
+}
+
+/// The raw leaf entry of a 4 KiB kernel mapping, for self-tests that check
+/// its flags.
+pub fn kernel_leaf_entry(virt: u64) -> Option<u64> {
+    unsafe { AddressSpace::kernel().leaf_entry(virt) }
+}
+
+/// PAT bit and the two cache bits of a leaf entry: (PAT, PCD, PWT).
+pub fn cache_bits(entry: u64) -> (bool, bool, bool) {
+    (entry & PAT_4K != 0, entry & CACHE_DISABLE != 0, entry & WRITE_THROUGH != 0)
 }
 
 // ===========================================================================
@@ -711,23 +737,29 @@ pub unsafe fn selftest() -> bool {
     };
     check(&mut ok, b"KERNEL_CODE page is read-only and runs (mov eax, 42; ret -> 42)", code_ok);
 
-    // --- 7. device memory: VGA text buffer, uncached ---
-    // Write the bottom-right screen cell through a new MMIO mapping and read
-    // it back through the identity map: same physical bytes.
-    let vga_cell_va = va + 0x2000;
-    let cell = 24 * 80 + 79;
-    let mmio_ok = ks.map(vga_cell_va, 0xB8000, PageFlags::MMIO).is_ok() && {
-        let new_view = (vga_cell_va as *mut u16).add(cell);
-        let old_view = (0xB8000 as *const u16).add(cell);
+    // --- 7. device memory: the screen, uncached ---
+    // Write 4 bytes of screen memory through a new MMIO mapping and read
+    // them back through the screen's own view: same physical bytes. In text
+    // mode that is the VGA buffer (the bottom-right two cells); in graphics
+    // mode the framebuffer's first page (VGA memory isn't plain memory then).
+    let (screen_phys, screen_view, offset, value): (u64, u64, usize, u32) =
+        match crate::display::mmio_test_target() {
+            Some((phys, view)) => (phys, view, 0xFFC, 0x00FF_00FF),
+            None => (0xB8000, 0xB8000, (24 * 80 + 78) * 2, 0x0F46_0F46),
+        };
+    let test_va = va + 0x2000;
+    let mmio_ok = ks.map(test_va, screen_phys, PageFlags::MMIO).is_ok() && {
+        let new_view = (test_va as *mut u8).add(offset) as *mut u32;
+        let old_view = (screen_view as *const u8).add(offset) as *const u32;
         let saved = old_view.read_volatile();
-        new_view.write_volatile(0x0F00 | b'F' as u16);
+        new_view.write_volatile(value);
         let seen = old_view.read_volatile();
         new_view.write_volatile(saved);
-        let entry = ks.leaf_entry(vga_cell_va).unwrap_or(0);
+        let entry = ks.leaf_entry(test_va).unwrap_or(0);
         let uncached = entry & CACHE_DISABLE != 0;
-        ks.unmap(vga_cell_va) == Ok(0xB8000) && seen == 0x0F00 | b'F' as u16 && uncached
+        ks.unmap(test_va) == Ok(screen_phys) && seen == value && uncached
     };
-    check(&mut ok, b"MMIO mapping of the VGA buffer is uncached and aliases it", mmio_ok);
+    check(&mut ok, b"MMIO mapping of the screen's memory is uncached and aliases it", mmio_ok);
 
     // --- User address spaces ---
     // Where user pages may go: only user space, only in a user address

@@ -60,7 +60,8 @@ impl E820Entry {
     }
 }
 
-/// Where stage2 records FLAGS as its last BIOS call left them (Entry 16).
+/// Where stage2 records FLAGS as the BIOS's disk and memory-map calls left
+/// them (Entry 16; before the display is set up since Entry 19).
 pub const BIOS_FLAGS_ADDR: usize = 0x04F0;
 
 extern "C" {
@@ -70,7 +71,8 @@ extern "C" {
 
 const IF: u64 = 1 << 9;
 
-/// The BIOS returned from stage2's last call with interrupts enabled.
+/// The BIOS returned from stage2's disk and memory-map calls with
+/// interrupts enabled.
 pub fn bios_left_interrupts_on() -> bool {
     unsafe { (BIOS_FLAGS_ADDR as *const u16).read_volatile() as u64 & IF != 0 }
 }
@@ -78,6 +80,63 @@ pub fn bios_left_interrupts_on() -> bool {
 /// Interrupts were enabled when the kernel was entered.
 pub fn entered_with_interrupts_on() -> bool {
     unsafe { core::ptr::read_volatile(&raw const entry_rflags) & IF != 0 }
+}
+
+/// What stage 2 did about the display (Entry 18), as it left it at 0x0900.
+/// Layout: bootloader/BIOS/stage2.asm, DI_* constants.
+#[derive(Clone, Copy)]
+pub struct DisplayInfo {
+    /// 0 graphics mode set; text mode because: 1 built with TEXT_MODE=1,
+    /// 2 Shift held, 3 no VBE 2.0, 4 no usable mode, 5 the mode set failed,
+    /// 6 the ROM font couldn't be copied.
+    pub status: u8,
+    /// The VGA ROM's 8x16 font is at FONT_ADDR.
+    pub font: bool,
+    pub mode: u16,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub bpp: u32,
+    /// (size, position) of each colour field in a pixel.
+    pub red: (u8, u8),
+    pub green: (u8, u8),
+    pub blue: (u8, u8),
+    pub framebuffer: u64,
+    /// The display's own resolution from its EDID; (0, 0) if unknown.
+    pub native: (u32, u32),
+    pub vbe_version: u16,
+    pub modes_listed: u32,
+}
+
+pub const DISPLAY_INFO_ADDR: usize = 0x0900;
+/// 256 glyphs, 16 bytes each (one byte per row, bit 7 = leftmost pixel).
+pub const FONT_ADDR: usize = 0x1000;
+const DISPLAY_MAGIC: u32 = u32::from_le_bytes(*b"FDSP");
+
+/// The display hand-off, or None if stage 2 didn't write one.
+pub fn display_info() -> Option<DisplayInfo> {
+    let b = |off: usize| unsafe { ((DISPLAY_INFO_ADDR + off) as *const u8).read_volatile() };
+    let w = |off: usize| b(off) as u32 | (b(off + 1) as u32) << 8;
+    let d = |off: usize| w(off) | w(off + 2) << 16;
+    if d(0) != DISPLAY_MAGIC {
+        return None;
+    }
+    Some(DisplayInfo {
+        status: b(4),
+        font: b(5) == 1,
+        mode: w(6) as u16,
+        width: w(8),
+        height: w(10),
+        pitch: w(12),
+        bpp: b(14) as u32,
+        red: (b(15), b(16)),
+        green: (b(17), b(18)),
+        blue: (b(19), b(20)),
+        framebuffer: d(24) as u64,
+        native: (w(28), w(30)),
+        vbe_version: w(32) as u16,
+        modes_listed: w(34),
+    })
 }
 
 /// Read the E820 map left by stage2

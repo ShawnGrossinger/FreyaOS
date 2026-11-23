@@ -5,6 +5,9 @@
 ; - (Real mode) enable A20
 ; - (Real mode) load kernel from disk into 0x0010_0000 (1 MiB) using INT 13h extensions,
 ;   in 32 KiB chunks through a bounce buffer, copied up with unreal mode
+; - (Real mode) collect the E820 memory map
+; - (Real mode) set a VESA graphics mode with a linear framebuffer, if there is a good one,
+;   and copy the VGA ROM's 8x16 font for the kernel to draw text with (Entry 18)
 ; - enter 32-bit protected mode
 ; - set up minimal IA-32e paging (identity-map first 2 MiB using a single 2 MiB page)
 ; - enable long mode and jump to the kernel entry at 0x0010_0000
@@ -60,6 +63,38 @@ COM1_BASE         equ 0x03F8
 ; is the BIOS data area's "inter-application communication area", kept
 ; free for programs like this one).
 BIOS_FLAGS        equ 0x04F0
+
+; Display hand-off for the kernel (kernel/src/boot.rs reads the same layout).
+; 0x0900-0x093F and 0x1000-0x24FF lie between the E820 map (ends by 0x0804)
+; and the stack (below 0x7C00), and nothing else uses them.
+DISPLAY_INFO      equ 0x0900      ; 64 bytes, filled in by setup_display
+FONT_ADDR         equ 0x1000      ; 4 KiB: 256 glyphs of 16 rows, 8 pixels wide
+VBE_CTRL_INFO     equ 0x2000      ; 512 bytes: VBE controller information
+VBE_MODE_INFO     equ 0x2200      ; 256 bytes: VBE mode information
+EDID_BUFFER       equ 0x2400      ; 128 bytes: the display's EDID
+
+DI_MAGIC          equ 0           ; dd 'FDSP'
+DI_STATUS         equ 4           ; db, see DS_* below
+DI_FONT           equ 5           ; db 1 = the font was copied to FONT_ADDR
+DI_MODE           equ 6           ; dw VBE mode number
+DI_WIDTH          equ 8           ; dw pixels
+DI_HEIGHT         equ 10          ; dw pixels
+DI_PITCH          equ 12          ; dw bytes from one line to the next
+DI_BPP            equ 14          ; db bits per pixel (24 or 32)
+DI_RED            equ 15          ; db size, db position (then green, then blue)
+DI_FRAMEBUFFER    equ 24          ; dd physical address of the linear framebuffer
+DI_NATIVE_W       equ 28          ; dw the display's own resolution, from EDID (0: unknown)
+DI_NATIVE_H       equ 30          ; dw
+DI_VBE_VERSION    equ 32          ; dw BCD, e.g. 0x0300
+DI_MODES          equ 34          ; dw modes the card listed
+
+DS_GRAPHICS       equ 0           ; graphics mode set
+DS_BUILT_TEXT     equ 1           ; text: built with TEXT_MODE=1
+DS_SHIFT          equ 2           ; text: Shift held while booting
+DS_NO_VBE         equ 3           ; text: no VBE 2.0 (no linear framebuffer)
+DS_NO_MODE        equ 4           ; text: no usable mode in the card's list
+DS_SET_FAILED     equ 5           ; text: the card refused the chosen mode
+DS_NO_FONT        equ 6           ; text: the ROM font couldn't be copied (nothing to draw with)
 
 ; --- Stage 2 entry ---
 start:
@@ -208,21 +243,34 @@ start:
     ; Entry count stored at 0x0500 as a 16-bit word.
     call get_e820_map
 
-    ; --- Interrupts off, for good ---
+    ; --- What the BIOS left the interrupt flag as ---
     ; INT 13h and INT 15h return with RETF 2 (to keep their carry flag),
     ; which also keeps whatever IF the BIOS handler left: the CLI at the top
     ; of stage 2 doesn't survive them. SeaBIOS (QEMU) returns with IF clear;
     ; the T430's BIOS returns with it set, so the kernel used to start with
     ; interrupts on and the PIC still putting the timer on vector 8, one of
-    ; the CPU's exception vectors (Entry 16). Record what the BIOS left, for
-    ; the kernel's log, then CLI: from here until the kernel loads its own
-    ; IDT there is nothing that could take an interrupt.
+    ; the CPU's exception vectors (Entry 16). Recorded here, for the kernel's
+    ; log, after the disk and memory-map calls: setup_display turns
+    ; interrupts on and off itself (to see Shift), so recorded after it
+    ; this would always say off (Entry 19).
 %ifdef __BIOS_LEAVES_IF_ON
     sti                           ; test build: behave like the T430's BIOS
 %endif
     pushf
     pop ax
     mov [BIOS_FLAGS], ax
+
+    ; --- Display: VESA graphics if possible (the last BIOS call) ---
+    ; After a graphics mode is set the BIOS's text output is gone, so this
+    ; comes after every print_string, and before interrupts go off for good.
+    call setup_display
+
+    ; --- Interrupts off, for good ---
+    ; From here until the kernel loads its own IDT there is nothing that
+    ; could take an interrupt.
+%ifdef __BIOS_LEAVES_IF_ON
+    sti                           ; test build: as a video BIOS might leave it
+%endif
     cli
 
     ; --- Set up GDT and enter protected mode ---
@@ -427,11 +475,14 @@ print_string:
 
 ; serial_putc: write AL to COM1. Does nothing if serial_init found no UART
 ; (the T430 has none), and never waits forever for one that doesn't answer.
+; Keeps every register (Entry 18: it used to change AH, so a disk error
+; code printed by serial_write_hex_byte had its low digit wrong).
 serial_putc:
     cmp byte [serial_present], 0
     je .absent
     push dx
     push cx
+    push ax
     mov ah, al
     mov cx, 0xFFFF
 .wait:
@@ -444,6 +495,7 @@ serial_putc:
     mov dx, COM1_BASE
     mov al, ah
     out dx, al
+    pop ax
     pop cx
     pop dx
 .absent:
@@ -549,6 +601,334 @@ serial_init:
     ret
 
 ; ---------------------------------------------------------------------------------------------
+; setup_display
+; Copy the VGA ROM's 8x16 font to FONT_ADDR, then choose and set a VESA mode with a
+; linear framebuffer, and describe the result at DISPLAY_INFO. Stays in text mode (and
+; says why) if the build asks for it, Shift is held, the card has no VBE 2.0, no mode
+; fits, or setting it fails: the kernel draws either way.
+;
+; Choice: graphics modes with a linear framebuffer, direct colour, 24 or 32 bits per
+; pixel, between 640x480 and 1920x1280 (the kernel's largest text grid is 240x80 cells
+; of 8x16). If the display's EDID gives its own resolution, nothing larger than that;
+; among the rest, the most pixels, then 32 bits over 24.
+; ---------------------------------------------------------------------------------------------
+setup_display:
+    pushad
+    push es
+
+    cld
+    xor ax, ax
+    mov es, ax
+    mov di, DISPLAY_INFO
+    mov cx, 32
+    rep stosw                          ; zero the 64-byte block
+    mov dword [DISPLAY_INFO + DI_MAGIC], 'FDSP'
+
+    ; --- The font: INT 10h AX=1130h BH=06h returns ES:BP -> 8x16 glyphs, CX = 16 ---
+    push bp
+    mov ax, 0x1130
+    mov bh, 0x06
+    int 0x10
+    cmp cx, 16
+    jne .font_done
+    push ds
+    mov ax, es
+    mov ds, ax
+    mov si, bp
+    xor ax, ax
+    mov es, ax
+    mov di, FONT_ADDR
+    mov cx, 2048
+    cld
+    rep movsw                          ; 4096 bytes
+    pop ds
+    mov byte [DISPLAY_INFO + DI_FONT], 1
+.font_done:
+    pop bp
+    xor ax, ax
+    mov es, ax
+
+%ifdef __TEXT_MODE
+    mov byte [DISPLAY_INFO + DI_STATUS], DS_BUILT_TEXT
+    jmp .report
+%endif
+
+    ; --- Shift held: stay in text mode ---
+    ; Interrupts have been off since stage 1 (but inside some BIOS calls),
+    ; so the BIOS may not have seen the keyboard. Give it a quarter of a
+    ; second with them on: its keyboard handler records Shift in the shift
+    ; flags (BIOS data area 0x417), and a held key repeats. The flags are
+    ; then read straight from there: INT 16h would do, but SeaBIOS's also
+    ; fetches waiting keys itself, which would hide a broken wait from the
+    ; test (test.sh's shift case). Bounded even if the timer never ticks.
+    sti
+    mov ebx, [0x046C]                   ; BIOS timer ticks, 18.2 a second
+    mov ecx, 0x00200000                 ; ~2 s of port 0x80 delays at most
+.shift_wait:
+    mov eax, [0x046C]
+    sub eax, ebx
+    cmp eax, 5
+    jae .shift_check
+    out 0x80, al                        ; about 1 us (the POST code port)
+    dec ecx
+    jnz .shift_wait
+.shift_check:
+    cli
+    test byte [0x0417], 0x03            ; bit 0 right Shift, bit 1 left Shift
+    jz .vbe
+    mov byte [DISPLAY_INFO + DI_STATUS], DS_SHIFT
+    jmp .report
+
+.vbe:
+    ; --- Without the font the kernel couldn't draw a single character ---
+    cmp byte [DISPLAY_INFO + DI_FONT], 1
+    je .vbe_info
+    mov byte [DISPLAY_INFO + DI_STATUS], DS_NO_FONT
+    jmp .report
+
+.vbe_info:
+    ; --- Controller information: ask for VBE 2.0+ fields ---
+    mov dword [VBE_CTRL_INFO], 'VBE2'
+    mov di, VBE_CTRL_INFO
+    mov ax, 0x4F00
+    int 0x10
+    xor bx, bx
+    mov es, bx
+    cmp ax, 0x004F
+    jne .no_vbe
+    cmp dword [VBE_CTRL_INFO], 'VESA'
+    jne .no_vbe
+    mov ax, [VBE_CTRL_INFO + 4]        ; version, BCD
+    mov [DISPLAY_INFO + DI_VBE_VERSION], ax
+    cmp ax, 0x0200
+    jb .no_vbe
+
+    ; --- The display's own resolution, from EDID (VBE/DDC 4F15h, block 0) ---
+    mov ax, 0x4F15
+    mov bl, 0x01
+    xor cx, cx
+    xor dx, dx
+    mov di, EDID_BUFFER
+    int 0x10
+    xor bx, bx
+    mov es, bx
+    cmp ax, 0x004F
+    jne .modes
+    cmp dword [EDID_BUFFER], 0xFFFFFF00     ; header 00 FF FF FF FF FF FF 00
+    jne .modes
+    cmp dword [EDID_BUFFER + 4], 0x00FFFFFF
+    jne .modes
+    mov si, EDID_BUFFER
+    mov cx, 128
+    xor bl, bl
+.edid_sum:
+    add bl, [si]
+    inc si
+    loop .edid_sum
+    test bl, bl                         ; all 128 bytes sum to 0
+    jnz .modes
+    cmp word [EDID_BUFFER + 54], 0      ; first detailed timing: pixel clock 0 = not a timing
+    je .modes
+    movzx ax, byte [EDID_BUFFER + 58]   ; horizontal active: byte 56, high nibble of 58
+    shr ax, 4
+    shl ax, 8
+    mov al, [EDID_BUFFER + 56]
+    mov [DISPLAY_INFO + DI_NATIVE_W], ax
+    movzx ax, byte [EDID_BUFFER + 61]   ; vertical active: byte 59, high nibble of 61
+    shr ax, 4
+    shl ax, 8
+    mov al, [EDID_BUFFER + 59]
+    mov [DISPLAY_INFO + DI_NATIVE_H], ax
+
+.modes:
+    ; --- Walk the card's mode list (far pointer at offset 14), at most 256 entries ---
+    mov ax, [VBE_CTRL_INFO + 14]
+    mov [vbe_list_off], ax
+    mov ax, [VBE_CTRL_INFO + 16]
+    mov [vbe_list_seg], ax
+    mov word [vbe_best], 0xFFFF
+    mov dword [vbe_best_area], 0
+    mov byte [vbe_best_bpp], 0
+.next_mode:
+    cmp word [DISPLAY_INFO + DI_MODES], 256
+    jae .chosen
+    push ds
+    mov si, [vbe_list_off]
+    mov ds, [vbe_list_seg]
+    mov cx, [si]                        ; the mode number
+    pop ds
+    cmp cx, 0xFFFF
+    je .chosen
+    add word [vbe_list_off], 2
+    inc word [DISPLAY_INFO + DI_MODES]
+    mov [vbe_mode], cx
+
+    mov ax, 0x4F01
+    mov di, VBE_MODE_INFO
+    int 0x10
+    xor bx, bx
+    mov es, bx
+    cmp ax, 0x004F
+    jne .next_mode
+    mov ax, [VBE_MODE_INFO + 0]         ; attributes: supported (0), graphics (4), linear (7)
+    and ax, 0x0091
+    cmp ax, 0x0091
+    jne .next_mode
+    cmp byte [VBE_MODE_INFO + 27], 6    ; memory model: direct colour
+    jne .next_mode
+    mov bl, [VBE_MODE_INFO + 25]        ; bits per pixel
+    cmp bl, 32
+    je .bpp_ok
+    cmp bl, 24
+    jne .next_mode
+.bpp_ok:
+    mov ax, [VBE_MODE_INFO + 18]        ; width
+    mov dx, [VBE_MODE_INFO + 20]        ; height
+    cmp ax, 640
+    jb .next_mode
+    cmp ax, 1920
+    ja .next_mode
+    cmp dx, 480
+    jb .next_mode
+    cmp dx, 1280
+    ja .next_mode
+    ; No bigger than the display's own resolution; with no EDID, no bigger
+    ; than 1024x768, which every VESA display shows (a mode the panel can't
+    ; show would leave the screen dark).
+    mov cx, [DISPLAY_INFO + DI_NATIVE_W]
+    mov si, [DISPLAY_INFO + DI_NATIVE_H]
+    test cx, cx
+    jz .no_edid
+    test si, si
+    jnz .limit
+.no_edid:
+    mov cx, 1024
+    mov si, 768
+.limit:
+    cmp ax, cx
+    ja .next_mode
+    cmp dx, si
+    ja .next_mode
+    ; Everything the kernel needs to draw: a framebuffer address, and lines
+    ; at least as long as a row of pixels. Checked here, before the mode is
+    ; set: once it is, there is no going back to text mode.
+    cmp dword [VBE_MODE_INFO + 40], 0
+    je .next_mode
+    push ax
+    push dx
+    movzx cx, bl
+    shr cx, 3                           ; bytes per pixel
+    mul cx                              ; AX = bytes in a row of pixels
+    mov cx, ax
+    call mode_pitch
+    cmp ax, cx
+    pop dx
+    pop ax
+    jb .next_mode
+    movzx eax, ax
+    movzx edx, dx
+    imul eax, edx                       ; area
+    cmp eax, [vbe_best_area]
+    ja .better
+    jb .next_mode
+    cmp bl, [vbe_best_bpp]              ; same area: more bits per pixel wins
+    jbe .next_mode
+.better:
+    mov [vbe_best_area], eax
+    mov [vbe_best_bpp], bl
+    mov ax, [vbe_mode]
+    mov [vbe_best], ax
+    jmp .next_mode
+
+.chosen:
+    mov cx, [vbe_best]
+    cmp cx, 0xFFFF
+    jne .set
+    mov byte [DISPLAY_INFO + DI_STATUS], DS_NO_MODE
+    jmp .report
+.set:
+    mov ax, 0x4F01                      ; its information again, into the buffer
+    mov di, VBE_MODE_INFO
+    int 0x10
+    xor bx, bx
+    mov es, bx
+    cmp ax, 0x004F
+    jne .set_failed
+    mov bx, [vbe_best]
+    or bx, 0x4000                       ; linear framebuffer
+    mov ax, 0x4F02
+    int 0x10
+    xor cx, cx
+    mov es, cx
+    cmp ax, 0x004F
+    jne .set_failed
+
+    ; --- Describe the mode for the kernel ---
+    mov ax, [vbe_best]
+    mov [DISPLAY_INFO + DI_MODE], ax
+    mov ax, [VBE_MODE_INFO + 18]
+    mov [DISPLAY_INFO + DI_WIDTH], ax
+    mov ax, [VBE_MODE_INFO + 20]
+    mov [DISPLAY_INFO + DI_HEIGHT], ax
+    call mode_pitch
+    mov [DISPLAY_INFO + DI_PITCH], ax
+    mov al, [VBE_MODE_INFO + 25]
+    mov [DISPLAY_INFO + DI_BPP], al
+    mov si, VBE_MODE_INFO + 31          ; red size, red position, green..., blue...
+    mov di, DISPLAY_INFO + DI_RED
+    mov cx, 6
+    cld
+    rep movsb
+    mov eax, [VBE_MODE_INFO + 40]
+    mov [DISPLAY_INFO + DI_FRAMEBUFFER], eax
+    mov byte [DISPLAY_INFO + DI_STATUS], DS_GRAPHICS
+    jmp .report
+
+.set_failed:
+    mov byte [DISPLAY_INFO + DI_STATUS], DS_SET_FAILED
+    jmp .report
+.no_vbe:
+    mov byte [DISPLAY_INFO + DI_STATUS], DS_NO_VBE
+
+.report:
+    ; Serial only: after a mode set, BIOS text output is gone.
+    mov si, msg_display_serial
+    call serial_write_string
+    mov al, [DISPLAY_INFO + DI_STATUS]
+    call serial_write_hex_byte
+    mov si, msg_display_mode_serial
+    call serial_write_string
+    mov al, [DISPLAY_INFO + DI_MODE + 1]
+    call serial_write_hex_byte
+    mov al, [DISPLAY_INFO + DI_MODE]
+    call serial_write_hex_byte
+    mov al, 0x0A
+    call serial_putc
+
+    pop es
+    popad
+    ret
+
+vbe_list_off   dw 0
+vbe_list_seg   dw 0
+vbe_mode       dw 0
+vbe_best       dw 0
+vbe_best_area  dd 0
+vbe_best_bpp   db 0
+
+; AX = bytes from one line to the next of the mode in VBE_MODE_INFO: the
+; VBE 3 linear-mode field (offset 50) when there is one, else offset 16.
+mode_pitch:
+    mov ax, [VBE_MODE_INFO + 16]
+    cmp word [DISPLAY_INFO + DI_VBE_VERSION], 0x0300
+    jb .done
+    cmp word [VBE_MODE_INFO + 50], 0
+    je .done
+    mov ax, [VBE_MODE_INFO + 50]
+.done:
+    ret
+
+; ---------------------------------------------------------------------------------------------
 ; get_e820_map
 ; Collect BIOS E820 memory map into physical 0x0504.
 ; 0x0500 (dword) = entry count on return.
@@ -636,6 +1016,8 @@ msg_a20_fail_serial db "[stage2] ERROR: kernel too large (max 127 sectors)", 0x0
 msg_e820_ok_serial db "[stage2] E820 map collected", 0x0A, 0
 msg_e820_fail_serial db "[stage2] ERROR: E820 not supported", 0x0A, 0
 msg_read_err_code db "[stage2] INT13 error code: 0x", 0
+msg_display_serial db "[stage2] display: status 0x", 0
+msg_display_mode_serial db ", VBE mode 0x", 0
 
 
 

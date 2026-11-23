@@ -29,9 +29,12 @@ STAGE2    := $(OUTDIR)/stage2.bin
 KERNELELF := $(OUTDIR)/kernel.elf
 KERNELBIN := $(OUTDIR)/kernel.bin
 
-.PHONY: all clean run trace debug test rehearse usb usb-clear
+.PHONY: all build clean run trace debug test rehearse usb usb-clear
 
 all: $(IMG)
+
+# Another name for it.
+build: all
 
 $(OUTDIR):
 	mkdir -p $(OUTDIR)
@@ -78,14 +81,24 @@ $(KERNELBIN): $(KERNELELF)
 
 # Stage2 preliminary build (with placeholder kernel constants) so we can compute its size.
 # BIOS_LEAVES_IF_ON=1 (test.sh's bios-if-on case): stage2 turns interrupts
-# on after its last BIOS call, as the T430's BIOS leaves them (Entry 16).
-STAGE2_DEFS := $(if $(BIOS_LEAVES_IF_ON),-D__BIOS_LEAVES_IF_ON,)
+# on after its disk calls, as the T430's BIOS leaves them (Entry 16), and
+# again after setting the display.
+# TEXT_MODE=1: stage2 keeps the BIOS's 80x25 text mode instead of setting a
+# VESA graphics mode (Entry 18). Holding Shift while it boots does the same.
+STAGE2_DEFS := $(if $(BIOS_LEAVES_IF_ON),-D__BIOS_LEAVES_IF_ON,) $(if $(TEXT_MODE),-D__TEXT_MODE,)
+# As with FREYA_DEMO: a stamp names the current choice, so switching
+# between "make" and "TEXT_MODE=1 make" rebuilds stage2.
+STAGE2_STAMP := $(OUTDIR)/.stage2$(if $(BIOS_LEAVES_IF_ON),-bios-if-on,)$(if $(TEXT_MODE),-text-mode,)
 
-$(STAGE2PRE): $(BOOTDIR)/stage2.asm | $(OUTDIR)
+$(STAGE2_STAMP): | $(OUTDIR)
+	rm -f $(OUTDIR)/.stage2*
+	touch $@
+
+$(STAGE2PRE): $(BOOTDIR)/stage2.asm $(STAGE2_STAMP) | $(OUTDIR)
 	$(NASM) -f bin $(STAGE2_DEFS) $(BOOTDIR)/stage2.asm -o $(STAGE2PRE)
 
 # Stage2 final build: compute Stage2 sectors, then compute kernel LBA/sectors, then assemble.
-$(STAGE2): $(BOOTDIR)/stage2.asm $(STAGE2PRE) $(KERNELBIN) | $(OUTDIR)
+$(STAGE2): $(BOOTDIR)/stage2.asm $(STAGE2PRE) $(KERNELBIN) $(STAGE2_STAMP) | $(OUTDIR)
 	@STAGE2_SIZE=$$(stat -c%s $(STAGE2PRE)); \
 	STAGE2_SECTORS=$$(( ($$STAGE2_SIZE + $(SECTOR) - 1)/$(SECTOR) )); \
 	KERNEL_LBA=$$(( 1 + $$STAGE2_SECTORS )); \

@@ -22,11 +22,16 @@ SYS_REPLY    equ 6                  ; reply(-, w0, w1, w2, w3, xfer)
 SYS_PORT_IN  equ 7                  ; port_in(ports, port, width): value
 SYS_PORT_OUT equ 8                  ; port_out(ports, port, width, value)
 SYS_IRQ_WAIT equ 9                  ; irq_wait(irq): returns once the line has fired
-SYS_IRQ_ACK  equ 10                 ; irq_ack(irq)
+SYS_IRQ_ACK  equ 10                 ; irq_ack(irq): unmask the line (after handling it, or to arm it first)
 SYS_POWER    equ 11                 ; power(cap, action): never returns if allowed
+SYS_CONSOLE_SCROLL equ 12           ; console_scroll(cap, action): rows the view is back
 
 POWER_RESTART  equ 0
 POWER_SHUTDOWN equ 1
+
+SCROLL_BACK    equ 0                ; console_scroll: a page back (PageUp)
+SCROLL_FORWARD equ 1                ; a page forward (PageDown)
+SCROLL_TO_END  equ 2                ; to the newest line
 
 ; Message words go in RSI, RDX, R10, R8; R9 = slot of a capability to pass
 ; along, or NO_CAP.

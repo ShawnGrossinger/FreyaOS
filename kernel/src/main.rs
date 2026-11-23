@@ -11,6 +11,7 @@ mod boot;
 mod cap;
 mod cpu;
 mod disk_io;
+mod display;
 mod gdt;
 mod heap;
 mod idt;
@@ -93,19 +94,21 @@ fn serial_init() {
 /// is one, to COM1.
 fn serial_write_byte(b: u8) {
     screen_log_byte(b);
+    uart_byte(b);
+}
+
+/// One byte to the UART, if there is one; nothing else.
+fn uart_byte(b: u8) {
     if !SERIAL_PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
-
     unsafe {
-
         // Wait for the transmitter holding register to empty, but not
         // forever: a UART that stops answering mustn't hang the kernel.
         let mut patience = 100_000u32;
         while (inb(COM1 + 5) & 0x20) == 0 && patience > 0 {
             patience -= 1;
         }
-
         outb(COM1 + 0, b);
     }
 }
@@ -115,25 +118,48 @@ fn serial_write_byte(b: u8) {
 // ------------------------------------------------------------------
 //
 // Real hardware like the T430 has no serial port, so everything printed
-// is also kept here: rows 18-24, scrolling, long lines wrapped. A shadow
-// copy in RAM is redrawn on each scroll (reading VGA memory back is slow).
+// is also kept here, from row 18 to the bottom of the screen: 7 rows in
+// text mode, 30 at 1024x768 (Entry 18). Long lines wrap at the screen's
+// width. The last HISTORY rows are kept, and PageUp/PageDown (through the
+// keyboard driver and system call 12) scroll back through them.
 // The line being printed is also kept whole, so a failing self-test can
 // be repeated after the summary, where it stays on screen.
 
 const LOG_TOP: usize = 18;
-const LOG_ROWS: usize = 7;
 const LOG_ATTR: u8 = 0x07;
 const LINE_MAX: usize = 160;
+const HISTORY: usize = 400;
+/// Rows and width of the crash screen's "before it happened" block.
+const SNAPSHOT_ROWS: usize = 7;
+const SNAPSHOT_COLS: usize = 160;
+type Snapshot = [[u8; SNAPSHOT_COLS]; SNAPSHOT_ROWS];
 
 struct ScreenLog {
-    rows: [[u8; 80]; LOG_ROWS],
+    history: [[u8; display::MAX_COLS]; HISTORY],
+    /// Index of the row being written; rows before it in ring order.
+    newest: usize,
+    /// Rows started since boot (the first row counts as 1).
+    total: usize,
     col: usize,
+    /// Rows scrolled back from the end; 0 = following new output.
+    back: usize,
     line: [u8; LINE_MAX],
     line_len: usize,
 }
 
-static mut SCREEN_LOG: ScreenLog =
-    ScreenLog { rows: [[b' '; 80]; LOG_ROWS], col: 0, line: [0; LINE_MAX], line_len: 0 };
+static mut SCREEN_LOG: ScreenLog = ScreenLog {
+    history: [[b' '; display::MAX_COLS]; HISTORY],
+    newest: 0,
+    total: 1,
+    col: 0,
+    back: 0,
+    line: [0; LINE_MAX],
+    line_len: 0,
+};
+
+fn log_rows() -> usize {
+    display::rows() - LOG_TOP
+}
 
 fn screen_log_byte(b: u8) {
     cpu::without_interrupts(|| {
@@ -141,19 +167,17 @@ fn screen_log_byte(b: u8) {
         match b {
             b'\r' => {}
             b'\n' => {
-                screen_log_scroll(log);
+                screen_log_new_row(log);
                 log.line_len = 0;
             }
             _ => {
-                if log.col >= 80 {
-                    screen_log_scroll(log); // wrap
+                if log.col >= display::cols() {
+                    screen_log_new_row(log); // wrap
                 }
-                if let Some(last) = log.rows.last_mut() {
-                    if let Some(cell) = last.get_mut(log.col) {
-                        *cell = b;
-                    }
+                log.history[log.newest][log.col] = b;
+                if log.back == 0 {
+                    display::put(LOG_TOP + log_rows() - 1, log.col, b, LOG_ATTR);
                 }
-                vga_cell(LOG_TOP + LOG_ROWS - 1, log.col, b, LOG_ATTR);
                 log.col += 1;
                 if let Some(slot) = log.line.get_mut(log.line_len) {
                     *slot = b;
@@ -164,33 +188,96 @@ fn screen_log_byte(b: u8) {
     });
 }
 
-fn screen_log_scroll(log: &mut ScreenLog) {
-    log.rows.rotate_left(1);
-    if let Some(last) = log.rows.last_mut() {
-        *last = [b' '; 80];
-    }
+fn screen_log_new_row(log: &mut ScreenLog) {
+    log.newest = (log.newest + 1) % HISTORY;
+    log.history[log.newest] = [b' '; display::MAX_COLS];
+    log.total += 1;
     log.col = 0;
-    for (r, row) in log.rows.iter().enumerate() {
-        for (c, &ch) in row.iter().enumerate() {
-            vga_cell(LOG_TOP + r, c, ch, LOG_ATTR);
+    if log.back > 0 {
+        // Scrolled back: keep showing the same rows.
+        log.back = (log.back + 1).min(max_back(log));
+    }
+    screen_log_draw(log);
+}
+
+/// How far back the view can go: rows kept, less one screenful.
+fn max_back(log: &ScreenLog) -> usize {
+    log.total.min(HISTORY).saturating_sub(log_rows())
+}
+
+/// The log area from history. display::put skips cells that already show
+/// the right thing, so this is cheap when little has changed.
+fn screen_log_draw(log: &ScreenLog) {
+    let rows = log_rows();
+    let cols = display::cols();
+    let kept = log.total.min(HISTORY);
+    for r in 0..rows {
+        // Screen row r shows the row (rows - 1 - r + back) before the newest.
+        let age = rows - 1 - r + log.back;
+        let row = (age < kept).then(|| &log.history[(log.newest + HISTORY - age) % HISTORY]);
+        for c in 0..cols {
+            let ch = row.map_or(b' ', |row| row[c]);
+            display::put(LOG_TOP + r, c, ch, LOG_ATTR);
+        }
+    }
+    if log.back > 0 {
+        let mut note = idt::Line::new();
+        note.str(b" -- scrolled back ").dec(log.back as u64).str(b" rows: PageDown to go forward -- ");
+        // Across the whole top row, so no half-hidden line shows beside it.
+        let text = note.as_bytes();
+        for c in 0..cols {
+            display::put(LOG_TOP, c, text.get(c).copied().unwrap_or(b' '), 0x70);
         }
     }
 }
 
-/// The log's rows as they are now. A crash report takes this before it
-/// prints anything, so the lines that led up to the crash aren't scrolled
-/// off by the report itself.
-fn screen_log_snapshot() -> [[u8; 80]; LOG_ROWS] {
-    cpu::without_interrupts(|| unsafe { (*(&raw const SCREEN_LOG)).rows })
+/// What PageUp/PageDown do (system call 12, through the keyboard driver).
+pub const SCROLL_BACK: u64 = 0;
+pub const SCROLL_FORWARD: u64 = 1;
+pub const SCROLL_TO_END: u64 = 2;
+
+/// Move the log's view; returns how many rows back it now is.
+fn screen_log_scroll(action: u64) -> usize {
+    cpu::without_interrupts(|| {
+        let log = unsafe { &mut *(&raw mut SCREEN_LOG) };
+        let page = log_rows().saturating_sub(1).max(1);
+        log.back = match action {
+            SCROLL_BACK => (log.back + page).min(max_back(log)),
+            SCROLL_FORWARD => log.back.saturating_sub(page),
+            _ => 0,
+        };
+        screen_log_draw(log);
+        log.back
+    })
+}
+
+/// The last rows of the log as they are now (wherever the view is). A
+/// crash report takes this before it prints anything, so the lines that
+/// led up to the crash aren't scrolled off by the report itself.
+fn screen_log_snapshot() -> Snapshot {
+    cpu::without_interrupts(|| {
+        let log = unsafe { &*(&raw const SCREEN_LOG) };
+        let mut out = [[b' '; SNAPSHOT_COLS]; SNAPSHOT_ROWS];
+        let kept = log.total.min(HISTORY);
+        for (r, row) in out.iter_mut().enumerate() {
+            let age = SNAPSHOT_ROWS - 1 - r;
+            if age < kept {
+                let src = &log.history[(log.newest + HISTORY - age) % HISTORY];
+                row.copy_from_slice(&src[..SNAPSHOT_COLS]);
+            }
+        }
+        out
+    })
 }
 
 /// Rows 0 to 17 after a fatal error, for machines with no serial port:
 /// `lines` (white on red) from the top, then the log as it stood before
-/// the error, under a heading. Rows 18 to 24 keep the live log, which shows
-/// the end of the full report.
-fn crash_screen(lines: &[&[u8]], before: &[[u8; 80]; LOG_ROWS]) {
+/// the error, under a heading. The log below goes back to following new
+/// output, so it shows the end of the full report.
+fn crash_screen(lines: &[&[u8]], before: &Snapshot) {
     const RED: u8 = 0x4F;
-    const HEADING_ROW: usize = LOG_TOP - LOG_ROWS - 1; // 10
+    const HEADING_ROW: usize = LOG_TOP - SNAPSHOT_ROWS - 1; // 10
+    screen_log_scroll(SCROLL_TO_END);
     for row in 0..LOG_TOP {
         vga_print(row, b"", 0x07);
     }
@@ -199,8 +286,8 @@ fn crash_screen(lines: &[&[u8]], before: &[[u8; 80]; LOG_ROWS]) {
     }
     vga_print(HEADING_ROW, b"Before it happened (the last lines of the log):", 0x0E);
     for (r, line) in before.iter().enumerate() {
-        for (c, &ch) in line.iter().enumerate() {
-            vga_cell(HEADING_ROW + 1 + r, c, ch, 0x07);
+        for (c, &ch) in line.iter().enumerate().take(display::cols()) {
+            display::put(HEADING_ROW + 1 + r, c, ch, 0x07);
         }
     }
 }
@@ -217,15 +304,24 @@ fn current_line(out: &mut [u8; LINE_MAX]) -> usize {
 /// Text at a column, leaving the rest of the row as it is.
 fn vga_text(row: usize, col: usize, text: &[u8], attr: u8) {
     for (i, &ch) in text.iter().enumerate() {
-        vga_cell(row, col + i, ch, attr);
+        display::put(row, col + i, ch, attr);
     }
 }
 
-fn vga_cell(row: usize, col: usize, ch: u8, attr: u8) {
-    if row < 25 && col < 80 {
-        let cell = (0xB8000 + (row * 80 + col) * 2) as *mut u16;
-        unsafe { cell.write_volatile((attr as u16) << 8 | ch as u16) };
-    }
+/// Serial only, not the screen log: notes for test.sh that would disturb
+/// what's on screen (the log's own scrolling, for one).
+fn serial_note(s: &[u8]) {
+    cpu::without_interrupts(|| {
+        if !SERIAL_PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        for &b in s {
+            if b == b'\n' {
+                uart_byte(b'\r');
+            }
+            uart_byte(b);
+        }
+    });
 }
 
 // Out of line on purpose: these are called from dozens of places, and
@@ -284,52 +380,16 @@ fn serial_write_hex(n: u64) {
 }
 
 
-/// Blank the 80x25 text screen and hide the BIOS's blinking cursor, so the
-/// kernel's status lines aren't interleaved with leftover BIOS output.
-fn vga_clear() {
-    for cell in 0..80 * 25usize {
-        unsafe {
-            *((0xb8000 + cell * 2) as *mut u8) = b' ';
-            *((0xb8000 + cell * 2 + 1) as *mut u8) = 0x07; // grey on black
-        }
-    }
-
-    // CRTC register 0x0A (cursor start): bit 5 set = cursor off.
-    unsafe {
-        outb(0x3D4, 0x0A);
-        outb(0x3D5, 0x20);
-    }
-}
 
 /// -----------------------------------------------------------------
 /// Kernel entry point
 /// -----------------------------------------------------------------
 /// 
-/// Write a string to a specific VGA text mode row
-/// Row 0 is the top of the screen. Each row is 80 characters wide.
-/// 'attr' is the VGA attribute byte (e.g. 0x0F = white on black, 0x0A = green on black).
+/// A whole row: `msg` from column 0, the rest of the row blank, all in
+/// `attr` (VGA attribute: 0x0F white on black, 0x0A green on black...).
 fn vga_print(row: usize, msg: &[u8], attr: u8) {
-
-    let base = 0xb8000 + row * 80 * 2;
-
-    // Clear the row first
-    for col in 0..80usize {
-
-        unsafe {
-
-            *((base + col * 2) as *mut u8) = b' ';
-            *((base + col * 2 + 1) as *mut u8) = attr;
-        }
-    }
-
-    // Write message
-    for (i, &b) in msg.iter().enumerate() {
-
-        if i >= 80 { break; }
-        unsafe {
-            *((base + i * 2) as *mut u8) = b;
-            *((base + i * 2 + 1) as *mut u8) = attr;
-        }
+    for col in 0..display::cols() {
+        display::put(row, col, msg.get(col).copied().unwrap_or(b' '), attr);
     }
 }
 
@@ -339,11 +399,14 @@ fn vga_print(row: usize, msg: &[u8], attr: u8) {
 ///   - Kernel loaded at physical 0x0010_0000
 ///   - E820 map at 0x0500 (count u16) / 0x0504 (entries, 24 B each)
 ///   - FLAGS after the last BIOS call at 0x04F0 (u16)
+///   - Display information at 0x0900 ('FDSP' + the mode, boot.rs) and the
+///     VGA ROM's 8x16 font at 0x1000 (4 KiB): text mode or a VESA graphics
+///     mode with a linear framebuffer (Entry 18)
 ///   - Interrupts disabled (and _start disables them anyway: Entry 16)
 #[no_mangle]
 pub extern "C" fn rust_start() -> ! {
 
-    vga_clear();
+    display::init();
     serial_init();
     serial_write_str(b"[kernel] FreyaOS kernel starting\n");
 
@@ -367,7 +430,7 @@ pub extern "C" fn rust_start() -> ! {
     // --- Interrupts were off from the bootloader on (Entry 16) ---
     let bios_left_if = boot::bios_left_interrupts_on();
     serial_write_str(b"[boot] self-test interrupts were off when the kernel started (the BIOS had left them ");
-    serial_write_str(if bios_left_if { b"ON after its last call; stage 2 turned them off)" } else { b"off)" });
+    serial_write_str(if bios_left_if { b"ON after its disk calls; stage 2 turned them off)" } else { b"off)" });
     let entry_ok = selftest::verdict(!boot::entered_with_interrupts_on());
 
     // --- Paging: kernel-owned tables, guard page under the stack ---
@@ -449,11 +512,21 @@ pub extern "C" fn rust_start() -> ! {
     serial_write_u64(ps.free_frames * pmm::PAGE_SIZE / (1024 * 1024));
     serial_write_str(b" MiB\n");
 
+    // --- The screen: map the framebuffer, if stage 2 set a graphics mode ---
+    // As early as it can be: it needs the frame allocator for page tables.
+    let attached = unsafe { display::attach() };
+    display::describe();
+    let mut display_ok = match attached {
+        Ok(()) => true,
+        Err(why) => selftest::check(b"display", why, false),
+    };
+
     let pmm_ok = unsafe { pmm::selftest(e820) };
     let physmap_ok = unsafe { paging::selftest(e820) };
 
     // --- Page mapping API: map/unmap/translate 4 KiB pages ---
     let vmm_ok = unsafe { vmm::selftest() };
+    display_ok &= display::selftest();
 
     // --- Kernel heap: Box, Vec, String, BTreeMap ---
     let heap_ok = heap::selftest();
@@ -581,7 +654,7 @@ pub extern "C" fn rust_start() -> ! {
     // --- VGA status display (screen was cleared at entry) ---
     // Steps with no result value either succeed or end in an exception
     // report, so reaching this point means they passed.
-    vga_status(0, b"FreyaOS kernel:  ", true);
+    vga_status(0, b"Kernel + screen: ", display_ok);
     vga_status(1, b"Segments + TSS:  ", true);
     vga_status(2, b"Exception table: ", int3_ok && entry_ok);
     vga_status(3, b"Page tables:     ", true);
@@ -602,6 +675,15 @@ pub extern "C" fn rust_start() -> ! {
     if bios_left_if {
         // Worth seeing on a real machine: this is what Entry 16 was about.
         vga_text(0, 26, b"(the BIOS left interrupts on; stage 2 turns them off)", 0x08);
+    }
+    // Graphics mode has room on the right: which mode stage 2 chose, and
+    // the 16 colours as a check that the pixel format is read right.
+    let mut note = [0u8; 64];
+    let note_len = display::status_note(&mut note);
+    if note_len > 0 && display::cols() >= 100 {
+        let col = display::cols() - 36;
+        vga_text(1, col, &note[..note_len], 0x07);
+        display::draw_swatch(2, col);
     }
 
     // --- One line that says whether everything is up ---
@@ -641,7 +723,11 @@ pub extern "C" fn rust_start() -> ! {
     if all_ok {
         vga_print(
             16,
-            if keyboard { b"--- FreyaOS ready ---  Ctrl+Alt+Del: restart   Ctrl+Alt+End: switch off" } else { b"--- FreyaOS foundation ready ---" },
+            match (keyboard, display::cols() >= 110) {
+                (true, true) => b"--- FreyaOS ready ---  Ctrl+Alt+Del: restart   Ctrl+Alt+End: switch off   PageUp/PageDown: scroll the log",
+                (true, false) => b"--- FreyaOS ready ---  Ctrl+Alt+Del restart  Ctrl+Alt+End off  PgUp/PgDn scroll",
+                (false, _) => b"--- FreyaOS foundation ready ---",
+            },
             0x0F,
         );
         serial_write_str(b"[kernel] init complete - boot thread done; scheduler and timer running\n");

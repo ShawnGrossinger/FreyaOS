@@ -217,7 +217,7 @@ pub fn on_return_to_user() {
 // ===========================================================================
 
 use crate::selftest::verdict;
-use crate::syscall::{ERR_BAD_ADDRESS, ERR_BAD_SYSCALL, ERR_NO_CAPABILITY};
+use crate::syscall::{ERR_BAD_ADDRESS, ERR_BAD_ARGUMENT, ERR_BAD_SYSCALL, ERR_NO_CAPABILITY};
 use crate::{serial_write_str as s, serial_write_u64 as dec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -236,6 +236,7 @@ const BAD_SYSCALL: u64 = 10;
 const SPIN: u64 = 11;
 const ISOLATE: u64 = 12;
 const MXCSR: u64 = 13;
+const CONSOLE_SCROLL: u64 = 14;
 
 /// Every wait is bounded: a broken kernel fails the test instead of
 /// hanging the boot.
@@ -325,6 +326,26 @@ pub fn selftest() -> bool {
         b"user",
         b"the same program without the capability: write refused (no capability), nothing printed",
         refused == code(ERR_NO_CAPABILITY) && bytes_now == bytes_after,
+    );
+
+    // 3b. Scrolling the screen's log takes the console capability too, and
+    //     only the three actions exist. With it, "to the newest line" works
+    //     (the view is there already during boot, so 0 rows back).
+    let scroll_none = run(&PROBE, CONSOLE_SCROLL | crate::SCROLL_TO_END << 8, NO_CAPS);
+    let scroll_ports = run(
+        &PROBE,
+        CONSOLE_SCROLL | crate::SCROLL_TO_END << 8,
+        crate::cap::table(&[crate::cap::Cap::IoPorts { base: 0x70, count: 2 }]),
+    );
+    let scroll_bad = run(&PROBE, CONSOLE_SCROLL | 3 << 8, CONSOLE_ONLY);
+    let scroll_end = run(&PROBE, CONSOLE_SCROLL | crate::SCROLL_TO_END << 8, CONSOLE_ONLY);
+    ok &= crate::selftest::check(
+        b"user",
+        b"console_scroll with no capability or a port capability: refused; an action that doesn't exist: bad argument; to the newest line with the console: 0 rows back",
+        scroll_none == code(ERR_NO_CAPABILITY)
+            && scroll_ports == code(ERR_NO_CAPABILITY)
+            && scroll_bad == code(ERR_BAD_ARGUMENT)
+            && scroll_end == code(0),
     );
 
     // 4. Pointers are checked.

@@ -2,7 +2,7 @@
 ; keyboard.asm — the PS/2 keyboard driver, as a user process.
 ;
 ; Capabilities it is given (and all it can touch):
-;   slot 0  Console        to print what is typed
+;   slot 0  Console        to print what is typed and scroll the log
 ;   slot 1  Irq line 1     the keyboard interrupt
 ;   slot 2  IoPorts 0x60   the controller's data port
 ;   slot 3  IoPorts 0x64   the controller's status port
@@ -16,9 +16,17 @@
 ; hold back every keystroke behind it. Each interrupt: read every byte
 ; waiting, then ack the line.
 ;
+; The keyboard's line is edge-triggered: the controller raises it when a
+; byte arrives and keeps it up until the byte is read. An edge that comes
+; while the line is masked is lost, and the raised line then never makes
+; another. So the line is armed (irq_ack) before the controller is emptied,
+; never after: a key held down through boot sends a byte every tenth of a
+; second, and one landing between the two left the keyboard dead (Entry 19).
+;
 ;   Ctrl+Alt+Del   restart
 ;   Ctrl+Alt+End   switch off
-;   typing + Enter prints the line ("typed: ...")
+;   PageUp/Down    scroll the screen's log back / forward a page
+;   typing + Enter prints the line ("typed: ..."), back at the newest line
 ; ---------------------------------------------------------------------------
 bits 64
 %include "freya.inc"
@@ -69,7 +77,13 @@ start:
     test rax, rax
     jnz fail
 
-    mov r12d, 64                ; throw away anything left from the firmware
+    mov eax, SYS_IRQ_ACK        ; arm the line first (see the top)
+    mov edi, KEYBOARD_IRQ
+    syscall
+    test rax, rax
+    jnz fail
+
+    mov r12d, 64                ; then throw away anything left from the firmware
 .flush:
     call read_status
     test al, OUTPUT_FULL
@@ -181,6 +195,10 @@ handle_scancode:
     cmp eax, 0x4F               ; End
     je .shut_down
 .plain:
+    cmp eax, 0x49               ; PageUp (E0 49; 49 alone is the keypad's 9)
+    je .page_up
+    cmp eax, 0x51               ; PageDown (E0 51; the keypad's 3)
+    je .page_down
     test r15d, EXTENDED
     jnz .handled                ; arrows and the like: nothing to print
     cmp eax, 0x1C
@@ -213,12 +231,27 @@ handle_scancode:
 .enter:
     test r14d, r14d
     jz .handled
+    mov eax, SYS_CONSOLE_SCROLL ; back to the newest line, where this lands
+    mov edi, CONSOLE
+    mov esi, SCROLL_TO_END
+    syscall
     mov eax, SYS_WRITE
     mov edi, CONSOLE
     mov rsi, LINE
     lea edx, [r14d + PREFIX_LEN]
     syscall
     xor r14d, r14d
+    jmp .handled
+
+.page_up:
+    mov esi, SCROLL_BACK
+    jmp .scroll
+.page_down:
+    mov esi, SCROLL_FORWARD
+.scroll:
+    mov eax, SYS_CONSOLE_SCROLL
+    mov edi, CONSOLE
+    syscall
     jmp .handled
 
 .restart:
@@ -246,7 +279,7 @@ fail:
     syscall
     ud2
 
-ready_text:     db "keyboard ready: Ctrl+Alt+Del restarts, Ctrl+Alt+End switches off", 10
+ready_text:     db "keyboard ready: Ctrl+Alt+Del restart, Ctrl+Alt+End switch off, PgUp/PgDn scroll", 10
 ready_length    equ $ - ready_text
 refused_text:   db "power request refused", 10
 refused_length  equ $ - refused_text

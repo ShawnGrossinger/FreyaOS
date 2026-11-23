@@ -1,3 +1,5 @@
 build/out/
 kernel/target/
 *.patch
+# A saved terminal session, kept beside the code (Entry 19).
+Terminal-Log

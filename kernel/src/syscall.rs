@@ -22,8 +22,11 @@
 //!   7 port_in(ports, port, width)      -> value                 (irq.rs)
 //!   8 port_out(ports, port, width, v)  -> 0
 //!   9 irq_wait(irq)                    -> 0 once the line has fired
-//!  10 irq_ack(irq)                     -> 0
+//!  10 irq_ack(irq)                     -> 0 (the line unmasked: armed)
 //!  11 power(power, action)             -> never returns (0 restart, 1 off)
+//!  12 console_scroll(console, action)  -> rows the screen log's view is
+//!                                         back (0 back a page, 1 forward a
+//!                                         page, 2 to the newest line)
 //!
 //! Message registers: send/call take the four words in RSI, RDX, R10, R8
 //! and in R9 the slot of a capability to pass along (-1 for none). recv and
@@ -53,9 +56,10 @@ pub const SYS_PORT_OUT: u64 = 8;
 pub const SYS_IRQ_WAIT: u64 = 9;
 pub const SYS_IRQ_ACK: u64 = 10;
 pub const SYS_POWER: u64 = 11;
+pub const SYS_CONSOLE_SCROLL: u64 = 12;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
-/// write: the slot doesn't hold the console capability.
+/// write, console_scroll: the slot doesn't hold the console capability.
 pub const ERR_NO_CAPABILITY: i64 = -2;
 pub const ERR_BAD_ADDRESS: i64 = -3;
 /// The slot doesn't hold the kind of capability this call needs, or it
@@ -69,6 +73,9 @@ pub const ERR_PEER_GONE: i64 = -6;
 pub const ERR_INTERRUPTED: i64 = -7;
 /// reply with no call to answer.
 pub const ERR_NO_REPLY: i64 = -8;
+/// An argument outside what the call accepts: a port width, an interrupt
+/// line the machine doesn't have, a power or scroll action that doesn't
+/// exist.
 pub const ERR_BAD_ARGUMENT: i64 = -9;
 
 /// Longest write in one call; longer ones are cut (the return value says
@@ -178,6 +185,7 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
         SYS_IRQ_WAIT => crate::irq::wait(f.rdi),
         SYS_IRQ_ACK => crate::irq::ack(f.rdi),
         SYS_POWER => sys_power(f.rdi, f.rsi),
+        SYS_CONSOLE_SCROLL => sys_console_scroll(f.rdi, f.rsi),
         _ => ERR_BAD_SYSCALL,
     };
     f.rax = result as u64;
@@ -198,6 +206,24 @@ fn sys_power(slot: u64, action: u64) -> i64 {
         crate::power::SHUT_DOWN => crate::power::shut_down(),
         _ => ERR_BAD_ARGUMENT,
     }
+}
+
+/// console_scroll(slot, action): move the screen log's view (PageUp and
+/// PageDown, through the keyboard driver), with the Console capability in
+/// `slot`. Returns how many rows back from the newest line the view is.
+fn sys_console_scroll(slot: u64, action: u64) -> i64 {
+    if sched::current_cap(slot) != Cap::Console {
+        return ERR_NO_CAPABILITY;
+    }
+    if action > crate::SCROLL_TO_END {
+        return ERR_BAD_ARGUMENT;
+    }
+    let back = crate::screen_log_scroll(action);
+    // For test.sh, on serial only (the screen already shows it).
+    let mut note = crate::idt::Line::new();
+    note.str(b"[console] view ").dec(back as u64).str(b" rows back\n");
+    crate::serial_note(note.as_bytes());
+    back as i64
 }
 
 /// A received message goes back in the message registers (only on success:

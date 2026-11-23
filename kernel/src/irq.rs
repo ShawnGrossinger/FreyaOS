@@ -16,11 +16,17 @@
 //! Lines 0-15 are the ISA interrupts (keyboard = 1, ...). Each has its own
 //! vector, VECTOR_BASE + line. The I/O APIC (found through the ACPI MADT,
 //! acpi.rs) carries the real devices there: every input starts masked, and
-//! an ISA line is unmasked when a driver first waits on it. A level-
-//! triggered line is masked again from each interrupt until the driver
-//! acks it (otherwise it would fire again at once, forever); an edge-
-//! triggered one stays open, and the per-line count keeps any interrupt
-//! that arrives while the driver is busy.
+//! an ISA line is unmasked when a driver first acks or waits on it. A
+//! level-triggered line is masked again from each interrupt until the
+//! driver acks it (otherwise it would fire again at once, forever); an
+//! edge-triggered one stays open, and the per-line count keeps any
+//! interrupt that arrives while the driver is busy.
+//!
+//! An edge that arrives while its line is masked is lost (the I/O APIC
+//! ignores it), and a device that holds its line up until it is serviced
+//! then never makes another. So a driver arms its line with ack before it
+//! empties its device, then waits (Entry 19: the keyboard driver emptied
+//! the controller first, and a key held through boot killed the keyboard).
 //!
 //! Line 16 is a test line with no device behind it: the kernel raises it
 //! by sending itself an interrupt through the local APIC, so the whole
@@ -253,14 +259,14 @@ pub fn wait(slot: u64) -> i64 {
     })
 }
 
-/// irq_ack(slot): the driver has handled the line; a level-triggered one is
-/// unmasked again.
+/// irq_ack(slot): the driver is ready for the line's next interrupt, so it
+/// is unmasked: again, for a level-triggered line (masked by its last
+/// interrupt); for the first time, when a driver arms its line before it
+/// empties its device (see the top of this file).
 pub fn ack(slot: u64) -> i64 {
     match line_cap(slot) {
         Ok(line) => {
-            if is_level(line) {
-                set_masked(line, false);
-            }
+            set_masked(line, false);
             0
         }
         Err(e) => e,

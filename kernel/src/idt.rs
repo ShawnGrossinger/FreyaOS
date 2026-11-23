@@ -662,7 +662,7 @@ fn decode_selector_error(err: u64) {
 /// The report on screen, for machines with no serial port attached (the
 /// T430 has none): rows 0 to 9 hold everything report_serial says that
 /// fits, and the log lines from before the exception sit under them.
-fn report_screen(f: &InterruptFrame, cr2: u64, before: &[[u8; 80]; crate::LOG_ROWS]) {
+fn report_screen(f: &InterruptFrame, cr2: u64, before: &crate::Snapshot) {
     let mut title = Line::new();
     title.str(b"!! CPU EXCEPTION ").dec(f.vector).str(b": ").str(exception_name(f.vector));
     if crate::sched::is_enabled() {
@@ -701,14 +701,15 @@ fn report_screen(f: &InterruptFrame, cr2: u64, before: &[[u8; 80]; crate::LOG_RO
     );
 }
 
-/// Fixed 80-column text line builder (no allocator, no core::fmt).
-struct Line {
+/// Fixed 80-column text line builder (no allocator, no core::fmt). Also
+/// used for the screen log's scroll note (main.rs).
+pub(crate) struct Line {
     buf: [u8; 80],
     len: usize,
 }
 
 impl Line {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Line { buf: [b' '; 80], len: 0 }
     }
 
@@ -719,14 +720,14 @@ impl Line {
         }
     }
 
-    fn str(&mut self, s: &[u8]) -> &mut Self {
+    pub(crate) fn str(&mut self, s: &[u8]) -> &mut Self {
         for &b in s {
             self.byte(b);
         }
         self
     }
 
-    fn hex(&mut self, n: u64) -> &mut Self {
+    pub(crate) fn hex(&mut self, n: u64) -> &mut Self {
         self.str(b"0x");
         for shift in (0..16).rev() {
             let nibble = ((n >> (shift * 4)) & 0xF) as u8;
@@ -735,7 +736,7 @@ impl Line {
         self
     }
 
-    fn dec(&mut self, mut n: u64) -> &mut Self {
+    pub(crate) fn dec(&mut self, mut n: u64) -> &mut Self {
         // u64::MAX has 20 digits. Collect them least-significant first,
         // then emit in reverse. Iterators instead of index arithmetic keep
         // the compiler from emitting a bounds-check panic, which would pull
@@ -756,7 +757,7 @@ impl Line {
         self
     }
 
-    fn as_bytes(&self) -> &[u8] {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
         self.buf.get(..self.len).unwrap_or(&self.buf)
     }
 }

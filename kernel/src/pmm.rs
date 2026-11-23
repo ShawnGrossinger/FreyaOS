@@ -352,6 +352,11 @@ unsafe fn free_frame_locked(phys: usize) {
 }
 
 /// Free frames right now.
+/// Is the frame at `phys` free? (For self-tests: false outside the bitmap.)
+pub fn is_frame_free(phys: u64) -> bool {
+    crate::cpu::without_interrupts(|| unsafe { (*(&raw const PMM)).is_free(phys / PAGE_SIZE) })
+}
+
 pub fn free_frames() -> u64 {
     unsafe { (*(&raw const PMM)).free }
 }

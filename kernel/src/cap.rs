@@ -8,8 +8,9 @@
 //! the sender may do only through an endpoint capability with GRANT.
 //!
 //! Kinds of capability:
-//!   - Console: may write to the kernel's debug log (serial). A bootstrap
-//!     convenience until there is a console driver process.
+//!   - Console: may write to the kernel's log (serial and the screen) and
+//!     scroll the screen's view of it. A bootstrap convenience until there
+//!     is a console driver process.
 //!   - Endpoint: may send to and/or receive from an IPC endpoint (ipc.rs),
 //!     with rights SEND, RECV, GRANT. The badge is fixed when the capability
 //!     is made and is delivered with every message sent through it, so a
