@@ -622,8 +622,9 @@ pub extern "C" fn rust_start() -> ! {
         let ipc = ipc::selftest();
         let factory = factory::selftest();
         let info = info::selftest();
+        let caps = cap::selftest();
         let drivers = irq::selftest();
-        mutex && ipc && factory && info && drivers
+        mutex && ipc && factory && info && caps && drivers
     };
 
     // --- VGA status display (screen was cleared at entry) ---

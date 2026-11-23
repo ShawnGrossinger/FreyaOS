@@ -81,6 +81,46 @@
 //!   bit 7  every slot taken, then spin asked for with a Process
 //!          capability: refused (no slot), and not started (the kernel's
 //!          check that nothing is left over would see it running)
+//!
+//! REVOKE (7, Entry 25), with slot 0 Console, 1 Factory (every right), 2
+//! an endpoint (SEND + RECV), 3 Memory: one page, writable
+//! (kernel/src/cap.rs checks it exits with 0x3F):
+//!   bit 0  a copy of the console, and a copy of that: two derived; revoke
+//!          removes both and leaves the console, with none derived
+//!   bit 1  a copy and a copy of it; the first dropped: the second now
+//!          counts as the console's, and revoke removes it
+//!   bit 2  revoke and copy of an empty slot, and revoke past the last:
+//!          refused
+//!   bit 3  across processes: relay, lent a copy of the console and a
+//!          Factory for tickers, starts a ticker with its console (both
+//!          quiet). The copy lent has two derived from it, relay's and the
+//!          ticker's; revoking it removes both, and the Factory's, one.
+//!          relay notices and ends with no-capability; its ticker does
+//!          too (the kernel checks nothing is left running)
+//!   bit 4  memory: a copy mapped and written; mapped again: refused (one
+//!          mapping per capability); the original revoked: the copy and
+//!          its mapping gone (mapping the original at the same address now
+//!          works, and shows what was written); another copy, then the
+//!          original dropped: its mapping gone too
+//!   bit 5  mint makes copies too: a SEND-only endpoint and a Factory for
+//!          hello alone are derived from the endpoint and the Factory they
+//!          were minted from; revoking those removes them, and only them
+//!
+//! RECEIVE (8), GIVE (9), GIVE_LATE (10), RECEIVE_ONE (11) (Entry 25):
+//! a capability in a message, taken back (kernel/src/cap.rs pairs them):
+//!   GIVE         calls through slot 1 (SEND + GRANT) with a copy of its
+//!                console; once answered, revokes it and sends again with
+//!                nothing; exits with how many the revoke removed (1: the
+//!                receiver's)
+//!   RECEIVE      receives on slot 1, looks at what came and answers, then
+//!                receives again; exits with the kind of capability the
+//!                first brought (1, the console) and, << 8, what that slot
+//!                holds after the second (0: nothing)
+//!   GIVE_LATE    sends a copy of its console, with nobody receiving yet:
+//!                the kernel revokes it while it waits; exits with send's
+//!                result
+//!   RECEIVE_ONE  receives once; exits with 0x10 | the kind it brought (0:
+//!                none: the capability revoked on the way wasn't delivered)
 
 #![no_std]
 #![no_main]
@@ -99,6 +139,11 @@ const BIND: u64 = 3;
 const SIGNAL: u64 = 4;
 const INFO: u64 = 5;
 const PROCESS: u64 = 6;
+const REVOKE: u64 = 7;
+const RECEIVE: u64 = 8;
+const GIVE: u64 = 9;
+const GIVE_LATE: u64 = 10;
+const RECEIVE_ONE: u64 = 11;
 const TEST_LINE: u64 = 16;
 
 fn main(arg: u64) -> u64 {
@@ -109,6 +154,11 @@ fn main(arg: u64) -> u64 {
         SIGNAL => signal_tests(),
         INFO => info_tests(),
         PROCESS => process_tests(),
+        REVOKE => revoke_tests(),
+        RECEIVE => receive(true),
+        RECEIVE_ONE => receive(false),
+        GIVE => give(true),
+        GIVE_LATE => give(false),
         _ => 0,
     }
 }
@@ -309,4 +359,134 @@ fn process_tests() -> u64 {
 
     bit(0, ended) | bit(1, stopped) | bit(2, narrowed) | bit(3, refused) | bit(4, stale) | bit(5, wrong) | bit(6, described)
         | bit(7, no_room)
+}
+
+fn revoke_tests() -> u64 {
+    const MEMORY: u64 = 3;
+    const A: u64 = MAP_BASE;
+    const B: u64 = MAP_BASE + 0x10_0000;
+    const WRITTEN: u64 = 0x1234_5678;
+    let gone = |slot: i64| slot < 0 || !holds(slot as u64, KIND_CONSOLE);
+
+    let a = copy(CONSOLE_SLOT);
+    let b = if a >= 0 { copy(a as u64) } else { a };
+    let chain = b >= 0
+        && derived(CONSOLE_SLOT) == 2
+        && revoke(CONSOLE_SLOT) == 2
+        && gone(a)
+        && gone(b)
+        && holds(CONSOLE_SLOT, KIND_CONSOLE)
+        && derived(CONSOLE_SLOT) == 0;
+
+    let a = copy(CONSOLE_SLOT);
+    let b = if a >= 0 { copy(a as u64) } else { a };
+    let handed_up = b >= 0
+        && drop_cap(a as u64) == 0
+        && derived(CONSOLE_SLOT) == 1
+        && revoke(CONSOLE_SLOT) == 1
+        && gone(b);
+
+    let refused = revoke(20) == ERR_NO_CAPABILITY && copy(20) == ERR_NO_CAPABILITY && revoke(40) == ERR_NO_CAPABILITY;
+
+    // mint makes copies too: a narrower endpoint and a narrower Factory are
+    // derived from the ones they were minted from, and revoked with them.
+    let send_only = mint(EP, SEND, 5);
+    let hello_only = mint(FACTORY, 1 << PROGRAM_HELLO, 0);
+    let minted = send_only >= 0
+        && hello_only >= 0
+        && derived(EP) == 1
+        && derived(FACTORY) == 1
+        && revoke(EP) == 1
+        && revoke(FACTORY) == 1
+        && !holds(send_only as u64, KIND_ENDPOINT)
+        && !holds(hello_only as u64, KIND_FACTORY)
+        && holds(EP, KIND_ENDPOINT)
+        && holds(FACTORY, KIND_FACTORY);
+
+    // Across processes: relay, and the ticker relay starts.
+    let loan = copy(CONSOLE_SLOT);
+    let tickers = mint(FACTORY, 1 << PROGRAM_TICKER, 0);
+    let mut slots = [NO_SLOT; MAX_CAPS];
+    slots[0] = loan as u8;
+    slots[1] = tickers as u8;
+    let across = loan >= 0
+        && tickers >= 0
+        && match spawn_process(FACTORY, PROGRAM_RELAY, TICKER_QUIET | 1, &slots, EP) {
+            Ok((id, process)) => {
+                // Wait (bounded) until relay has started its ticker.
+                for _ in 0..300 {
+                    if derived(loan as u64) == 2 {
+                        break;
+                    }
+                    sleep(1);
+                }
+                derived(loan as u64) == 2
+                    && revoke(loan as u64) == 2
+                    && revoke(tickers as u64) == 1
+                    && wait_exit(id)
+                    && status(process) == Ok((STATUS_EXITED, ERR_NO_CAPABILITY as u64))
+            }
+            Err(_) => false,
+        };
+
+    // Memory.
+    let read = || unsafe { core::ptr::read_volatile(A as *const u64) };
+    let second = copy(MEMORY);
+    let memory = second >= 0
+        && map(second as u64, A) == 0
+        && {
+            unsafe { core::ptr::write_volatile(A as *mut u64, WRITTEN) };
+            read() == WRITTEN
+        }
+        && map(second as u64, B) == ERR_BAD_ARGUMENT
+        && revoke(MEMORY) == 1
+        && !holds(second as u64, KIND_MEMORY)
+        && map(MEMORY, A) == 0 // A was unmapped, or this would be refused
+        && read() == WRITTEN
+        && {
+            let third = copy(MEMORY);
+            third >= 0 && drop_cap(MEMORY) == 0 && map(third as u64, A) == 0 && read() == WRITTEN
+        };
+
+    bit(0, chain) | bit(1, handed_up) | bit(2, refused) | bit(3, across) | bit(4, memory) | bit(5, minted)
+}
+
+/// GIVE and GIVE_LATE: a copy of the console sent through slot 1.
+fn give(twice: bool) -> u64 {
+    const OUT: u64 = 1;
+    let lent = copy(CONSOLE_SLOT);
+    if lent < 0 {
+        return lent as u64;
+    }
+    if !twice {
+        return send(OUT, [0; 4], lent as u64) as u64;
+    }
+    // A call, answered once the receiver has looked at what came: a send
+    // returns as soon as the message is delivered, and revoking then could
+    // beat the receiver to its look.
+    if call(OUT, [0; 4], lent as u64).is_err() {
+        return 0xBAD;
+    }
+    let removed = revoke(lent as u64);
+    send(OUT, [0; 4], NO_CAP);
+    removed as u64
+}
+
+/// RECEIVE and RECEIVE_ONE: what the messages on slot 1 brought.
+fn receive(twice: bool) -> u64 {
+    const IN: u64 = 1;
+    let Ok(first) = recv(IN) else { return 0xBAD };
+    let kind = |slot: u64| match cap_info(slot) {
+        Ok((k, ..)) => k as u64,
+        Err(_) => 0,
+    };
+    if !twice {
+        return 0x10 | if first.cap_slot == NO_CAP { 0 } else { kind(first.cap_slot) };
+    }
+    let brought = kind(first.cap_slot);
+    reply([0; 4], NO_CAP); // looked: GIVE may revoke now
+    if recv(IN).is_err() {
+        return 0xBAD;
+    }
+    brought | kind(first.cap_slot) << 8
 }

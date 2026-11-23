@@ -70,11 +70,27 @@ pub struct Message {
     pub cap: Cap,
     /// On delivery: the slot it landed in, or NO_SLOT.
     pub cap_slot: u64,
+    /// Where the capability was copied from (Entry 25): its position plus
+    /// one (0: nowhere) and its serial number. If it has been removed by
+    /// the time the message is delivered, the capability isn't delivered.
+    pub cap_from: u16,
+    pub cap_serial: u32,
+}
+
+impl Message {
+    fn with(badge: u64, words: [u64; 4], (cap, origin): (Cap, cap::Origin)) -> Message {
+        let (cap_from, cap_serial) = origin.map_or((0, 0), |(p, serial)| (p as u16 + 1, serial));
+        Message { badge, words, cap, cap_slot: NO_SLOT, cap_from, cap_serial }
+    }
+
+    fn origin(&self) -> cap::Origin {
+        (self.cap_from != 0).then_some((self.cap_from as usize - 1, self.cap_serial))
+    }
 }
 
 /// No message. cap_slot is 0 only so that an empty message (and so an
 /// empty task) is all zero bytes; nothing reads it until deliver() sets it.
-pub const EMPTY_MESSAGE: Message = Message { badge: 0, words: [0; 4], cap: Cap::None, cap_slot: 0 };
+pub const EMPTY_MESSAGE: Message = Message { badge: 0, words: [0; 4], cap: Cap::None, cap_slot: 0, cap_from: 0, cap_serial: 0 };
 
 /// References to each endpoint (capabilities naming it, plus its creator's
 /// until released). 0 = free.
@@ -165,7 +181,7 @@ pub fn signal(ep: u8, bits: u64) {
 }
 
 fn signal_message(bits: u64) -> Message {
-    Message { badge: SIGNAL_BADGE, words: [bits, 0, 0, 0], cap: Cap::None, cap_slot: NO_SLOT }
+    Message::with(SIGNAL_BADGE, [bits, 0, 0, 0], (Cap::None, None))
 }
 
 pub fn retain(ep: u8) {
@@ -202,31 +218,33 @@ fn endpoint(slot: u64, need: u8) -> Result<(u8, u64, u8), i64> {
     }
 }
 
-/// The capability the caller wants to pass along (slot `xfer`), if any.
-fn outgoing(xfer: u64, may_grant: bool) -> Result<Cap, i64> {
+/// The capability the caller wants to pass along (slot `xfer`), if any,
+/// and where the copy comes from (Entry 25).
+fn outgoing(xfer: u64, may_grant: bool) -> Result<(Cap, cap::Origin), i64> {
     if xfer == NO_SLOT {
-        return Ok(Cap::None);
+        return Ok((Cap::None, None));
     }
     if !may_grant {
         return Err(ERR_NO_GRANT);
     }
-    match sched::current_cap(xfer) {
-        Cap::None => Err(ERR_WRONG_CAPABILITY),
-        cap => Ok(cap),
+    match cap::current_with_origin(xfer) {
+        (Cap::None, _) => Err(ERR_WRONG_CAPABILITY),
+        found => Ok(found),
     }
 }
 
 /// Hand `msg` to task `to`: its capability (if any) goes into the first
-/// free slot of `to`'s table. No free slot: the capability is dropped and
-/// cap_slot says NO_SLOT. Interrupts must be off.
+/// free slot of `to`'s table, as a copy of the sender's (Entry 25). No free
+/// slot, or the sender's has been removed since it was sent (revoked while
+/// the message waited): the capability isn't delivered, and cap_slot says
+/// NO_SLOT. Interrupts must be off.
 fn deliver(to: TaskId, mut msg: Message) {
     msg.cap_slot = NO_SLOT;
     if msg.cap != Cap::None {
-        let t = sched::task(to);
-        if let Some(slot) = cap::free_slot(&t.caps) {
-            t.caps[slot] = msg.cap;
-            cap::retain(msg.cap);
-            msg.cap_slot = slot as u64;
+        if let Some(slot) = cap::free_slot(&sched::task(to).caps) {
+            if cap::put(to, slot, msg.cap, msg.origin()) {
+                msg.cap_slot = slot as u64;
+            }
         }
     }
     let t = sched::task(to);
@@ -245,7 +263,7 @@ pub fn send(slot: u64, words: [u64; 4], xfer: u64, call: bool) -> (i64, Message)
         Ok(c) => c,
         Err(e) => return (e, EMPTY_MESSAGE),
     };
-    let msg = Message { badge, words, cap, cap_slot: NO_SLOT };
+    let msg = Message::with(badge, words, cap);
 
     without_interrupts(|| unsafe {
         if receivers()[ep as usize % MAX_ENDPOINTS] == 0 {
@@ -346,7 +364,7 @@ pub fn reply(words: [u64; 4], xfer: u64) -> i64 {
         if sched::task(caller).state != State::AwaitingReply(me) {
             return ERR_PEER_GONE; // it was killed while waiting
         }
-        deliver(caller, Message { badge: 0, words, cap, cap_slot: NO_SLOT });
+        deliver(caller, Message::with(0, words, cap));
         sched::task(caller).state = State::Ready;
         0
     })
@@ -367,7 +385,12 @@ pub fn on_exit(dead: TaskId) {
 /// with ERR_INTERRUPTED, and its system call's return path ends it.
 pub fn interrupt_wait(id: TaskId) {
     let t = sched::task(id);
-    if matches!(t.state, State::Sending(_) | State::Receiving(_) | State::AwaitingReply(_) | State::IrqWait(_)) {
+    // Sleeping too (Entry 25: system call sleep), so a killed process
+    // doesn't sleep out its time first.
+    if matches!(
+        t.state,
+        State::Sending(_) | State::Receiving(_) | State::AwaitingReply(_) | State::IrqWait(_) | State::Sleeping(_)
+    ) {
         t.result = ERR_INTERRUPTED;
         t.state = State::Ready;
     }

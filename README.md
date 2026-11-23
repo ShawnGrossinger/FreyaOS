@@ -23,15 +23,15 @@ Bridge, 16 GB), booted from a USB stick.
 | Interrupts | A gate for all 256 vectors, the local APIC timer at 100 Hz, the I/O APIC routed from ACPI tables; interrupts nobody set up are survived and reported |
 | Tasks | Kernel threads, preemptive round-robin scheduling, sleeping, joining, a mutex |
 | User mode | Ring 3 processes in their own address spaces, written in assembly or Rust; `SYSCALL`, SMEP and SMAP where the CPU has them; a fault ends only the process |
-| Capabilities and IPC | 32 capability slots per process; synchronous call/reply IPC that can pass capabilities (with GRANT) and badges; signals, from the kernel or from a process holding a badged capability; memory lent through Memory capabilities; narrower copies (mint) and letting go (drop) |
+| Capabilities and IPC | 32 capability slots per process; synchronous call/reply IPC that can pass capabilities (with GRANT) and badges; signals, from the kernel or from a process holding a badged capability; memory lent through Memory capabilities; narrower copies (mint) and letting go (drop); every copy remembers its original, so whatever was lent can be taken back (revoke), from every process it reached |
 | Init | The only process the kernel starts: it holds the drivers' capabilities and a Factory capability, starts each driver and the shell with exactly what it needs, and starts one again if it ends |
 | Drivers | I/O-port, interrupt-line and memory capabilities, and interrupts delivered as signals; a console driver, a PS/2 driver (keyboard and controller) and a mouse driver, all in Rust, running as user processes, started by init |
-| Shell | A first shell in Rust: line editing with history, built-in commands (help, echo, ps, caps, uptime, mem, restart, off), and programs started and stopped (run, jobs, kill), holding eight capabilities and nothing else |
+| Shell | A first shell in Rust: line editing with history, built-in commands (help, echo, ps, caps, uptime, mem, restart, off), programs started and stopped (run, jobs, kill), and what it lent them taken back (revoke), holding eight capabilities and nothing else |
 | Power | Restart and switch-off through ACPI, behind a Power capability (Ctrl+Alt+Del, Ctrl+Alt+End, or the shell's restart and off) |
 | Not yet | UEFI boot, disk, network, file system, memory that grows as a program runs, multiple CPUs |
 
-Every boot runs **91 self-tests** and shows the result on screen. `make test`
-checks the disk image and boots **37 configurations** headless, checking each
+Every boot runs **94 self-tests** and shows the result on screen. `make test`
+checks the disk image and boots **38 configurations** headless, checking each
 one.
 
 ## Design in brief
@@ -50,7 +50,15 @@ one.
   moves by being copied into a process its holder starts, or passed in an IPC
   message through an endpoint with GRANT. An endpoint capability can be copied
   with fewer rights and a badge, and a Factory with fewer rights (mint); any
-  capability can be let go of (drop).
+  capability can be copied as it is (copy) and let go of (drop).
+- **What is lent can be taken back.** Every capability remembers the one it
+  was copied from: by copy, mint, spawn's slot list or a message. `revoke`
+  removes everything derived from a capability, however many hands it went
+  through, in every process at once; the holder keeps its own. Dropping a
+  capability hands its copies up to its own original, so they can still be
+  revoked. A Memory capability revoked or dropped takes its mapping with it,
+  and a capability revoked while its message waits, or while its process is
+  being made, is never delivered. A process that ends holds nothing.
 - **Init decides, the kernel enforces.** At the end of boot the kernel starts
   one process, init, with every capability the drivers will need. Init mints
   narrower copies, starts the console, PS/2 and mouse drivers and the shell
@@ -92,6 +100,9 @@ one.
   | 22 | cap_info(slot): what one of the caller's own slots holds | nothing |
   | 23 | kill(cap): stop a process | Process |
   | 24 | status(cap): running, or how it ended | Process |
+  | 25 | copy(slot): a copy, derived from it, to lend | anything |
+  | 26 | revoke(slot): remove everything derived from it, in every process | anything |
+  | 27 | sleep(ticks): wait that many timer ticks | nothing |
 
 ## Repository layout
 
@@ -100,7 +111,7 @@ bootloader/BIOS/   stage1.asm (MBR), stage2.asm (loader, E820, VESA mode, long m
 bootloader/UEFI/   placeholder for a later UEFI loader
 kernel/            Rust kernel: entry.asm, kernel.ld, src/*.rs
 user/              user programs in NASM (test programs)
-user/rust/         user programs in Rust (init; the console, PS/2 and mouse drivers; the shell; spin and crash) and their library
+user/rust/         user programs in Rust (init; the console, PS/2 and mouse drivers; the shell; spin, crash, ticker and relay) and their library
 build/             Makefile, test.sh, write-usb.sh
 docs/              development journal, roadmap and design notes
 ```
@@ -120,7 +131,7 @@ Then, from `build/`:
 ```bash
 make            # builds out/freya-os.img (1 MiB disk image); "make build" too
 make run        # boots it in QEMU, serial output in the terminal
-make test       # every test case, headless; expect "37 passed, 0 failed"
+make test       # every test case, headless; expect "38 passed, 0 failed"
 TEXT_MODE=1 make   # an image that stays in 80x25 text mode
 ```
 
@@ -166,18 +177,28 @@ command runs. **Backspace** deletes, **Esc** clears the line, **Up** and
 | `help` | lists the commands |
 | `echo TEXT` | prints TEXT |
 | `ps` | every task: what it is doing, and how many capabilities it holds |
-| `caps` | the shell's own capabilities: everything it may do |
+| `caps` | the shell's own capabilities: everything it may do, what it has lent and to whom, and how many copies are out |
 | `uptime` | time since the timer started, task switches, system calls |
 | `mem` | memory free |
-| `run NAME` | start a program in the background: `hello`, `spin` (runs until stopped) or `crash` (writes to the kernel's memory, and is stopped) |
+| `run NAME` | start a program in the background: `hello`, `spin` (runs until stopped), `crash` (writes to the kernel's memory, and is stopped), `ticker` (a line a second while it holds the console) or `relay` (lends the console on to a ticker of its own) |
 | `jobs` | the programs started from the shell that are still running |
 | `kill ID`, `kill NAME` | stop one of them, or every one of that name |
+| `revoke ID`, `revoke NAME` | take back what the shell lent it, from it and from anyone it passed it to |
 | `restart`, `off` | restart or switch off the machine |
 
-The shell's Factory capability covers only those three programs: `run
+The shell's Factory capability covers only those five programs: `run
 console` is refused by the kernel. When a program ends, the shell says how
 (its exit code, the CPU exception that stopped it, or `kill`). It can stop
 only what it started: `kill 5` gets "this shell holds no capability for it".
+
+A program gets a copy of the shell's console, lent, not the shell's own;
+`relay` also gets a Factory that starts only `ticker`. `revoke` takes those
+back from every process that has them: `run relay`, then `revoke relay`,
+says "3 capabilities" (the console from relay and from its ticker, and
+relay's Factory), and both end on their own, since they can't write any
+more. Revoking doesn't stop a program: `spin` doesn't notice. When a program
+ends, the shell takes back whatever it had passed on, so a relay that is
+killed doesn't leave its ticker writing.
 
 The shell's lines are shown in white, without the "[user 7 'shell']" the
 kernel puts in front of every line a process writes (serial keeps it).
@@ -208,6 +229,11 @@ headless and checks its serial log:
 - `programs`: `run spin`, the shell still answering while it spins, `kill`
   by number and by name, `kill 5` refused, `hello`'s exit code, `crash`
   stopped by a page fault, `run console` refused
+- `revoke`: `run ticker`, `caps` (the copy lent and the copy made from it),
+  `revoke 8` (1 capability; the ticker ends with "no capability"), `run
+  relay`, `ps` and `caps`, `revoke relay` (3 capabilities, in two
+  processes), then a relay killed (the shell takes back its ticker's
+  console); no tick after any take-back, and the shell back to its 8
 - `scroll`: PageUp and PageDown, checked step by step, and a screenshot whose
   size and colours must match the mode the kernel reported
 - `edid-1366`, `edid-1440`, `no-edid`, `cirrus-24bit`: the mode stage 2
@@ -277,7 +303,8 @@ why. `TEXT_MODE=1 make usb DEV=/dev/sdX` writes a stick that always does.
 
 ## Next
 
-Programs from the shell on the T430. Then one of: memory for programs (a
-heap through a capability), the capability layer (revoking what was handed
-out; capabilities for memory and address spaces), arguments and output for
-programs, or read-only disks on a spare machine.
+Programs from the shell and revocation on the T430. Then one of: memory for
+programs (a heap through a capability), more of the capability layer
+(capabilities for address spaces; a process passing on only part of what it
+holds), arguments and output for programs, or read-only disks on a spare
+machine.

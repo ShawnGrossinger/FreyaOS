@@ -46,6 +46,14 @@
 //!                                         Entry 24)
 //!  24 status(process)                  -> 0 running, or how it ended, the
 //!                                         code or vector in RDI
+//!  25 copy(slot)                       -> slot of a copy, derived from it
+//!                                         (cap.rs, Entry 25)
+//!  26 revoke(slot)                     -> how many capabilities derived
+//!                                         from it were removed, everywhere
+//!  27 sleep(ticks)                     -> 0, that many timer ticks later
+//!                                         (acts on the caller only)
+//!
+//! cap_info's R10 (Entry 25): how many capabilities are derived from it.
 //!
 //! spawn's R9 (Entry 24): flags in (bit 0: hand back a Process capability)
 //! and that capability's slot out (-1 for none).
@@ -92,6 +100,12 @@ pub const SYS_INFO: u64 = 21;
 pub const SYS_CAP_INFO: u64 = 22;
 pub const SYS_KILL: u64 = 23;
 pub const SYS_STATUS: u64 = 24;
+pub const SYS_COPY: u64 = 25;
+pub const SYS_REVOKE: u64 = 26;
+pub const SYS_SLEEP: u64 = 27;
+
+/// Longest sleep: a day.
+const MAX_SLEEP_TICKS: u64 = 24 * 3600 * crate::apic::TIMER_HZ;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
 /// write, note: the slot doesn't hold the console capability; map: it
@@ -240,11 +254,17 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
         SYS_SIGNAL => ipc::signal_through(f.rdi),
         SYS_INFO => crate::info::info(f.rdi, f.rsi, f.rdx),
         SYS_CAP_INFO => {
-            let (kind, a, b, c) = crate::info::cap_info(f.rdi);
+            let (kind, a, b, c, derived) = crate::info::cap_info(f.rdi);
             if kind >= 0 {
-                (f.rdi, f.rsi, f.rdx) = (a, b, c);
+                (f.rdi, f.rsi, f.rdx, f.r10) = (a, b, c, derived);
             }
             kind
+        }
+        SYS_COPY => crate::cap::copy(f.rdi),
+        SYS_REVOKE => crate::cap::revoke(f.rdi),
+        SYS_SLEEP => {
+            sched::sleep_ticks(f.rdi.min(MAX_SLEEP_TICKS));
+            0
         }
         SYS_KILL => crate::factory::kill(f.rdi),
         SYS_STATUS => {

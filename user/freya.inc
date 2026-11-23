@@ -39,6 +39,9 @@ SYS_INFO     equ 21                 ; info(info, ptr, len): uptime, memory, task
 SYS_CAP_INFO equ 22                 ; cap_info(slot): what the caller's own slot holds
 SYS_KILL     equ 23                 ; kill(process): stop it (Entry 24)
 SYS_STATUS   equ 24                 ; status(process): running, or how it ended
+SYS_COPY     equ 25                 ; copy(slot): a copy derived from it, for lending (Entry 25)
+SYS_REVOKE   equ 26                 ; revoke(slot): everything derived from it, everywhere, removed
+SYS_SLEEP    equ 27                 ; sleep(ticks): wait that many timer ticks
 
 ; Programs spawn can start (kernel/src/factory.rs), and endpoint rights.
 PROGRAM_HELLO    equ 0
@@ -48,6 +51,8 @@ PROGRAM_MOUSE    equ 3
 PROGRAM_SHELL    equ 4
 PROGRAM_SPIN     equ 5
 PROGRAM_CRASH    equ 6
+PROGRAM_TICKER   equ 7
+PROGRAM_RELAY    equ 8
 RIGHT_SEND   equ 1
 RIGHT_RECV   equ 2
 RIGHT_GRANT  equ 4

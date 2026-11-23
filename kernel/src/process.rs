@@ -29,7 +29,7 @@
 //!   to 0x0000_7F00_0000_0000  (system call map, mem.rs)
 //!   0x0000_7FFF_0000_0000  top of the stack, read + write (16 KiB below)
 
-use crate::cap::{Caps, CONSOLE_ONLY, NO_CAPS};
+use crate::cap::{Caps, CONSOLE_ONLY, MAX_CAPS, NO_CAPS};
 use crate::pmm::{self, PAGE_SIZE};
 use crate::sched::{self, ExitStatus, SpawnError, TaskId};
 use crate::vmm::{AddressSpace, PageFlags};
@@ -122,6 +122,20 @@ pub static CRASH: Program = Program {
     image: include_bytes!(concat!(env!("OUT_DIR"), "/crash.bin")),
 };
 
+/// Prints a line a second for as long as it holds the console
+/// (user/rust/src/bin/ticker.rs, Entry 25).
+pub static TICKER: Program = Program {
+    name: "ticker",
+    image: include_bytes!(concat!(env!("OUT_DIR"), "/ticker.bin")),
+};
+
+/// Lends the console it was lent on to a ticker of its own
+/// (user/rust/src/bin/relay.rs, Entry 25).
+pub static RELAY: Program = Program {
+    name: "relay",
+    image: include_bytes!(concat!(env!("OUT_DIR"), "/relay.bin")),
+};
+
 /// Test program: its argument picks one thing to try (user/probe.asm).
 pub static PROBE: Program = Program {
     name: "probe",
@@ -159,13 +173,20 @@ extern "C" {
 /// Start `program` as a new process with argument `arg` (in RDI) and
 /// capability table `caps`. It runs when the scheduler picks it.
 pub fn spawn(program: &Program, arg: u64, caps: Caps) -> Result<TaskId, SpawnError> {
-    spawn_signalling(program, arg, caps, None).map(|(id, _)| id)
+    spawn_signalling(program, arg, caps, &[None; MAX_CAPS], None).map(|(id, _)| id)
 }
 
 /// spawn, and when the process ends signal endpoint `exit_signal` with bit
 /// (1 << its id) (factory.rs). Returns its id and its slot's generation
-/// (sched.rs; Entry 24).
-pub fn spawn_signalling(program: &Program, arg: u64, caps: Caps, exit_signal: Option<u8>) -> Result<(TaskId, u32), SpawnError> {
+/// (sched.rs; Entry 24). `origins[i]`: the capability `caps[i]` was copied
+/// from, if any (Entry 25).
+pub fn spawn_signalling(
+    program: &Program,
+    arg: u64,
+    caps: Caps,
+    origins: &[crate::cap::Origin; MAX_CAPS],
+    exit_signal: Option<u8>,
+) -> Result<(TaskId, u32), SpawnError> {
     let data_pages = program.data_pages();
     // A Rust program with no zeroed statics asks for no data pages at all.
     if program.image.len() as u64 > MAX_CODE_BYTES || data_pages > MAX_DATA_PAGES {
@@ -177,7 +198,7 @@ pub fn spawn_signalling(program: &Program, arg: u64, caps: Caps, exit_signal: Op
         return Err(SpawnError::OutOfMemory);
     }
     // The task owns the address space from here; reap() destroys it.
-    sched::spawn_in_signalling(program.name, start, arg, space.root(), caps, exit_signal).inspect_err(|_| unsafe {
+    sched::spawn_in_signalling(program.name, start, arg, space.root(), caps, origins, exit_signal).inspect_err(|_| unsafe {
         AddressSpace::from_root(space.root()).destroy();
     })
 }
@@ -367,7 +388,9 @@ fn selftest_memory() -> bool {
     let misaligned = refused(MAP_READ | (at + 8) << 8, table(&[ro]));
     let below = refused(MAP_READ | (USER_DATA_BASE + 0x10_0000) << 8, table(&[ro]));
     let past = refused(MAP_READ | MAP_END << 8, table(&[ro]));
-    let twice = run(&PROBE, MAP_TWICE | at << 8, table(&[ro])) == code(ERR_BAD_ADDRESS);
+    // A second capability for the same page over the first one's mapping
+    // (since Entry 25 one capability maps once; cap.rs tests that).
+    let twice = run(&PROBE, MAP_TWICE | at << 8, table(&[ro, ro])) == code(ERR_BAD_ADDRESS);
     sched::reap();
     let kept = !pmm::is_frame_free(page) && unsafe { word.read_volatile() } == WRITTEN;
     ok &= crate::selftest::check(

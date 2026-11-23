@@ -47,8 +47,17 @@ use crate::syscall::{copy_from_user, ERR_BAD_ARGUMENT, ERR_NO_CAPABILITY, ERR_NO
 /// The programs spawn can start, by number (user/freya.inc and
 /// user/rust/src/lib.rs: PROGRAM_*). The kernel's test programs aren't
 /// among them: only its own self-tests start those.
-pub static PROGRAMS: [&Program; 7] =
-    [&process::HELLO, &process::CONSOLE, &process::PS2, &process::MOUSE, &process::SHELL, &process::SPIN, &process::CRASH];
+pub static PROGRAMS: [&Program; 9] = [
+    &process::HELLO,
+    &process::CONSOLE,
+    &process::PS2,
+    &process::MOUSE,
+    &process::SHELL,
+    &process::SPIN,
+    &process::CRASH,
+    &process::TICKER,
+    &process::RELAY,
+];
 const _: () = assert!(PROGRAMS.len() <= 16, "a Factory's rights have 16 program bits");
 
 /// spawn's flags: a Process capability for the new process, please.
@@ -100,14 +109,18 @@ pub fn spawn(factory: u64, program: u64, arg: u64, slots: u64, exit_ep: u64, fla
 fn start(program: &Program, arg: u64, slots: u64, exit_ep: u64) -> Result<(sched::TaskId, u32), i64> {
     let mut list = [0u8; MAX_CAPS];
     copy_from_user(slots, &mut list)?;
+    // Each copy remembers its original (Entry 25), so the caller can take
+    // it back later with revoke; one revoked before the process is made
+    // isn't given to it.
     let mut caps: Caps = cap::NO_CAPS;
+    let mut origins: [cap::Origin; MAX_CAPS] = [None; MAX_CAPS];
     for (i, &from) in list.iter().enumerate() {
         if from == NO_SLOT_BYTE {
             continue;
         }
-        match sched::current_cap(from as u64) {
-            Cap::None => return Err(ERR_BAD_ARGUMENT), // an empty slot, or past the last
-            c => caps[i] = c,
+        match cap::current_with_origin(from as u64) {
+            (Cap::None, _) => return Err(ERR_BAD_ARGUMENT), // an empty slot, or past the last
+            (c, origin) => (caps[i], origins[i]) = (c, origin),
         }
     }
     let exit_signal = match exit_ep {
@@ -117,7 +130,7 @@ fn start(program: &Program, arg: u64, slots: u64, exit_ep: u64) -> Result<(sched
             _ => return Err(ERR_WRONG_CAPABILITY),
         },
     };
-    process::spawn_signalling(program, arg, caps, exit_signal).map_err(|_| ERR_NO_MEMORY)
+    process::spawn_signalling(program, arg, caps, &origins, exit_signal).map_err(|_| ERR_NO_MEMORY)
 }
 
 pub fn endpoint(factory: u64) -> i64 {
@@ -253,7 +266,7 @@ pub fn selftest() -> bool {
     //    captest the kernel runs a spinning process, and hands captest a
     //    Process capability for the task its slot held before: a stale one,
     //    which must stop nothing.
-    let spin = process::spawn_signalling(&process::SPIN, 0, cap::NO_CAPS, None).ok();
+    let spin = process::spawn_signalling(&process::SPIN, 0, cap::NO_CAPS, &[None; MAX_CAPS], None).ok();
     let (tested, spared) = match (ipc::create(), spin) {
         (Some(ep), Some((spin_id, generation))) => {
             let stale = Cap::Process { id: spin_id as u8, generation: generation.wrapping_sub(1) };

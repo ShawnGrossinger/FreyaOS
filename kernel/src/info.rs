@@ -102,13 +102,14 @@ pub fn info(slot: u64, ptr: u64, len: u64) -> i64 {
     (HEADER_BYTES + written * RECORD_BYTES) as i64
 }
 
-/// cap_info(slot): (kind, a, b, c) for the caller's slot, or an error for
-/// a slot past the last.
-pub fn cap_info(slot: u64) -> (i64, u64, u64, u64) {
+/// cap_info(slot): (kind, a, b, c, how many capabilities are derived from
+/// it) for the caller's slot, or an error for a slot past the last.
+pub fn cap_info(slot: u64) -> (i64, u64, u64, u64, u64) {
     if slot >= crate::cap::MAX_CAPS as u64 {
-        return (ERR_BAD_ARGUMENT, 0, 0, 0);
+        return (ERR_BAD_ARGUMENT, 0, 0, 0, 0);
     }
-    match sched::current_cap(slot) {
+    let derived = crate::cpu::without_interrupts(|| crate::cap::derived_count(sched::current(), slot as usize)) as u64;
+    let (kind, a, b, c) = match sched::current_cap(slot) {
         Cap::None => (KIND_NONE, 0, 0, 0),
         Cap::Console => (KIND_CONSOLE, 0, 0, 0),
         Cap::Endpoint { ep, badge, rights } => (KIND_ENDPOINT, ep as u64, rights as u64, badge),
@@ -119,7 +120,8 @@ pub fn cap_info(slot: u64) -> (i64, u64, u64, u64) {
         Cap::Factory { rights } => (KIND_FACTORY, rights as u64, 0, 0),
         Cap::Info => (KIND_INFO, 0, 0, 0),
         Cap::Process { id, generation } => (KIND_PROCESS, id as u64, generation as u64, 0),
-    }
+    };
+    (kind, a, b, c, derived)
 }
 
 // ===========================================================================

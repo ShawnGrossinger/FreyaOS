@@ -13,13 +13,24 @@
 //!                      on Enter (SCROLL)
 //!   slot 4  Info       uptime, memory and the tasks (ps, uptime, mem)
 //!   slot 5  Power      restart and off
-//!   slot 6  Factory    (Entry 24) starts hello, spin and crash, nothing else
+//!   slot 6  Factory    (Entry 24) starts hello, spin, crash, ticker and
+//!                      relay (Entry 25), nothing else
 //!   slot 7  Endpoint   its own again (SEND): where the programs it starts
 //!                      signal when they end (bit 1 << id)
 //!
 //! No port, no interrupt, no screen: it can't reach a device, and a fault
 //! in it ends only it (init starts it again). Its Factory starts only the
-//! three test programs; run anything else and the kernel refuses.
+//! test programs; run anything else and the kernel refuses.
+//!
+//! Loans (Entry 25): a program isn't given the shell's own console, but a
+//! copy of it (copy), which the shell keeps in a slot of its own; relay is
+//! also lent a Factory that starts only ticker (mint). Whatever the program
+//! makes of them, passes on or hands to a program it starts is derived from
+//! those loans, so revoke ID takes all of it back in one call, from every
+//! process that has it, and tells how many capabilities went. The program
+//! goes on running: what it does without them is up to it (ticker and
+//! relay end; spin doesn't notice). When a program ends, the shell takes
+//! back anything it had passed on that is still out, and lets the loans go.
 //!
 //! Programs (Entry 24): run starts one in the background, with the console
 //! in its slot 0 and nothing else, and keeps the Process capability spawn
@@ -63,7 +74,13 @@ struct Job {
     /// The slot of its Process capability.
     cap: u64,
     program: u64,
+    /// The slots of what it was lent (Entry 25), NOT_LENT where nothing.
+    loans: [u64; LOANS],
 }
+
+/// A program is lent the console; relay also a Factory for tickers.
+const LOANS: usize = 2;
+const NOT_LENT: u64 = u64::MAX;
 
 const PROMPT: &[u8] = b"freya> ";
 const MAX_LINE: usize = 64;
@@ -246,9 +263,11 @@ const HELP: &[&[u8]] = &[
     b"  caps       the capabilities this shell holds: all it may do\n",
     b"  uptime     time since the timer started\n",
     b"  mem        memory free\n",
-    b"  run NAME   start a program: hello, spin (runs until stopped), crash (writes to the kernel)\n",
+    b"  run NAME   start a program: hello, spin (runs until stopped), crash (writes to the kernel),\n",
+    b"             ticker (a line a second while it holds the console), relay (lends it to a ticker)\n",
     b"  jobs       the programs started here that are still running\n",
     b"  kill ID    stop one of them (or kill NAME: every one of that name)\n",
+    b"  revoke ID  take back what this shell lent it, from it and from whoever it passed it to\n",
     b"  restart    restart the machine\n",
     b"  off        switch the machine off\n",
     b"keys: Up/Down earlier lines, Esc clears the line, PgUp/PgDn scroll the log\n",
@@ -275,6 +294,7 @@ impl Shell {
             b"run" => self.start(rest),
             b"jobs" => self.list_jobs(),
             b"kill" => self.stop(rest),
+            b"revoke" => self.take_back(rest),
             b"restart" => power_off_or_restart(POWER_RESTART, b"restarting\n"),
             b"off" => power_off_or_restart(POWER_OFF, b"switching off\n"),
             b"" => {}
@@ -286,8 +306,9 @@ impl Shell {
         }
     }
 
-    /// run NAME: start it, with the console and nothing else, and keep its
-    /// Process capability.
+    /// run NAME: start it, with a copy of the console lent to it (and, for
+    /// relay, a Factory for tickers) and nothing else, and keep its Process
+    /// capability.
     fn start(&mut self, name: &[u8]) {
         let Some(program) = PROGRAM_NAMES.iter().position(|&n| n == name) else {
             let mut l = Line::<120>::new();
@@ -308,12 +329,24 @@ impl Shell {
             l.dec(MAX_JOBS as u64).str(b" programs are running from this shell already: stop one first (kill)\n");
             return say(l.as_bytes());
         };
+        let loans = match lend(program as u64) {
+            Ok(loans) => loans,
+            Err(e) => return error(b"couldn't make what it is lent", e),
+        };
         let mut slots = [NO_SLOT; MAX_CAPS];
-        slots[0] = CONSOLE as u8;
+        for (i, &loan) in loans.iter().enumerate() {
+            if loan != NOT_LENT {
+                slots[i] = loan as u8;
+            }
+        }
         let mut l = Line::<120>::new();
-        match spawn_process(FACTORY, program as u64, 0, &slots, EXITS) {
+        let started = spawn_process(FACTORY, program as u64, 0, &slots, EXITS);
+        if started.is_err() {
+            let_go(&loans);
+        }
+        match started {
             Ok((id, cap)) => {
-                self.jobs[free] = Some(Job { id, cap, program: program as u64 });
+                self.jobs[free] = Some(Job { id, cap, program: program as u64, loans });
                 l.str(b"started ").str(name).str(b" as process ").dec(id);
             }
             Err(ERR_WRONG_CAPABILITY) => {
@@ -379,8 +412,43 @@ impl Shell {
         }
     }
 
-    /// The processes with these bits (1 << id) ended: say how, and let
-    /// their capabilities go.
+    /// revoke ID, or revoke NAME: take back everything derived from what
+    /// this shell lent it, wherever it went.
+    fn take_back(&mut self, what: &[u8]) {
+        if what.is_empty() {
+            return say(b"revoke what? a process number or a program's name (jobs lists them)\n");
+        }
+        let number = parse(what);
+        let mut found = false;
+        for j in self.jobs.iter().flatten() {
+            let name = PROGRAM_NAMES[j.program as usize];
+            if number != Some(j.id) && name != what {
+                continue;
+            }
+            found = true;
+            let mut l = Line::<160>::new();
+            l.str(b"took back what this shell lent ").str(name).str(b" (process ").dec(j.id).str(b"): ");
+            match take_back(&j.loans) {
+                Ok(0) => l.str(b"nothing was still out"),
+                Ok(1) => l.str(b"1 capability"),
+                Ok(n) => l.dec(n).str(b" capabilities"),
+                Err(e) => l.str(b"refused (error -").dec(e.unsigned_abs()).str(b")"),
+            };
+            l.str(b"\n");
+            say(l.as_bytes());
+        }
+        if !found {
+            let mut l = Line::<160>::new();
+            match number {
+                Some(id) => l.str(b"process ").dec(id).str(b": this shell lent it nothing (only what it started)\n"),
+                None => l.str(b"no ").str(what).str(b" started from this shell is running\n"),
+            };
+            say(l.as_bytes());
+        }
+    }
+
+    /// The processes with these bits (1 << id) ended: say how, take back
+    /// what they passed on, and let their capabilities go.
     fn ended(&mut self, bits: u64) {
         for slot in self.jobs.iter_mut() {
             let Some(j) = *slot else { continue };
@@ -393,7 +461,7 @@ impl Shell {
                 Ok((STATUS_EXITED, code)) => {
                     l.str(b"exit code ");
                     if (code as i64) < 0 {
-                        l.str(b"-").dec((code as i64).unsigned_abs());
+                        l.str(b"-").dec((code as i64).unsigned_abs()).str(error_name(code as i64));
                     } else {
                         l.dec(code);
                     }
@@ -409,11 +477,76 @@ impl Shell {
                     l.str(b"how is no longer known");
                 }
             }
+            // What it lent on to a program of its own that still runs: the
+            // loan ends with it.
+            match take_back(&j.loans) {
+                Ok(0) | Err(_) => {}
+                Ok(1) => {
+                    l.str(b"; took back 1 capability it had passed on");
+                }
+                Ok(n) => {
+                    l.str(b"; took back ").dec(n).str(b" capabilities it had passed on");
+                }
+            }
             l.str(b"\n");
             say(l.as_bytes());
+            let_go(&j.loans);
             drop_cap(j.cap);
             *slot = None;
         }
+    }
+}
+
+/// What the shell lends `program` (Entry 25): a copy of its console, and
+/// for relay a Factory that starts tickers and nothing else. Each is derived
+/// from the shell's own, and stays in a slot of the shell's.
+fn lend(program: u64) -> Result<[u64; LOANS], i64> {
+    let mut loans = [NOT_LENT; LOANS];
+    let console = copy(CONSOLE);
+    if console < 0 {
+        return Err(console);
+    }
+    loans[0] = console as u64;
+    if program == PROGRAM_RELAY {
+        let tickers = mint(FACTORY, 1 << PROGRAM_TICKER, 0);
+        if tickers < 0 {
+            let_go(&loans);
+            return Err(tickers);
+        }
+        loans[1] = tickers as u64;
+    }
+    Ok(loans)
+}
+
+/// Revoke each loan: everything derived from them, in every process.
+/// Returns how many capabilities went.
+fn take_back(loans: &[u64; LOANS]) -> Result<u64, i64> {
+    let mut gone = 0;
+    for &loan in loans.iter().filter(|&&l| l != NOT_LENT) {
+        let n = revoke(loan);
+        if n < 0 {
+            return Err(n);
+        }
+        gone += n as u64;
+    }
+    Ok(gone)
+}
+
+fn let_go(loans: &[u64; LOANS]) {
+    for &loan in loans.iter().filter(|&&l| l != NOT_LENT) {
+        drop_cap(loan);
+    }
+}
+
+/// The kernel's error codes, by name, for exit codes.
+fn error_name(code: i64) -> &'static [u8] {
+    match code {
+        ERR_NO_CAPABILITY => b" (no capability)",
+        ERR_WRONG_CAPABILITY => b" (wrong capability)",
+        ERR_PEER_GONE => b" (peer gone)",
+        ERR_INTERRUPTED => b" (interrupted)",
+        ERR_NO_SLOT => b" (no free slot)",
+        _ => b"",
     }
 }
 
@@ -578,6 +711,19 @@ fn caps(&self) {
             }
             _ => l.str(b"(a kind this shell doesn't know)"),
         };
+        // Entry 25: what it is lent to, and how much is derived from it.
+        if let Some(j) = self.jobs.iter().flatten().find(|j| j.loans.contains(&slot)) {
+            l.str(b"; lent to ").str(PROGRAM_NAMES[j.program as usize]).str(b" (process ").dec(j.id).str(b")");
+        }
+        match derived(slot) {
+            0 => {}
+            1 => {
+                l.str(b"; 1 copy made from it");
+            }
+            n => {
+                l.str(b"; ").dec(n).str(b" copies made from it");
+            }
+        }
         l.str(b"\n");
         say(l.as_bytes());
     }

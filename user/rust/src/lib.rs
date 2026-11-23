@@ -93,6 +93,9 @@ pub const SYS_INFO: u64 = 21;
 pub const SYS_CAP_INFO: u64 = 22;
 pub const SYS_KILL: u64 = 23;
 pub const SYS_STATUS: u64 = 24;
+pub const SYS_COPY: u64 = 25;
+pub const SYS_REVOKE: u64 = 26;
+pub const SYS_SLEEP: u64 = 27;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
 pub const ERR_NO_CAPABILITY: i64 = -2;
@@ -121,8 +124,16 @@ pub const PROGRAM_MOUSE: u64 = 3;
 pub const PROGRAM_SHELL: u64 = 4;
 pub const PROGRAM_SPIN: u64 = 5;
 pub const PROGRAM_CRASH: u64 = 6;
+pub const PROGRAM_TICKER: u64 = 7;
+pub const PROGRAM_RELAY: u64 = 8;
 /// The programs' names, by number (kernel/src/process.rs).
-pub const PROGRAM_NAMES: [&[u8]; 7] = [b"hello", b"console", b"ps2", b"mouse", b"shell", b"spin", b"crash"];
+pub const PROGRAM_NAMES: [&[u8]; 9] =
+    [b"hello", b"console", b"ps2", b"mouse", b"shell", b"spin", b"crash", b"ticker", b"relay"];
+
+/// ticker's and relay's argument (Entry 25): bits 0 to 15 the ticks between
+/// lines (0: 100, a second), and this bit for quiet: no lines, only a look
+/// at the console capability each time (the self-tests use it).
+pub const TICKER_QUIET: u64 = 1 << 16;
 
 /// A Factory's rights (Entry 24): bit n lets it start program n; this one
 /// lets it make endpoints. mint makes a copy with fewer.
@@ -385,6 +396,23 @@ pub fn signal(slot: u64) -> i64 {
     syscall3(SYS_SIGNAL, slot, 0, 0)
 }
 
+/// A copy of the capability in `slot`, derived from it (Entry 25): lend
+/// the copy, and revoke(slot) takes it back. Returns the copy's slot.
+pub fn copy(slot: u64) -> i64 {
+    syscall3(SYS_COPY, slot, 0, 0)
+}
+
+/// Remove every capability derived from the one in `slot`, in every
+/// process, however it got there (Entry 25). Returns how many.
+pub fn revoke(slot: u64) -> i64 {
+    syscall3(SYS_REVOKE, slot, 0, 0)
+}
+
+/// Wait `ticks` timer ticks (100 a second).
+pub fn sleep(ticks: u64) {
+    syscall3(SYS_SLEEP, ticks, 0, 0);
+}
+
 /// Let go of the capability in `slot`.
 pub fn drop_cap(slot: u64) -> i64 {
     syscall3(SYS_DROP, slot, 0, 0)
@@ -512,7 +540,13 @@ pub const KIND_PROCESS: i64 = 9;
 /// flags; a Factory's its rights; a process's its task slot (its id) and
 /// generation (Entry 24).
 pub fn cap_info(slot: u64) -> Result<(i64, u64, u64, u64), i64> {
-    let (kind, a, b, c): (i64, u64, u64, u64);
+    cap_info_derived(slot).map(|(kind, a, b, c, _)| (kind, a, b, c))
+}
+
+/// cap_info, and how many capabilities are derived from this one (Entry
+/// 25): copies of it, copies of those, wherever they are.
+pub fn cap_info_derived(slot: u64) -> Result<(i64, u64, u64, u64, u64), i64> {
+    let (kind, a, b, c, derived): (i64, u64, u64, u64, u64);
     unsafe {
         asm!(
             "syscall",
@@ -520,6 +554,7 @@ pub fn cap_info(slot: u64) -> Result<(i64, u64, u64, u64), i64> {
             inlateout("rdi") slot => a,
             lateout("rsi") b,
             lateout("rdx") c,
+            lateout("r10") derived,
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack),
@@ -528,7 +563,18 @@ pub fn cap_info(slot: u64) -> Result<(i64, u64, u64, u64), i64> {
     if kind < 0 {
         return Err(kind);
     }
-    Ok((kind, a, b, c))
+    Ok((kind, a, b, c, derived))
+}
+
+/// How many capabilities are derived from the one in `slot` (0 for an
+/// empty slot).
+pub fn derived(slot: u64) -> u64 {
+    cap_info_derived(slot).map_or(0, |(_, _, _, _, d)| d)
+}
+
+/// Does `slot` still hold a capability of `kind`?
+pub fn holds(slot: u64, kind: i64) -> bool {
+    matches!(cap_info(slot), Ok((k, ..)) if k == kind)
 }
 
 /// The snapshot's header, and one record per task after it.

@@ -23,7 +23,8 @@
 //! again (SIGNAL_REDRAW), so it sends the line being typed again.
 //!
 //! For the shell (Entry 24) it also mints a Factory that can start only
-//! hello, spin and crash, and makes no endpoints, and a SEND copy of the
+//! hello, spin, crash, ticker and relay (Entry 25), and makes no
+//! endpoints, and a SEND copy of the
 //! shell's own endpoint, where the programs the shell starts signal when
 //! they end. Then it lets go of the full copies of the four endpoints it
 //! has minted from: it won't mint again, and every RECV it still holds is
@@ -172,8 +173,11 @@ fn main(_arg: u64) -> u64 {
     let keys_for_shell = minted(shell_ep, SEND, SIGNAL_KEYS);
     let redraw_for_shell = minted(shell_ep, SEND, SIGNAL_REDRAW);
     let exits_for_shell = minted(shell_ep, SEND, 0);
-    let programs_for_shell =
-        (1 << freya::PROGRAM_HELLO) | (1 << freya::PROGRAM_SPIN) | (1 << freya::PROGRAM_CRASH);
+    let programs_for_shell = (1 << freya::PROGRAM_HELLO)
+        | (1 << freya::PROGRAM_SPIN)
+        | (1 << freya::PROGRAM_CRASH)
+        | (1 << freya::PROGRAM_TICKER)
+        | (1 << freya::PROGRAM_RELAY);
     let factory_for_shell = minted(FACTORY as u8, programs_for_shell, 0);
     // Everything is minted: the full copies go (see the top of this file).
     for full in [CONSOLE_EP as u8, ps2_ep, mouse_ep, shell_ep] {

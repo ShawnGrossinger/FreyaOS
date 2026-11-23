@@ -48,6 +48,19 @@
 //! keyboard driver only SEND, with a badge that names it. A Factory can be
 //! copied with fewer rights too (Entry 24). And a process can let go of a
 //! capability (system call drop).
+//!
+//! Revocation (Entry 25). Every capability in a table has a parent: the
+//! capability it was copied from (by mint, copy, spawn's slot list, or a
+//! message), or none if the kernel made it. revoke(slot) removes every
+//! capability derived from the one in `slot`, directly or through any
+//! number of copies, in any process, and leaves that one in place: whoever
+//! hands out a copy can take it back, and everything made from it. A
+//! capability that is dropped (or whose process ends) leaves what was made
+//! from it to its own parent, so that stays revocable from above. A Memory
+//! capability that is removed takes its mapping with it, so revoking
+//! memory takes the access, not just the name. And a copy on its way (in a
+//! message not yet received, or into a process being made) whose original
+//! is removed first is never delivered.
 
 pub const MAX_CAPS: usize = 32;
 
@@ -145,31 +158,32 @@ pub fn release(cap: Cap) {
 /// program bits), again a subset of what it has and at least one, and
 /// there is no badge (0).
 pub fn mint(slot: u64, rights: u64, badge: u64) -> i64 {
-    use crate::syscall::{ERR_BAD_ARGUMENT, ERR_NO_SLOT, ERR_WRONG_CAPABILITY};
-    let (ep, old, have) = match crate::sched::current_cap(slot) {
-        Cap::Endpoint { ep, badge, rights } => (ep, badge, rights),
+    use crate::syscall::{ERR_BAD_ARGUMENT, ERR_WRONG_CAPABILITY};
+    // The copy records where it came from (Entry 25): revoking the
+    // original takes it too.
+    let (source, origin) = current_with_origin(slot);
+    let copy = match source {
+        Cap::Endpoint { ep, badge: old, rights: have } => {
+            let all = (SEND | RECV | GRANT) as u64;
+            if rights == 0 || rights & !all != 0 || rights & !(have as u64) != 0 {
+                return ERR_BAD_ARGUMENT; // none, unknown, or more than it has
+            }
+            if badge == crate::ipc::SIGNAL_BADGE || (old != 0 && badge != old) {
+                return ERR_BAD_ARGUMENT;
+            }
+            Cap::Endpoint { ep, badge, rights: rights as u8 }
+        }
         Cap::Factory { rights: have } => {
             if rights == 0 || rights & !(have as u64) != 0 || badge != 0 {
                 return ERR_BAD_ARGUMENT; // none, more than it has, or a badge
             }
-            return match crate::sched::store_cap(Cap::Factory { rights: rights as u32 }) {
-                Some(slot) => slot as i64,
-                None => ERR_NO_SLOT,
-            };
+            Cap::Factory { rights: rights as u32 }
         }
         _ => return ERR_WRONG_CAPABILITY,
     };
-    let all = (SEND | RECV | GRANT) as u64;
-    if rights == 0 || rights & !all != 0 || rights & !(have as u64) != 0 {
-        return ERR_BAD_ARGUMENT; // none, unknown, or more than it has
-    }
-    if badge == crate::ipc::SIGNAL_BADGE || (old != 0 && badge != old) {
-        return ERR_BAD_ARGUMENT;
-    }
-    let copy = Cap::Endpoint { ep, badge, rights: rights as u8 };
-    match crate::sched::store_cap(copy) {
-        Some(slot) => slot as i64,
-        None => ERR_NO_SLOT,
+    match put_current(copy, origin) {
+        Ok(new) => new as i64,
+        Err(e) => e,
     }
 }
 
@@ -178,20 +192,400 @@ pub fn mint(slot: u64, rights: u64, badge: u64) -> i64 {
 /// a reference, and with it maybe its last possible receiver, which wakes
 /// whoever waits to send there with ERR_PEER_GONE. Init uses it when it
 /// stops starting a driver again, so that nobody waits for that driver.
+/// Since Entry 25: what was copied from it now counts as copied from its
+/// parent, and a mapping made with it is undone.
 pub fn drop_cap(slot: u64) -> i64 {
-    match crate::sched::take_cap(slot) {
+    let cap = without_interrupts(|| remove(crate::sched::current(), slot.min(MAX_CAPS as u64) as usize, true));
+    match cap {
         Cap::None => crate::syscall::ERR_NO_CAPABILITY,
-        cap => {
-            release(cap);
-            0
-        }
+        _ => 0,
     }
 }
 
-pub fn retain_all(caps: &Caps) {
-    caps.iter().for_each(|&c| retain(c));
+// ===========================================================================
+// Derivation and revocation (Entry 25)
+// ===========================================================================
+//
+// A position is a slot in a task's table: task * MAX_CAPS + slot. For each
+// one the kernel keeps, besides the capability (in sched's task table):
+//   SERIALS  a number no other capability has had (0: the slot is empty), so
+//            a copy in flight can tell whether its original is still there
+//   PARENTS  the position of the capability it was copied from, plus one
+//            (0: none). A parent always exists: when one is removed, its
+//            children are handed to its own parent.
+//   MAPPINGS where a Memory capability is mapped in its task (0: nowhere)
+// All of it is touched with interrupts off only.
+
+use crate::cpu::without_interrupts;
+use crate::sched::TaskId;
+
+const POSITIONS: usize = crate::sched::MAX_TASKS * MAX_CAPS;
+const _: () = assert!(POSITIONS < u16::MAX as usize);
+
+static mut SERIALS: [u32; POSITIONS] = [0; POSITIONS];
+static mut PARENTS: [u16; POSITIONS] = [0; POSITIONS];
+static mut MAPPINGS: [u64; POSITIONS] = [0; POSITIONS];
+static mut NEXT_SERIAL: u32 = 1;
+
+fn serials() -> &'static mut [u32; POSITIONS] {
+    unsafe { &mut *(&raw mut SERIALS) }
 }
 
-pub fn release_all(caps: &Caps) {
-    caps.iter().for_each(|&c| release(c));
+fn parents() -> &'static mut [u16; POSITIONS] {
+    unsafe { &mut *(&raw mut PARENTS) }
 }
+
+fn mappings() -> &'static mut [u64; POSITIONS] {
+    unsafe { &mut *(&raw mut MAPPINGS) }
+}
+
+/// Where a copy comes from: the original's position and serial number.
+pub type Origin = Option<(usize, u32)>;
+
+pub fn position(task: TaskId, slot: usize) -> usize {
+    task * MAX_CAPS + slot
+}
+
+/// The capability in `task`'s `slot`, and the origin a copy of it records.
+/// Interrupts must be off.
+pub fn with_origin(task: TaskId, slot: usize) -> (Cap, Origin) {
+    if slot >= MAX_CAPS {
+        return (Cap::None, None);
+    }
+    let p = position(task, slot);
+    let cap = crate::sched::task(task).caps[slot];
+    (cap, (cap != Cap::None).then_some((p, serials()[p])))
+}
+
+/// with_origin for the current task, with interrupts off for it.
+pub fn current_with_origin(slot: u64) -> (Cap, Origin) {
+    without_interrupts(|| {
+        if slot >= MAX_CAPS as u64 {
+            return (Cap::None, None);
+        }
+        with_origin(crate::sched::current(), slot as usize)
+    })
+}
+
+/// Is the capability an origin names still where it was?
+fn still_there(origin: (usize, u32)) -> bool {
+    serials()[origin.0] == origin.1
+}
+
+/// Put `cap` in `task`'s empty `slot`, copied from `from` (None: the
+/// kernel made it). If `from` has been removed meanwhile, the copy goes
+/// with it: nothing is stored, and the answer is false. Interrupts off.
+pub fn put(task: TaskId, slot: usize, cap: Cap, from: Origin) -> bool {
+    if cap == Cap::None || slot >= MAX_CAPS {
+        return false;
+    }
+    let parent = match from {
+        Some(origin) if still_there(origin) => origin.0 as u16 + 1,
+        Some(_) => return false,
+        None => 0,
+    };
+    let p = position(task, slot);
+    crate::sched::task(task).caps[slot] = cap;
+    retain(cap);
+    let next = unsafe { &mut *(&raw mut NEXT_SERIAL) };
+    serials()[p] = *next;
+    *next = next.wrapping_add(1).max(1);
+    parents()[p] = parent;
+    mappings()[p] = 0;
+    true
+}
+
+/// put() in the current task's first free slot. Ok(slot); Err(NO_SLOT) if
+/// every slot is taken, Err(NO_CAPABILITY) if `from` is gone.
+pub fn put_current(cap: Cap, from: Origin) -> Result<usize, i64> {
+    without_interrupts(|| {
+        let me = crate::sched::current();
+        let slot = free_slot(&crate::sched::task(me).caps).ok_or(crate::syscall::ERR_NO_SLOT)?;
+        if put(me, slot, cap, from) {
+            Ok(slot)
+        } else {
+            Err(crate::syscall::ERR_NO_CAPABILITY)
+        }
+    })
+}
+
+/// Take the capability out of `task`'s `slot`: what was copied from it is
+/// handed to its parent, a mapping made with it is undone (unless `unmap`
+/// is false: the whole address space is going), and its references are
+/// released. Returns what was there. Interrupts off.
+pub fn remove(task: TaskId, slot: usize, unmap: bool) -> Cap {
+    if slot >= MAX_CAPS {
+        return Cap::None;
+    }
+    let p = position(task, slot);
+    let cap = core::mem::replace(&mut crate::sched::task(task).caps[slot], Cap::None);
+    if cap == Cap::None {
+        return Cap::None;
+    }
+    let up = parents()[p];
+    for q in parents().iter_mut() {
+        if *q == p as u16 + 1 {
+            *q = up;
+        }
+    }
+    if unmap {
+        unmap_mapping(task, p, cap);
+    }
+    serials()[p] = 0;
+    parents()[p] = 0;
+    mappings()[p] = 0;
+    release(cap);
+    cap
+}
+
+/// Undo the mapping made with the Memory capability at position `p`, if
+/// there is one. The pages were only lent: none is freed.
+fn unmap_mapping(task: TaskId, p: usize, cap: Cap) {
+    let at = mappings()[p];
+    let Cap::Memory { pages, .. } = cap else { return };
+    let root = crate::sched::space_of(task);
+    if at == 0 || root == 0 {
+        return;
+    }
+    let mut space = unsafe { crate::vmm::AddressSpace::from_root(root) };
+    for i in 0..pages as u64 {
+        let _ = unsafe { space.unmap(at + i * crate::pmm::PAGE_SIZE) };
+    }
+}
+
+/// True if position `q` was copied, directly or not, from position `p`.
+fn derived_from(q: usize, p: usize) -> bool {
+    let mut up = parents()[q];
+    // A parent always exists and is older than its children, so there is
+    // no cycle; the bound is only a guard.
+    for _ in 0..POSITIONS {
+        if up == 0 {
+            return false;
+        }
+        if up as usize - 1 == p {
+            return true;
+        }
+        up = parents()[up as usize - 1];
+    }
+    false
+}
+
+/// Remove every capability derived from `task`'s `slot`, wherever it is;
+/// Ok(how many). Err if the slot is empty. Interrupts off.
+pub fn revoke_in(task: TaskId, slot: usize) -> Result<usize, i64> {
+    if slot >= MAX_CAPS || crate::sched::task(task).caps[slot] == Cap::None {
+        return Err(crate::syscall::ERR_NO_CAPABILITY);
+    }
+    let p = position(task, slot);
+    let mut doomed = [0u64; POSITIONS / 64];
+    for q in 0..POSITIONS {
+        if q != p && serials()[q] != 0 && derived_from(q, p) {
+            doomed[q / 64] |= 1 << (q % 64);
+        }
+    }
+    let mut removed = 0;
+    for q in 0..POSITIONS {
+        if doomed[q / 64] & (1 << (q % 64)) != 0 {
+            remove(q / MAX_CAPS, q % MAX_CAPS, true);
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// How many capabilities are derived from `task`'s `slot`. Interrupts off.
+pub fn derived_count(task: TaskId, slot: usize) -> usize {
+    if slot >= MAX_CAPS || crate::sched::task(task).caps[slot] == Cap::None {
+        return 0;
+    }
+    let p = position(task, slot);
+    (0..POSITIONS).filter(|&q| q != p && serials()[q] != 0 && derived_from(q, p)).count()
+}
+
+/// Where the current task's capability in `slot` is mapped (0: nowhere),
+/// and its serial number, to record a new mapping against.
+pub fn mapping(slot: usize) -> (u64, u32) {
+    without_interrupts(|| {
+        let p = position(crate::sched::current(), slot.min(MAX_CAPS - 1));
+        (mappings()[p], serials()[p])
+    })
+}
+
+/// Record that the current task mapped its capability in `slot` at `at`,
+/// if it is still the one with `serial`; false if it was removed while it
+/// was being mapped (the caller then undoes the mapping).
+pub fn record_mapping(slot: usize, serial: u32, at: u64) -> bool {
+    without_interrupts(|| {
+        let p = position(crate::sched::current(), slot.min(MAX_CAPS - 1));
+        if serial == 0 || serials()[p] != serial {
+            return false;
+        }
+        mappings()[p] = at;
+        true
+    })
+}
+
+/// copy(slot) (system call 25): a copy of the capability in the caller's
+/// `slot`, derived from it, in its first free slot. Any kind: what can't
+/// be narrowed can still be lent, and taken back.
+pub fn copy(slot: u64) -> i64 {
+    let (cap, origin) = current_with_origin(slot);
+    if cap == Cap::None {
+        return crate::syscall::ERR_NO_CAPABILITY;
+    }
+    match put_current(cap, origin) {
+        Ok(new) => new as i64,
+        Err(e) => e,
+    }
+}
+
+/// revoke(slot) (system call 26): see revoke_in. Returns how many went.
+pub fn revoke(slot: u64) -> i64 {
+    without_interrupts(|| match revoke_in(crate::sched::current(), slot.min(MAX_CAPS as u64) as usize) {
+        Ok(n) => n as i64,
+        Err(e) => e,
+    })
+}
+
+// ===========================================================================
+// Self-test (Entry 25): user/rust/src/bin/captest.rs does the asking
+// ===========================================================================
+
+const CAPTEST_REVOKE: u64 = 7;
+const CAPTEST_REVOKE_ALL: u64 = 0x3F;
+const CAPTEST_RECEIVE: u64 = 8;
+const CAPTEST_GIVE: u64 = 9;
+const CAPTEST_GIVE_LATE: u64 = 10;
+const CAPTEST_RECEIVE_ONE: u64 = 11;
+const WAIT_TICKS: u64 = 500;
+/// What captest writes through its mapping (captest.rs: WRITTEN).
+const WRITTEN: u64 = 0x1234_5678;
+
+pub fn selftest() -> bool {
+    use crate::process::{self, CAPTEST};
+    use crate::sched::{self, ExitStatus};
+    use crate::selftest::check;
+    let code = |v: u64| Some(ExitStatus::Code(v));
+    sched::reap();
+    let baseline = sched::free_frames_and_heap();
+    let endpoints = crate::ipc::in_use();
+
+    // 1. Copies, revoke and drop, across processes, and memory: captest's
+    //    REVOKE test, with a page of the kernel's to map.
+    let page = unsafe { crate::pmm::alloc_frame() };
+    let (revoked, written) = match (crate::ipc::create(), page) {
+        (Some(ep), Some(frame)) => {
+            let caps = table(&[
+                Cap::Console,
+                Cap::Factory { rights: FACTORY_ALL },
+                Cap::Endpoint { ep, badge: 0, rights: SEND | RECV },
+                Cap::Memory { base: frame as u64, pages: 1, flags: MEM_WRITE },
+            ]);
+            let tester = process::spawn(&CAPTEST, CAPTEST_REVOKE, caps);
+            crate::ipc::release_created(ep);
+            let status = tester.ok().and_then(|id| sched::join_timeout(id, WAIT_TICKS));
+            sched::reap(); // its mappings gone with it, before the page is freed
+            let word = unsafe { (crate::paging::phys_to_virt(frame as u64) as *const u64).read_volatile() };
+            unsafe { crate::pmm::free_frame(frame) };
+            (status == code(CAPTEST_REVOKE_ALL), word == WRITTEN)
+        }
+        (ep, frame) => {
+            if let Some(ep) = ep {
+                crate::ipc::release_created(ep);
+            }
+            if let Some(frame) = frame {
+                unsafe { crate::pmm::free_frame(frame) };
+            }
+            (false, false)
+        }
+    };
+    let mut ok = check(
+        b"cap",
+        b"copy, and revoke: both copies gone, the original kept; a dropped copy's copy revoked from above; across processes: relay's console and its ticker's in one revoke, and both end; memory: a revoked or dropped capability's mapping undone, one mapping per capability; minted copies derived too",
+        revoked && written,
+    );
+
+    // 2. In a message: revoked after it arrived, the receiver's copy goes;
+    //    revoked while the message waited, it never arrives.
+    let pair = |ep: u8, giver: u64, receiver: u64, between: &dyn Fn(TaskId) -> bool| {
+        let give = process::spawn(&CAPTEST, giver, table(&[Cap::Console, Cap::Endpoint { ep, badge: 0, rights: SEND | GRANT }]));
+        let mut middle = true;
+        if giver == CAPTEST_GIVE_LATE {
+            // Wait (bounded) until it waits to send, then take its copy.
+            let deadline = crate::apic::ticks() + 100;
+            while give.as_ref().is_ok_and(|&id| !sched::blocked_in_ipc(id)) && crate::apic::ticks() < deadline {
+                sched::sleep_ticks(1);
+            }
+            middle = give.as_ref().is_ok_and(|&id| between(id));
+        }
+        let take = process::spawn(&CAPTEST, receiver, table(&[Cap::None, Cap::Endpoint { ep, badge: 0, rights: RECV }]));
+        crate::ipc::release_created(ep);
+        let g = give.ok().and_then(|id| sched::join_timeout(id, WAIT_TICKS));
+        let t = take.ok().and_then(|id| sched::join_timeout(id, WAIT_TICKS));
+        (g, t, middle)
+    };
+    let after = crate::ipc::create().map(|ep| pair(ep, CAPTEST_GIVE, CAPTEST_RECEIVE, &|_| true));
+    let late = crate::ipc::create().map(|ep| {
+        pair(ep, CAPTEST_GIVE_LATE, CAPTEST_RECEIVE_ONE, &|id| {
+            without_interrupts(|| revoke_in(id, 0)) == Ok(1) // its console's one copy, in the message
+        })
+    });
+    let passed = after == Some((code(1), code(KIND_CONSOLE_CODE), true)) && late == Some((code(0), code(0x10), true));
+    if !passed {
+        // What each process ended with, for whoever reads the log.
+        use crate::{serial_write_str as s, serial_write_u64 as dec};
+        let show = |what: &[u8], status: Option<ExitStatus>| {
+            s(what);
+            match status {
+                Some(ExitStatus::Code(c)) => {
+                    s(b"exit code ");
+                    dec(c);
+                }
+                Some(ExitStatus::Fault(v)) => {
+                    s(b"fault ");
+                    dec(v as u64);
+                }
+                Some(ExitStatus::Killed) => s(b"killed"),
+                None => s(b"did not finish"),
+            }
+        };
+        for (name, pair) in [(&b"[cap] after it arrived: giver "[..], after), (&b"[cap] while it waited: giver "[..], late)] {
+            match pair {
+                Some((g, t, middle)) => {
+                    show(name, g);
+                    show(b", receiver ", t);
+                    s(if middle { b"\n" } else { b", and the revoke in the middle failed\n" });
+                }
+                None => {
+                    s(name);
+                    s(b"not started: no endpoint\n");
+                }
+            }
+        }
+    }
+    ok &= check(
+        b"cap",
+        b"a capability passed in a message goes when its original is revoked; one revoked while its message waited is not delivered",
+        passed,
+    );
+
+    // 3. Nothing left: relay's ticker, which nobody joins, ends by itself
+    //    once its console is gone.
+    let deadline = crate::apic::ticks() + WAIT_TICKS;
+    while sched::live_tasks() > 0 && crate::apic::ticks() < deadline {
+        sched::sleep_ticks(1);
+        sched::reap();
+    }
+    sched::reap();
+    let leaked = baseline as i64 - sched::free_frames_and_heap() as i64;
+    ok &= check(
+        b"cap",
+        b"all reaped: no tasks (relay's ticker ended with its console), no endpoints and no frames left over",
+        sched::live_tasks() == 0 && crate::ipc::in_use() == endpoints && leaked == 0,
+    );
+    ok
+}
+
+/// What RECEIVE exits with: the console's kind (info.rs: KIND_CONSOLE)
+/// from the first message, nothing (0) << 8 after the second.
+const KIND_CONSOLE_CODE: u64 = crate::info::KIND_CONSOLE as u64;

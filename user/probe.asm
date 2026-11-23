@@ -221,10 +221,10 @@ map_write:                      ; map, then write a quadword there: exit 0,
     xor edi, edi
     jmp exit
 
-map_twice:                      ; map, then map again at the same place:
+map_twice:                      ; map, then map slot 1 at the same place:
     call map_slot0              ; exit with what the second map returned
-    mov eax, SYS_MAP
-    xor edi, edi
+    mov eax, SYS_MAP            ; (Entry 25: one capability maps once, so
+    mov edi, 1                  ; the second is another capability)
     mov rsi, rbx
     syscall
     mov rdi, rax

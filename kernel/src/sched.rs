@@ -272,7 +272,7 @@ pub fn spawn(name: &'static str, entry: fn(u64), arg: u64) -> Result<TaskId, Spa
 /// kernel's) with capabilities `caps`. The task takes over the address
 /// space: reap() destroys it when the task is gone. process.rs uses this.
 pub fn spawn_in(name: &'static str, entry: fn(u64), arg: u64, space: u64, caps: Caps) -> Result<TaskId, SpawnError> {
-    spawn_in_signalling(name, entry, arg, space, caps, None).map(|(id, _)| id)
+    spawn_in_signalling(name, entry, arg, space, caps, &[None; cap::MAX_CAPS], None).map(|(id, _)| id)
 }
 
 /// Per task slot (Entry 24): how many tasks it has held, the current one
@@ -292,13 +292,17 @@ fn endings() -> &'static mut [Option<ExitStatus>; MAX_TASKS] {
 
 /// spawn_in(), and when the task ends, signal endpoint `exit_signal` with
 /// bit (1 << its id) (factory.rs: spawn). Returns its id and its slot's
-/// generation (Entry 24).
+/// generation (Entry 24). `origins[i]` says which capability `caps[i]` was
+/// copied from (None: the kernel made it), so revoking that one takes this
+/// one too (Entry 25); one revoked while the task was being made isn't
+/// given to it.
 pub fn spawn_in_signalling(
     name: &'static str,
     entry: fn(u64),
     arg: u64,
     space: u64,
     caps: Caps,
+    origins: &[cap::Origin; cap::MAX_CAPS],
     exit_signal: Option<u8>,
 ) -> Result<(TaskId, u32), SpawnError> {
     let (id, generation) = without_interrupts(|| {
@@ -351,22 +355,25 @@ pub fn spawn_in_signalling(
     }
 
     without_interrupts(|| {
-        cap::retain_all(&caps);
         if let Some(ep) = exit_signal {
             crate::ipc::retain(ep);
         }
         table()[id] = Task {
-            state: State::Ready,
+            state: State::Creating,
             name: Some(name),
             rsp: top - 8 * 8,
             entry: Some(entry),
             arg,
             has_stack: true,
             space,
-            caps,
+            caps: NO_CAPS,
             exit_signal,
             ..EMPTY
         };
+        for (slot, &c) in caps.iter().enumerate() {
+            cap::put(id, slot, c, origins[slot]);
+        }
+        table()[id].state = State::Ready;
     });
     Ok((id, generation))
 }
@@ -418,6 +425,13 @@ pub fn exit_with(status: ExitStatus) -> ! {
     }
     crate::ipc::on_exit(me);
     crate::console::on_exit(me);
+    // Its capabilities go now, not when it's reaped (Entry 25): a process
+    // that has ended holds nothing, so whoever its exit signal wakes finds
+    // what it held already gone, and what was copied from it handed up to
+    // their parents.
+    for slot in 0..cap::MAX_CAPS {
+        cap::remove(me, slot, false);
+    }
     if let Some(ep) = t[me].exit_signal {
         crate::ipc::signal(ep, 1 << me);
     }
@@ -440,13 +454,18 @@ pub fn reap() -> usize {
             if id == current_id() || task.state != State::Finished || !task.has_stack {
                 return 0;
             }
+            // exit_with() let its capabilities go already; this only makes
+            // sure. Their mappings go with the address space, so they
+            // aren't undone one by one.
+            for slot in 0..cap::MAX_CAPS {
+                cap::remove(id, slot, false);
+            }
             unsafe {
                 free_stack_pages(id, STACK_PAGES);
                 if task.space != 0 {
                     AddressSpace::from_root(task.space).destroy();
                 }
             }
-            cap::release_all(&task.caps);
             if let Some(ep) = task.exit_signal {
                 crate::ipc::release(ep);
             }
@@ -632,31 +651,22 @@ pub fn current_cap(handle: u64) -> Cap {
     })
 }
 
-/// Put `cap` in the current task's first free slot (and count it, as any
-/// capability stored in a table is). None if every slot is taken.
+/// The root of task `id`'s address space (0: a kernel task's, or none).
+pub fn space_of(id: TaskId) -> u64 {
+    without_interrupts(|| table()[id % MAX_TASKS].space)
+}
+
+/// Put `cap`, made by the kernel just now (an endpoint, a Process
+/// capability), in the current task's first free slot: a root, derived from
+/// nothing (Entry 25). None if every slot is taken.
 pub fn store_cap(cap: Cap) -> Option<usize> {
-    without_interrupts(|| {
-        let caps = &mut table()[current_id()].caps;
-        let slot = cap::free_slot(caps)?;
-        caps[slot] = cap;
-        cap::retain(cap);
-        Some(slot)
-    })
+    cap::put_current(cap, None).ok()
 }
 
 /// Empty slots in the current task's table (spawn checks for room for a
 /// Process capability before it starts anything: Entry 24).
 pub fn free_cap_slots() -> usize {
     without_interrupts(|| table()[current_id()].caps.iter().filter(|&&c| c == Cap::None).count())
-}
-
-/// Empty the current task's slot `handle`, returning what was there (not
-/// yet released: the caller does that).
-pub fn take_cap(handle: u64) -> Cap {
-    if handle >= cap::MAX_CAPS as u64 {
-        return Cap::None;
-    }
-    without_interrupts(|| core::mem::replace(&mut table()[current_id()].caps[handle as usize], Cap::None))
 }
 
 /// The mutex with key `key` (its address) and owner word `owner`: take it,

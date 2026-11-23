@@ -17,11 +17,15 @@
 //! Where: [MAP_BASE, MAP_END), page-aligned, clear of everything else. The
 //! window starts at 4 GiB, far above a program's code and data (1 GiB up)
 //! and below its stack's region, so a mapping can't land on either.
+//!
+//! One mapping per capability (Entry 25): the kernel remembers where each
+//! is mapped, and when the capability goes (revoked, dropped), so does the
+//! mapping. To map the same pages twice, copy the capability first.
 
 use crate::cap::{Cap, MEM_UNCACHED, MEM_WRITE, MEM_WRITE_COMBINING};
 use crate::pmm::PAGE_SIZE;
 use crate::sched;
-use crate::syscall::{ERR_BAD_ADDRESS, ERR_NO_CAPABILITY, ERR_NO_MEMORY};
+use crate::syscall::{ERR_BAD_ADDRESS, ERR_BAD_ARGUMENT, ERR_NO_CAPABILITY, ERR_NO_MEMORY};
 use crate::vmm::{AddressSpace, MapError, PageFlags};
 
 pub const MAP_BASE: u64 = 0x0000_0001_0000_0000;
@@ -39,6 +43,10 @@ pub fn map(slot: u64, address: u64) -> i64 {
     if !fits || pages == 0 {
         return ERR_BAD_ADDRESS;
     }
+    let (mapped_at, serial) = crate::cap::mapping(slot as usize);
+    if mapped_at != 0 {
+        return ERR_BAD_ARGUMENT; // this capability is mapped already
+    }
     let page_flags = PageFlags::user_borrowed(
         flags & MEM_WRITE != 0,
         flags & MEM_WRITE_COMBINING != 0,
@@ -55,6 +63,15 @@ pub fn map(slot: u64, address: u64) -> i64 {
             }
             return if e == MapError::OutOfMemory { ERR_NO_MEMORY } else { ERR_BAD_ADDRESS };
         }
+    }
+    // Remembered against this capability, so that removing it unmaps it
+    // (Entry 25). If it was revoked while the pages were being mapped, the
+    // mapping goes now.
+    if !crate::cap::record_mapping(slot as usize, serial, address) {
+        for i in 0..pages as u64 {
+            let _ = unsafe { space.unmap(address + i * PAGE_SIZE) };
+        }
+        return ERR_NO_CAPABILITY;
     }
     crate::console::on_map(base); // the screen: this process draws now (Entry 21)
     0
