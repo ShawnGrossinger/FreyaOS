@@ -642,8 +642,14 @@ pub fn selftest() -> bool {
     //     bits through a badged capability and receives them, and is
     //     refused without a badge, without SEND, or where nobody can
     //     receive any more (captest.rs says which bit is which).
+    //     `nobody` stops counting its creator as a receiver before captest
+    //     starts, not after (Entry 28): captest signals it at once, so a
+    //     tick or a host stall between spawn and done let it get 0 where
+    //     peer-gone was right (2 boots of 39 on Shawn's machine). The
+    //     reference stays until captest holds its own.
     let ep = fresh();
     let nobody = fresh();
+    release_receiver(nobody);
     let tester = process::spawn(
         &process::CAPTEST,
         CAPTEST_SIGNAL,
@@ -657,12 +663,25 @@ pub fn selftest() -> bool {
     )
     .ok();
     done(ep);
-    done(nobody);
+    release(nobody);
+    let got = finish(tester);
     ok &= check(
         b"ipc",
         b"a process signals through a badged capability: the badge's bits arrive once, merged (0x5), without blocking; refused: no badge, no SEND, the console; peer-gone where nobody can receive",
-        finish(tester) == code(CAPTEST_SIGNAL_ALL as i64),
+        got == code(CAPTEST_SIGNAL_ALL as i64),
     );
+    if got != code(CAPTEST_SIGNAL_ALL as i64) {
+        // Which checks failed (Entry 28): a bit missing from 0xF names one.
+        s(b"[ipc]   captest's signal checks: ");
+        match got {
+            Some(ExitStatus::Code(c)) => {
+                s(b"exit code ");
+                crate::serial_write_hex(c);
+                s(b" of 0xF (bit 0 merged, 1 no badge, 2 no SEND, 3 peer-gone)\n");
+            }
+            _ => s(b"it did not exit by itself\n"),
+        }
+    }
 
     // 9. Everything given back: endpoints, tasks, frames.
     sched::reap();
