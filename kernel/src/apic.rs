@@ -128,7 +128,12 @@ pub struct ApicInfo {
     pub id: u32,
     pub version: u32,
     pub counts_per_10ms: u32,
+    /// The largest of the calibration's measurements (Entry 27).
+    pub most_per_10ms: u32,
 }
+
+/// How many times the timer is measured against the PIT (Entry 27).
+const CALIBRATIONS: usize = 5;
 
 /// Enable the local APIC, calibrate its timer and start it at TIMER_HZ.
 /// Interrupts stay disabled; the caller decides when to `sti`.
@@ -168,12 +173,22 @@ pub fn init() -> Result<ApicInfo, &'static [u8]> {
     write(REG_SVR, SVR_ENABLE | SPURIOUS_VECTOR as u32);
 
     // --- Calibrate: how far does the timer count in 10 ms? ---
+    // Measured CALIBRATIONS times, and the least kept (Entry 27). Anything
+    // that holds the CPU up while the timer counts (the host, under an
+    // emulator; SMM, on hardware) adds counts and never takes any away, so
+    // the least is the truest. Measured once, it was 41% high in one of
+    // Shawn's QEMU boots, and every tick after it 1.4 times too long.
     write(REG_TIMER_DIVIDE, DIVIDE_BY_16);
     write(REG_LVT_TIMER, LVT_MASKED); // one-shot, no interrupt while measuring
-    write(REG_TIMER_INITIAL, u32::MAX);
-    pit_wait_ms(10);
-    let counts = u32::MAX - read(REG_TIMER_CURRENT);
-    write(REG_TIMER_INITIAL, 0); // stop
+    let mut measured = [0u32; CALIBRATIONS];
+    for i in 0..CALIBRATIONS {
+        write(REG_TIMER_INITIAL, u32::MAX);
+        pit_wait_ms(10);
+        measured[i] = u32::MAX - read(REG_TIMER_CURRENT);
+        write(REG_TIMER_INITIAL, 0); // stop
+    }
+    let counts = measured.iter().copied().min().unwrap_or(0);
+    let most = measured.iter().copied().max().unwrap_or(0);
     if counts == 0 {
         return Err(b"APIC timer did not count during calibration");
     }
@@ -189,6 +204,7 @@ pub fn init() -> Result<ApicInfo, &'static [u8]> {
         id: read(REG_ID) >> 24,
         version: read(REG_VERSION) & 0xFF,
         counts_per_10ms: counts,
+        most_per_10ms: most,
     })
 }
 
@@ -395,7 +411,11 @@ pub fn selftest(info: &ApicInfo) -> bool {
 
     crate::serial_write_str(b"[apic] self-test timer calibrated against the PIT: ");
     crate::serial_write_u64(info.counts_per_10ms as u64);
-    crate::serial_write_str(b" counts per 10 ms");
+    crate::serial_write_str(b" counts per 10 ms, the least of ");
+    crate::serial_write_u64(CALIBRATIONS as u64);
+    crate::serial_write_str(b" measurements (the most ");
+    crate::serial_write_u64(info.most_per_10ms as u64);
+    crate::serial_write_str(b")");
     ok &= crate::selftest::verdict(info.counts_per_10ms > 100);
 
     // --- Interrupts on from here ---

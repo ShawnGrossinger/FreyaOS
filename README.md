@@ -13,6 +13,10 @@ processes holding exactly the capabilities they need.
 It runs in QEMU and on real hardware: a ThinkPad T430 (Intel i7-3520M, Ivy
 Bridge, 16 GB), booted from a USB stick.
 
+The design it is built toward, and the case that capability systems have
+been practical on ordinary hardware all along, is in the manifesto (see
+[Documentation](#documentation)).
+
 ## Status
 
 | Area | State |
@@ -123,7 +127,7 @@ kernel/            Rust kernel: entry.asm, kernel.ld, src/*.rs
 user/              user programs in NASM (test programs)
 user/rust/         user programs in Rust (init; the console, PS/2 and mouse drivers; the shell; spin, crash, ticker, relay and hog), and their library with its allocator
 build/             Makefile, test.sh, write-usb.sh
-docs/              development journal, roadmap and design notes
+docs/              the manifesto (the design) and the development journal
 ```
 
 ## Building
@@ -317,14 +321,19 @@ why. `TEXT_MODE=1 make usb DEV=/dev/sdX` writes a stick that always does.
 
 ## Documentation
 
+- `docs/Manifesto v1.docx`: the design FreyaOS is built toward: what it
+  defends against, and how. Where any other document disagrees, the
+  manifesto wins. Version 2, in review, corrects what wasn't feasible (the
+  External Witness becomes a $5 Raspberry Pi Pico 2 working with the T430's
+  TPM, in place of a CM4 wired to the CPU), and adds the architecture and
+  the roadmap, which replaces the earlier AI roadmap.
 - `docs/FreyaOS Development Journal.docx`: every change, with the evidence
   for it, what went wrong, lessons learned, and where the project stands
-  against the roadmap.
-- `docs/Freya OS-AI Development Roadmap.docx`: the phase plan.
+  against the manifesto.
 
 ## Next
 
-Programs from the shell, revocation and memory budgets on the T430. Then
-one of: arguments and output for programs, more of the capability layer
-(a program told when something it holds is revoked; capabilities for
-address spaces), or read-only disks on a spare machine.
+Programs from the shell, revocation and memory budgets on the T430. Then,
+once version 2 of the manifesto is settled, its first phase: a table giving
+every frame of memory a state, an owner and a kind, and a pinned toolchain
+so that two builds of the same source can be compared.

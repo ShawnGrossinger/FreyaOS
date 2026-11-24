@@ -612,7 +612,12 @@ check_image() { # check_image <image>: the layout a real PC's BIOS relies on
   [ "$(u 458 4)" -eq $((sectors - 1)) ] || { echo "partition 1 is $(u 458 4) sectors; the image has $((sectors - 1)) after the MBR"; return 1; }
   [ -z "$(od -An -v -t x1 -j 462 -N 48 "$img" | tr -d ' 0\n')" ] \
     || { echo "partition entries 2-4 aren't empty"; return 1; }
-  echo "$((size / 1048576)) MiB, MBR signature FREY, one active partition: sectors 1-$((sectors - 1))"
+  # What was built, so two machines' builds can be compared (Entry 27):
+  # the kernel's size from the build's layout line, and the image's hash.
+  local kernel hash
+  kernel=$(grep -o 'kernel_sectors=[0-9]*' "$(dirname "$img")/build.log" | tail -1 | cut -d= -f2)
+  hash=$(sha256sum "$img" | cut -c1-16)
+  echo "$((size / 1048576)) MiB, MBR signature FREY, one active partition: sectors 1-$((sectors - 1)); kernel ${kernel:-?} sectors; sha256 $hash"
 }
 
 selected() { # is case $1 selected on the command line (or nothing selected)?
@@ -624,6 +629,10 @@ selected() { # is case $1 selected on the command line (or nothing selected)?
 ARGS=("$@")
 pass=0; fail=0; results=()
 echo "FreyaOS test suite ($QEMU, timeout ${TIMEOUT}s per boot)"
+# The tools that built it (Entry 27): builds with different ones differ.
+# cargo +nightly is what the Makefile runs, so its rustc is the one that counts.
+rustc_v=$(rustc +nightly --version 2>/dev/null || echo "$(rustc --version 2>/dev/null) (no nightly)")
+echo "  tools: ${rustc_v:-rustc not found}; $(nasm -v 2>/dev/null | head -1); $($QEMU --version 2>/dev/null | head -1)"
 
 for entry in "${CASES[@]}"; do
   IFS='|' read -r name demo mem patterns extra keys <<< "$entry"
