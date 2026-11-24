@@ -23,19 +23,19 @@ been practical on ordinary hardware all along, is in the manifesto (see
 |---|---|
 | Boot | Stage 1 MBR (with a partition table) loads stage 2, which loads the kernel (up to 1 MiB), collects the E820 memory map, sets a graphics mode and enters long mode |
 | Screen | A VESA graphics mode with a linear framebuffer, as large as the display shows (read from its EDID) up to 1920x1280; text in the VGA ROM's own 8x16 font, drawn through a write-combining mapping. 80x25 text mode on request. Drawn by a console driver process from the end of boot, with 400 rows of the log to scroll back through |
-| Memory | Kernel-owned page tables, NX, a guard page under the kernel stack, a higher-half map of all RAM, a frame allocator, a page-mapping API, a kernel heap; heaps for programs, grown through a Budget capability, with Box, Vec and String in Rust programs |
+| Memory | Kernel-owned page tables, NX, a guard page under the kernel stack, a higher-half map of all RAM, a frame allocator, a page-mapping API, a kernel heap; heaps for programs, grown through a Budget capability, with Box, Vec and String in Rust programs. Every frame has a state, a kind and an owner, kept in a frame table beside the allocator's bitmap |
 | Interrupts | A gate for all 256 vectors, the local APIC timer at 100 Hz, the I/O APIC routed from ACPI tables; interrupts nobody set up are survived and reported |
 | Tasks | Kernel threads, preemptive round-robin scheduling, sleeping, joining, a mutex |
 | User mode | Ring 3 processes in their own address spaces, written in assembly or Rust; `SYSCALL`, SMEP and SMAP where the CPU has them; a fault ends only the process |
 | Capabilities and IPC | 32 capability slots per process; synchronous call/reply IPC that can pass capabilities (with GRANT) and badges; signals, from the kernel or from a process holding a badged capability; memory lent through Memory capabilities; narrower copies (mint) and letting go (drop); every copy remembers its original, so whatever was lent can be taken back (revoke), from every process it reached; memory budgets that nest the same way |
 | Init | The only process the kernel starts: it holds the drivers' capabilities and a Factory capability, starts each driver and the shell with exactly what it needs, and starts one again if it ends |
 | Drivers | I/O-port, interrupt-line and memory capabilities, and interrupts delivered as signals; a console driver, a PS/2 driver (keyboard and controller) and a mouse driver, all in Rust, running as user processes, started by init |
-| Shell | A first shell in Rust: line editing with history, built-in commands (help, echo, ps, caps, uptime, mem, restart, off), programs started and stopped (run, jobs, kill), and what it lent them taken back (revoke), holding nine capabilities and nothing else |
+| Shell | A first shell in Rust: line editing with history, built-in commands (help, echo, ps with each task's memory, caps, uptime, mem by kind, restart, off), programs started and stopped (run, jobs, kill), and what it lent them taken back (revoke), holding nine capabilities and nothing else |
 | Power | Restart and switch-off through ACPI, behind a Power capability (Ctrl+Alt+Del, Ctrl+Alt+End, or the shell's restart and off) |
 | Not yet | UEFI boot, disk, network, file system, memory that grows as a program runs, multiple CPUs |
 
-Every boot runs **96 self-tests** and shows the result on screen. `make test`
-checks the disk image and boots **39 configurations** headless, checking each
+Every boot runs **101 self-tests** and shows the result on screen. `make test`
+checks the disk image and boots **41 configurations** headless, checking each
 one.
 
 ## Design in brief
@@ -72,6 +72,17 @@ one.
   has left. Revoking a Budget frees its heap; the program's next touch of
   it is a page fault. Rust programs get Box, Vec and String from it
   (`freya::heap`).
+- **Every frame has an identity** (the manifesto's Section III). A frame
+  table beside the allocator's bitmap gives every frame of memory its state
+  (raw, sanitized, typed, or reserved), its kind (page table, kernel stack,
+  kernel heap, a process's code, data, stack or heap, ...) and its owner
+  (the kernel, or a task named by its slot and generation). Inside the
+  kernel a frame is held as a `Frame<Raw>`, `Frame<Sanitized>` or
+  `Frame<Typed>`, so the compiler keeps the order: only a zeroed frame can
+  be given an owner. A frame comes back from a page table only through a
+  check against the table, so a double free, a free by the wrong owner or a
+  free of the kernel's own image halts the kernel instead of corrupting
+  memory. `ps` shows what each task owns; `mem` what all memory is doing.
 - **Init decides, the kernel enforces.** At the end of boot the kernel starts
   one process, init, with every capability the drivers will need. Init mints
   narrower copies, starts the console, PS/2 and mouse drivers and the shell
@@ -321,19 +332,19 @@ why. `TEXT_MODE=1 make usb DEV=/dev/sdX` writes a stick that always does.
 
 ## Documentation
 
-- `docs/Manifesto v1.docx`: the design FreyaOS is built toward: what it
-  defends against, and how. Where any other document disagrees, the
-  manifesto wins. Version 2, in review, corrects what wasn't feasible (the
-  External Witness becomes a $5 Raspberry Pi Pico 2 working with the T430's
-  TPM, in place of a CM4 wired to the CPU), and adds the architecture and
-  the roadmap, which replaces the earlier AI roadmap.
+- `docs/Manifesto v2.docx`: the design FreyaOS is built toward: what it
+  defends against, and how, with the architecture as built (Section X) and
+  the roadmap from here (Section XI). Where any other document disagrees,
+  the manifesto wins. Version 2 (Entry 29) corrected what wasn't feasible in
+  version 1: the External Witness is a $5 Raspberry Pi Pico 2 working with
+  the T430's TPM, in place of a CM4 wired to the CPU.
 - `docs/FreyaOS Development Journal.docx`: every change, with the evidence
   for it, what went wrong, lessons learned, and where the project stands
   against the manifesto.
 
 ## Next
 
-Programs from the shell, revocation and memory budgets on the T430. Then,
-once version 2 of the manifesto is settled, its first phase: a table giving
-every frame of memory a state, an owner and a kind, and a pinned toolchain
-so that two builds of the same source can be compared.
+Programs from the shell, revocation, memory budgets and the frame table on
+the T430. Then the rest of the manifesto's Phase A: every `unsafe` block in
+the kernel listed and justified, and a pinned toolchain so that two builds of
+the same source can be compared.

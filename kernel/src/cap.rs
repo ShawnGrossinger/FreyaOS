@@ -387,9 +387,11 @@ fn unmap_mapping(task: TaskId, p: usize, cap: Cap) {
         }
         Cap::Budget { .. } => {
             let base = crate::mem::heap_base((p % MAX_CAPS) as u64);
+            let owner = space.owner();
             for i in 0..heaps()[p] as u64 {
-                if let Ok(frame) = unsafe { space.unmap(base + i * crate::pmm::PAGE_SIZE) } {
-                    unsafe { crate::pmm::free_frame(frame as usize) };
+                let page = base + i * crate::pmm::PAGE_SIZE;
+                if let Ok(frame) = unsafe { space.unmap_frame(page, crate::pmm::Kind::ProcessHeap.bit(), owner) } {
+                    frame.free();
                 }
             }
             heaps()[p] = 0;
@@ -586,29 +588,30 @@ pub fn selftest() -> bool {
 
     // 1. Copies, revoke and drop, across processes, and memory: captest's
     //    REVOKE test, with a page of the kernel's to map.
-    let page = unsafe { crate::pmm::alloc_frame() };
+    let page = crate::pmm::alloc(crate::pmm::Kind::Test, crate::pmm::Owner::Kernel);
     let (revoked, written) = match (crate::ipc::create(), page) {
-        (Some(ep), Some(frame)) => {
+        (Some(ep), Some(page)) => {
+            let frame = page.phys();
             let caps = table(&[
                 Cap::Console,
                 Cap::Factory { rights: FACTORY_ALL },
                 Cap::Endpoint { ep, badge: 0, rights: SEND | RECV },
-                Cap::Memory { base: frame as u64, pages: 1, flags: MEM_WRITE },
+                Cap::Memory { base: frame, pages: 1, flags: MEM_WRITE },
             ]);
             let tester = process::spawn(&CAPTEST, CAPTEST_REVOKE, caps);
             crate::ipc::release_created(ep);
             let status = tester.ok().and_then(|id| sched::join_timeout(id, WAIT_TICKS));
             sched::reap(); // its mappings gone with it, before the page is freed
-            let word = unsafe { (crate::paging::phys_to_virt(frame as u64) as *const u64).read_volatile() };
-            unsafe { crate::pmm::free_frame(frame) };
+            let word = unsafe { (crate::paging::phys_to_virt(frame) as *const u64).read_volatile() };
+            page.free();
             (status == code(CAPTEST_REVOKE_ALL), word == WRITTEN)
         }
         (ep, frame) => {
             if let Some(ep) = ep {
                 crate::ipc::release_created(ep);
             }
-            if let Some(frame) = frame {
-                unsafe { crate::pmm::free_frame(frame) };
+            if let Some(page) = frame {
+                page.free();
             }
             (false, false)
         }

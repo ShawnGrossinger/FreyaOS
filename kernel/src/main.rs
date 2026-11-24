@@ -471,13 +471,15 @@ pub extern "C" fn rust_start() -> ! {
     serial_write_u64(ps.frames);
     serial_write_str(b" frames (to ");
     serial_write_hex(ps.frames * pmm::PAGE_SIZE);
-    serial_write_str(b")\n[pmm] reserved: low 1 MiB, kernel ");
+    serial_write_str(b"); frame table after it: ");
+    serial_write_u64(ps.table_bytes / 1024);
+    serial_write_str(b" KiB, 8 bytes a frame: its state, kind and owner\n[pmm] reserved: low 1 MiB, kernel ");
     serial_write_hex(kernel_start);
     serial_write_str(b"-");
     serial_write_hex(kernel_end);
     serial_write_str(b", ");
     serial_write_u64((early.used().1 - early.used().0) / pmm::PAGE_SIZE);
-    serial_write_str(b" early page-table frames, the bitmap\n[pmm] usable RAM ");
+    serial_write_str(b" early page-table frames, the bitmap and the table\n[pmm] usable RAM ");
     serial_write_u64(ps.usable_bytes / (1024 * 1024));
     serial_write_str(b" MiB, free ");
     serial_write_u64(ps.free_frames * pmm::PAGE_SIZE / (1024 * 1024));
@@ -503,27 +505,20 @@ pub extern "C" fn rust_start() -> ! {
     let heap_ok = heap::selftest();
 
     // --- Smoke-test: allocate a frame and verify it is zeroed ---
-    let sanitize_ok = match unsafe { pmm::alloc_frame() } {
-
-        Some(phys) => {
-
+    let sanitize_ok = match pmm::alloc(pmm::Kind::Test, pmm::Owner::Kernel) {
+        Some(frame) => {
             serial_write_str(b"[kernel] test alloc: frame at ");
-            serial_write_hex(phys as u64);
+            serial_write_hex(frame.phys());
             serial_write_str(b"\n");
 
             // Verify zeroed (Sanitized invariant check).
-            let slice = unsafe {
-
-                core::slice::from_raw_parts(paging::phys_to_virt(phys as u64), pmm::PAGE_SIZE as usize)
-            };
-
+            let slice = unsafe { core::slice::from_raw_parts(paging::phys_to_virt(frame.phys()), pmm::PAGE_SIZE as usize) };
             let all_zero = slice.iter().all(|&b| b == 0);
-            unsafe { pmm::free_frame(phys) };
+            frame.free();
 
             selftest::check(b"kernel", b"a freshly allocated frame is all zeros", all_zero)
         }
-
-        None => selftest::check(b"kernel", b"alloc_frame returned a frame", false),
+        None => selftest::check(b"kernel", b"alloc returned a frame", false),
     };
 
     // --- Interrupts: legacy PICs out of the way, local APIC timer on ---
@@ -628,6 +623,12 @@ pub extern "C" fn rust_start() -> ! {
         mutex && ipc && factory && info && caps && budgets && drivers
     };
 
+    // --- Frame identity, after every test process has ended (Entry 29):
+    // no frame names a task that is gone, and what the frames are doing ---
+    sched::reap();
+    let owners_ok = pmm::selftest_owners(|id, generation| sched::slot_holds(id as usize, generation));
+    pmm::print_kinds();
+
     // --- VGA status display (screen was cleared at entry) ---
     // Steps with no result value either succeed or end in an exception
     // report, so reaching this point means they passed.
@@ -636,7 +637,7 @@ pub extern "C" fn rust_start() -> ! {
     vga_status(2, b"Exception table: ", int3_ok && entry_ok);
     vga_status(3, b"Page tables:     ", true);
     vga_status(4, b"Memory map:      ", true);
-    vga_status(5, b"Frame allocator: ", pmm_ok);
+    vga_status(5, b"Frame allocator: ", pmm_ok && owners_ok);
     // Anything the hardware sent that nobody asked for, over the whole boot.
     irq_ok &= idt::selftest_none_unexpected();
 
@@ -897,6 +898,10 @@ fn run_requested_demo() {
             "write_read_only" => vmm::demo_write_read_only(),
             // [heap] FATAL: double free
             "heap_double_free" => heap::demo_double_free(),
+            // [pmm] FATAL (Entry 29): a frame dropped while held, and the
+            // kernel image's first frame given back as if it were heap
+            "lost_frame" => pmm::demo_lost_frame(),
+            "free_kernel_image" => pmm::demo_free_kernel_image(),
             // [kernel] PANIC with file and line
             "panic" => panic!("FREYA_DEMO=panic"),
             // Not faults (Entries 20, 21 and 23): the console driver killed, so

@@ -34,9 +34,11 @@ use crate::cap::Cap;
 use crate::sched;
 use crate::syscall::{copy_to_user, ERR_BAD_ARGUMENT, ERR_WRONG_CAPABILITY};
 
-pub const HEADER_BYTES: usize = 64;
-pub const RECORD_BYTES: usize = 48;
-const VERSION: u32 = 1;
+pub const HEADER_BYTES: usize = 64 + 8 * crate::pmm::KINDS;
+pub const RECORD_BYTES: usize = 56;
+/// 2 since Entry 29: the frames of each kind in the header (bytes 64 on:
+/// kind 0, none, is the free frames), and each task's frames in its record.
+const VERSION: u32 = 2;
 
 pub const FLAG_PROCESS: u32 = 1 << 0;
 pub const FLAG_IDLE: u32 = 1 << 1;
@@ -81,6 +83,7 @@ pub fn info(slot: u64, ptr: u64, len: u64) -> i64 {
         r[40..44].copy_from_slice(&t.caps.to_le_bytes());
         let flags = if t.process { FLAG_PROCESS } else { 0 } | if t.idle { FLAG_IDLE } else { 0 };
         r[44..48].copy_from_slice(&flags.to_le_bytes());
+        r[48..56].copy_from_slice(&crate::pmm::frames_owned_by(id as u8).to_le_bytes());
         if let Err(e) = copy_to_user(ptr + (HEADER_BYTES + written * RECORD_BYTES) as u64, &r) {
             return e;
         }
@@ -97,6 +100,10 @@ pub fn info(slot: u64, ptr: u64, len: u64) -> i64 {
     h[40..48].copy_from_slice(&crate::pmm::usable_frames().to_le_bytes());
     h[48..56].copy_from_slice(&sched::switches().to_le_bytes());
     h[56..64].copy_from_slice(&syscalls.to_le_bytes());
+    for k in 0..crate::pmm::KINDS {
+        let n = crate::pmm::frames_of(crate::pmm::Kind::nth(k));
+        h[64 + 8 * k..72 + 8 * k].copy_from_slice(&n.to_le_bytes());
+    }
     if let Err(e) = copy_to_user(ptr, &h) {
         return e;
     }

@@ -628,7 +628,7 @@ fn right(l: &mut Line<120>, v: u64, width: usize) {
 
 fn ps() {
     let Some((sys, buf)) = snapshot() else { return };
-    say(b" id  name        caps  doing\n");
+    say(b" id  name        caps    memory  doing\n");
     let mut processes = 0;
     for i in 0..sys.tasks {
         let t = task_info(buf, i);
@@ -644,7 +644,11 @@ fn ps() {
         } else {
             l.str(b"kernel");
         }
+        // What it owns (Entry 29): a process's pages and page tables and
+        // its kernel stack; a kernel task's stack.
         l.str(b"  ");
+        right(&mut l, t.frames * PAGE / 1024, 4);
+        l.str(b" KiB  ");
         let d = t.detail;
         match t.what {
             TASK_RUNNING => l.str(b"running"),
@@ -781,6 +785,21 @@ fn mem() {
     l.str(b"memory: ").dec(mib(sys.free_frames)).str(b" MiB free of ").dec(mib(sys.usable_frames));
     l.str(b" MiB usable (").dec(sys.free_frames).str(b" of ").dec(sys.usable_frames).str(b" pages of 4 KiB)\n");
     say(l.as_bytes());
+    // What the rest is doing (Entry 29), in KiB.
+    let rows: [(&[u8], &[(usize, &[u8])]); 3] = [
+        (b"  kernel:   ", &[(FRAMES_KERNEL_IMAGE, b"image"), (FRAMES_KERNEL_HEAP, b"heap"), (FRAMES_KERNEL_STACK, b"stacks"), (FRAMES_PAGE_TABLE, b"page tables")]),
+        (b"  programs: ", &[(FRAMES_PROCESS_CODE, b"code"), (FRAMES_PROCESS_DATA, b"data"), (FRAMES_PROCESS_STACK, b"stacks"), (FRAMES_PROCESS_HEAP, b"heaps")]),
+        (b"  reserved: ", &[(FRAMES_FIRMWARE, b"low memory, firmware and gaps"), (FRAMES_ALLOCATOR, b"the frame allocator's bitmap and table")]),
+    ];
+    for (title, kinds) in rows {
+        let mut l = Line::<120>::new();
+        l.str(title);
+        for (i, &(k, name)) in kinds.iter().enumerate() {
+            l.str(if i == 0 { b"" } else { b", " }).str(name).str(b" ").dec(sys.frames[k] * PAGE / 1024).str(b" KiB");
+        }
+        l.str(b"\n");
+        say(l.as_bytes());
+    }
 }
 
 fn power_off_or_restart(action: u64, what: &[u8]) {

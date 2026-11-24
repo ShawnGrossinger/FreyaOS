@@ -386,17 +386,18 @@ fn cpuid(leaf: u32) -> (u32, u32) {
 /// Call after map_physical_memory() and pmm::init(). Temporarily
 /// allocates every free frame below 8 MiB (about 7 MiB).
 pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
+    use crate::pmm::{self, Kind, Owner};
     use crate::{serial_write_hex as hex, serial_write_str as s, serial_write_u64 as dec};
 
     let mut ok = true;
 
     // --- 1. alias ---
-    let alias_ok = match crate::pmm::alloc_frame() {
-        Some(frame) => {
-            let frame = frame as u64;
+    let alias_ok = match pmm::alloc(Kind::Test, Owner::Kernel) {
+        Some(held) => {
+            let frame = held.phys();
             phys_to_virt(frame).write_volatile(0x5A);
             let seen = (frame as *const u8).read_volatile(); // identity view
-            crate::pmm::free_frame(frame as usize);
+            held.free();
             seen == 0x5A
         }
         None => false,
@@ -409,8 +410,10 @@ pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
     let mut count: u64 = 0;
     let mut all_zeroed = true;
     let mut high_frame: u64 = 0;
-    while let Some(frame) = crate::pmm::alloc_frame() {
-        let frame = frame as u64;
+    // Each frame is stored by address in the one before (into_phys), and
+    // taken back by address at the end (reclaim).
+    while let Some(held) = pmm::alloc(Kind::Test, Owner::Kernel) {
+        let frame = held.into_phys();
         let words = phys_to_virt(frame) as *mut u64;
         for i in 0..(PAGE_SIZE as usize / 8) {
             if words.add(i).read_volatile() != 0 {
@@ -427,7 +430,7 @@ pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
     }
     while chain != 0 {
         let next = (phys_to_virt(chain) as *const u64).read_volatile();
-        crate::pmm::free_frame(chain as usize);
+        pmm::Frame::reclaim(chain, Kind::Test.bit(), Owner::Kernel).free();
         chain = next;
     }
     let alloc_ok = high_frame != 0 && all_zeroed;

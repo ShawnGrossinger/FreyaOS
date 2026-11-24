@@ -30,7 +30,7 @@
 //!   0x0000_7FFF_0000_0000  top of the stack, read + write (16 KiB below)
 
 use crate::cap::{Caps, CONSOLE_ONLY, MAX_CAPS, NO_CAPS};
-use crate::pmm::{self, PAGE_SIZE};
+use crate::pmm::{self, Kind, Owner, PAGE_SIZE};
 use crate::sched::{self, ExitStatus, SpawnError, TaskId};
 use crate::vmm::{AddressSpace, PageFlags};
 
@@ -214,19 +214,21 @@ pub fn spawn_signalling(
 /// belongs to the address space: if this fails part-way, destroy() frees
 /// what was mapped.
 unsafe fn load(space: &mut AddressSpace, image: &[u8], data_pages: u64) -> Result<(), ()> {
-    let mut map_new = |va: u64, flags: PageFlags, src: &[u8]| -> Result<(), ()> {
-        let frame = pmm::alloc_frame().ok_or(())? as u64; // arrives zeroed
-        core::ptr::copy_nonoverlapping(src.as_ptr(), crate::paging::phys_to_virt(frame), src.len());
-        space.map(va, frame, flags).map_err(|_| pmm::free_frame(frame as usize))
+    // Each page belongs to the process being built until its task has an
+    // id (Owner::Unassigned; sched::spawn hands them over: Entry 29).
+    let mut map_new = |va: u64, kind: Kind, flags: PageFlags, src: &[u8]| -> Result<(), ()> {
+        let frame = pmm::alloc(kind, Owner::Unassigned).ok_or(())?; // arrives zeroed
+        core::ptr::copy_nonoverlapping(src.as_ptr(), crate::paging::phys_to_virt(frame.phys()), src.len());
+        space.map_frame(va, frame, flags).map_err(|(_, frame)| frame.free())
     };
     for (i, chunk) in image.chunks(PAGE_SIZE as usize).enumerate() {
-        map_new(USER_CODE_BASE + i as u64 * PAGE_SIZE, PageFlags::USER_CODE, chunk)?;
+        map_new(USER_CODE_BASE + i as u64 * PAGE_SIZE, Kind::ProcessCode, PageFlags::USER_CODE, chunk)?;
     }
     for i in 0..data_pages {
-        map_new(USER_DATA_BASE + i * PAGE_SIZE, PageFlags::USER_DATA, &[])?;
+        map_new(USER_DATA_BASE + i * PAGE_SIZE, Kind::ProcessData, PageFlags::USER_DATA, &[])?;
     }
     for i in 1..=USER_STACK_PAGES {
-        map_new(USER_STACK_TOP - i * PAGE_SIZE, PageFlags::USER_DATA, &[])?;
+        map_new(USER_STACK_TOP - i * PAGE_SIZE, Kind::ProcessStack, PageFlags::USER_DATA, &[])?;
     }
     Ok(())
 }
@@ -368,10 +370,10 @@ fn selftest_memory() -> bool {
     use crate::mem::{MAP_BASE, MAP_END};
     const PATTERN: u64 = 0x0123_4567_89AB_CDEF;
     const WRITTEN: u64 = 0x5EED_5EED_5EED_5EED; // what probe's map_write stores
-    let Some(page) = (unsafe { pmm::alloc_frame() }) else {
+    let Some(frame) = pmm::alloc(Kind::Test, Owner::Kernel) else {
         return crate::selftest::check(b"user", b"a frame for the memory capability tests", false);
     };
-    let page = page as u64;
+    let page = frame.phys();
     let word = crate::paging::phys_to_virt(page) as *mut u64;
     unsafe { word.write_volatile(PATTERN) };
     let ro = Cap::Memory { base: page, pages: 1, flags: 0 };
@@ -405,7 +407,7 @@ fn selftest_memory() -> bool {
         b"map refused with no capability or the console's, misaligned, below or past the window, or over a mapping; the page is still the kernel's after them all",
         no_cap && console && misaligned && below && past && twice && kept,
     );
-    unsafe { pmm::free_frame(page as usize) };
+    frame.free();
     ok
 }
 
@@ -479,6 +481,28 @@ pub fn selftest() -> bool {
     dec(written);
     s(b" bytes and exited with that count");
     ok &= verdict(written > 0 && hello == Some(ExitStatus::Code(written)));
+
+    // 2b. Its frames are its own (Entry 29): a process that has ended but
+    //     isn't reaped yet still owns its pages, page tables and kernel
+    //     stack (far more than the stack's 4 pages), none is left with a
+    //     process being built, and once reaped it owns nothing.
+    ok &= match started(spawn(&HELLO, 0, NO_CAPS)) {
+        Some(id) => {
+            let ended = sched::join_timeout(id, WAIT_TICKS).is_some();
+            let owned = pmm::frames_owned_by(id as u8);
+            let unowned = pmm::frames_being_built();
+            sched::reap();
+            let after = pmm::frames_owned_by(id as u8);
+            s(b"[user] self-test a process's frames are its own: hello owned ");
+            dec(owned);
+            s(b" (its pages, page tables and kernel stack), ");
+            dec(unowned);
+            s(b" were left with no task; reaped, it owns ");
+            dec(after);
+            verdict(ended && owned > 8 && unowned == 0 && after == 0)
+        }
+        None => false,
+    };
 
     // 3. Without it, the same program is refused: no ambient authority.
     let refused = run(&HELLO, 0, NO_CAPS);

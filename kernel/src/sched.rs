@@ -44,7 +44,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::cpu::without_interrupts;
-use crate::pmm::{self, PAGE_SIZE};
+use crate::pmm::{self, Kind, Owner, PAGE_SIZE};
 use crate::cap::{self, Cap, Caps, NO_CAPS};
 use crate::ipc::{Message, EMPTY_MESSAGE};
 use crate::vmm::{AddressSpace, PageFlags};
@@ -314,22 +314,28 @@ pub fn spawn_in_signalling(
         Some((id, generations()[id]))
     })
     .ok_or(SpawnError::TableFull)?;
+    let owner = Owner::Task { id: id as u8, generation };
 
-    // Map the stack. Interrupts can stay on: pmm and vmm protect themselves.
+    // A process's address space was built before it had a task: its
+    // frames become the task's now (Entry 29).
+    if space != 0 {
+        unsafe { AddressSpace::from_root(space).adopt(owner) };
+    }
+
+    // Map the stack, the task's own. Interrupts can stay on: pmm and vmm
+    // protect themselves.
     let mut kernel = AddressSpace::kernel();
     for page in 0..STACK_PAGES {
         let va = stack_bottom(id) + page * PAGE_SIZE;
-        let mapped = unsafe {
-            match pmm::alloc_frame() {
-                Some(frame) => {
-                    let ok = kernel.map(va, frame as u64, PageFlags::KERNEL_DATA).is_ok();
-                    if !ok {
-                        pmm::free_frame(frame);
-                    }
-                    ok
+        let mapped = match pmm::alloc(Kind::KernelStack, owner) {
+            Some(frame) => match unsafe { kernel.map_frame(va, frame, PageFlags::KERNEL_DATA) } {
+                Ok(()) => true,
+                Err((_, frame)) => {
+                    frame.free();
+                    false
                 }
-                None => false,
-            }
+            },
+            None => false,
         };
         if !mapped {
             unsafe { free_stack_pages(id, page) };
@@ -378,12 +384,14 @@ pub fn spawn_in_signalling(
     Ok((id, generation))
 }
 
-/// Unmap and free the first `pages` stack pages of task `id`.
+/// Unmap and free the first `pages` stack pages of task `id`: each must be
+/// a kernel stack of the task in that slot now (Entry 29).
 unsafe fn free_stack_pages(id: TaskId, pages: u64) {
     let mut kernel = AddressSpace::kernel();
+    let owner = Owner::Task { id: id as u8, generation: generations()[id] };
     for page in 0..pages {
-        if let Ok(frame) = kernel.unmap(stack_bottom(id) + page * PAGE_SIZE) {
-            pmm::free_frame(frame as usize);
+        if let Ok(frame) = kernel.unmap_frame(stack_bottom(id) + page * PAGE_SIZE, Kind::KernelStack.bit(), owner) {
+            frame.free();
         }
     }
 }
@@ -470,6 +478,15 @@ pub fn reap() -> usize {
                 crate::ipc::release(ep);
             }
             table()[id] = EMPTY;
+            // Everything a task owned goes with it (Entry 29): say so if not.
+            let left = pmm::frames_owned_by(id as u8);
+            if left != 0 {
+                crate::serial_write_str(b"[pmm] task ");
+                crate::serial_write_u64(id as u64);
+                crate::serial_write_str(b" was reaped still owning ");
+                crate::serial_write_u64(left);
+                crate::serial_write_str(b" frames\n");
+            }
             1
         });
     }
@@ -649,6 +666,12 @@ pub fn current_cap(handle: u64) -> Cap {
         let caps = &table()[current_id()].caps;
         caps.get(handle as usize).copied().unwrap_or(Cap::None)
     })
+}
+
+/// Does slot `id` still hold its `generation`th task, running or ended but
+/// not yet reaped? (pmm's check that no frame outlives its owner: Entry 29.)
+pub fn slot_holds(id: TaskId, generation: u32) -> bool {
+    id < MAX_TASKS && without_interrupts(|| generations()[id] == generation && table()[id].state != State::Free)
 }
 
 /// The root of task `id`'s address space (0: a kernel task's, or none).
@@ -953,23 +976,24 @@ fn alloc_task(index: u64) {
         let size = 64 + (rounds % 8) as usize * 64;
         let layout = Layout::from_size_align(size, 16).unwrap_or(Layout::new::<u64>());
         unsafe {
-            let Some(frame) = pmm::alloc_frame() else {
+            let Some(held) = pmm::alloc(Kind::Test, Owner::Kernel) else {
                 errors += 1;
                 break;
             };
+            let frame = held.phys();
             let va = ALLOC_TEST_VA + index * PAGE_SIZE;
             let mut kernel = AddressSpace::kernel();
-            if kernel.map(va, frame as u64, PageFlags::KERNEL_DATA).is_err() {
-                pmm::free_frame(frame);
+            if kernel.map(va, frame, PageFlags::KERNEL_DATA).is_err() {
+                held.free();
                 errors += 1;
                 break;
             }
             let page = va as *mut u64;
-            let check = crate::paging::phys_to_virt(frame as u64) as *const u64;
+            let check = crate::paging::phys_to_virt(frame) as *const u64;
             let block = crate::heap::GLOBAL.alloc(layout) as *mut u64;
             if block.is_null() {
                 let _ = kernel.unmap(va);
-                pmm::free_frame(frame);
+                held.free();
                 errors += 1;
                 break;
             }
@@ -989,10 +1013,10 @@ fn alloc_task(index: u64) {
                 errors += 1;
             }
             crate::heap::GLOBAL.dealloc(block as *mut u8, layout);
-            if kernel.unmap(va) != Ok(frame as u64) {
+            if kernel.unmap(va) != Ok(frame) {
                 errors += 1;
             }
-            pmm::free_frame(frame);
+            held.free();
         }
         rounds += 1;
     }

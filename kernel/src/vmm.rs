@@ -49,7 +49,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::paging::{self, ADDR_MASK, HUGE, NO_EXECUTE, PRESENT, USER, WRITABLE};
-use crate::pmm::{self, PAGE_SIZE};
+use crate::pmm::{self, Frame, Kind, Owner, Typed, PAGE_SIZE};
 
 /// Start of the kernel's dynamic mapping region.
 pub const KERNEL_DYNAMIC_BASE: u64 = 0xFFFF_C000_0000_0000;
@@ -306,12 +306,14 @@ impl AddressSpace {
     /// space yet. Costs two frames (its PML4 and its lower-half PDPT).
     pub fn new_user() -> Result<AddressSpace, MapError> {
         crate::cpu::without_interrupts(|| unsafe {
-            let pml4 = pmm::alloc_frame().ok_or(MapError::OutOfMemory)? as u64;
-            let Some(pdpt) = pmm::alloc_frame() else {
-                pmm::free_frame(pml4 as usize);
+            // A process being built owns them until its task has an id
+            // (adopt(); Entry 29).
+            let pml4 = pmm::alloc(Kind::PageTable, Owner::Unassigned).ok_or(MapError::OutOfMemory)?;
+            let Some(pdpt) = pmm::alloc(Kind::PageTable, Owner::Unassigned) else {
+                pml4.free();
                 return Err(MapError::OutOfMemory);
             };
-            let pdpt = pdpt as u64;
+            let (pml4, pdpt) = (pml4.into_phys(), pdpt.into_phys());
             let kernel = table(paging::kernel_root());
             let (new_pml4, new_pdpt) = (table(pml4), table(pdpt));
             for i in 256..ENTRIES {
@@ -330,6 +332,9 @@ impl AddressSpace {
 
     /// Free every user page, every table of the user half and the PML4.
     /// Leaves the shared parts alone: the kernel half and the low 1 GiB.
+    /// Every frame freed must be one of a process's pages or tables and
+    /// belong to this address space's owner, or the kernel halts (Entry
+    /// 29): a space never frees what isn't its own.
     ///
     /// # Safety
     /// Must be a user address space that no task will use again. It must
@@ -338,6 +343,9 @@ impl AddressSpace {
         if self.is_kernel() || self.root == active_root() {
             fatal(b"destroy of the kernel's or the active address space, root ", self.root);
         }
+        let owner = self.owner();
+        let give_back = |phys: u64, kinds: u32| Frame::reclaim(phys, kinds, owner).free();
+        let table_kind = Kind::PageTable.bit();
         crate::cpu::without_interrupts(|| {
             let pml4 = table(self.root);
             for i in 0..256 {
@@ -361,17 +369,97 @@ impl AddressSpace {
                         for l in 0..ENTRIES {
                             let e1 = *table(pt).add(l);
                             if e1 & PRESENT != 0 && e1 & BORROWED == 0 {
-                                pmm::free_frame((e1 & ADDR_MASK) as usize);
+                                give_back(e1 & ADDR_MASK, pmm::PROCESS_PAGES);
                             }
                         }
-                        pmm::free_frame(pt as usize);
+                        give_back(pt, table_kind);
                     }
-                    pmm::free_frame(pd as usize);
+                    give_back(pd, table_kind);
                 }
-                pmm::free_frame(pdpt as usize);
+                give_back(pdpt, table_kind);
             }
-            pmm::free_frame(self.root as usize);
+            give_back(self.root, table_kind);
             USER_SPACES.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+
+    /// Who this address space's frames belong to (Entry 29): the kernel's
+    /// own, the kernel; a process's, whoever its PML4's record names.
+    pub fn owner(&self) -> Owner {
+        if self.is_kernel() {
+            Owner::Kernel
+        } else {
+            pmm::record(self.root).owner()
+        }
+    }
+
+    /// Map a frame the mapping will hold from now on: the page table keeps
+    /// it by address, and unmap_frame() gives it back. If it can't be
+    /// mapped, the frame comes back with the error.
+    ///
+    /// # Safety
+    /// As map().
+    pub unsafe fn map_frame(&mut self, virt: u64, frame: Frame<Typed>, flags: PageFlags) -> Result<(), (MapError, Frame<Typed>)> {
+        match self.map(virt, frame.phys(), flags) {
+            Ok(()) => {
+                let _stored = frame.into_phys();
+                Ok(())
+            }
+            Err(e) => Err((e, frame)),
+        }
+    }
+
+    /// Unmap a page whose frame the mapping held (map_frame), and take the
+    /// frame back: the kernel halts unless it is one of `kinds` and belongs
+    /// to `owner` (pmm::Frame::reclaim).
+    ///
+    /// # Safety
+    /// As unmap().
+    pub unsafe fn unmap_frame(&mut self, virt: u64, kinds: u32, owner: Owner) -> Result<Frame<Typed>, UnmapError> {
+        let phys = self.unmap(virt)?;
+        Ok(Frame::reclaim(phys, kinds, owner))
+    }
+
+    /// Hand every frame of a process being built to `owner`, the task now
+    /// made for it (sched::spawn; Entry 29): its PML4, the tables of its
+    /// user half, and its pages. Borrowed pages stay whose they were.
+    ///
+    /// # Safety
+    /// A user address space whose frames still belong to Owner::Unassigned.
+    pub unsafe fn adopt(&self, owner: Owner) {
+        crate::cpu::without_interrupts(|| {
+            let pml4 = table(self.root);
+            for i in 0..256 {
+                let e4 = *pml4.add(i);
+                if e4 & PRESENT == 0 {
+                    continue;
+                }
+                let pdpt = e4 & ADDR_MASK;
+                for j in 0..ENTRIES {
+                    let e3 = *table(pdpt).add(j);
+                    if (i == 0 && j == 0) || e3 & PRESENT == 0 {
+                        continue; // the shared low 1 GiB, or nothing
+                    }
+                    let pd = e3 & ADDR_MASK;
+                    for k in 0..ENTRIES {
+                        let e2 = *table(pd).add(k);
+                        if e2 & PRESENT == 0 {
+                            continue;
+                        }
+                        let pt = e2 & ADDR_MASK;
+                        for l in 0..ENTRIES {
+                            let e1 = *table(pt).add(l);
+                            if e1 & PRESENT != 0 && e1 & BORROWED == 0 {
+                                pmm::adopt(e1 & ADDR_MASK, owner);
+                            }
+                        }
+                        pmm::adopt(pt, owner);
+                    }
+                    pmm::adopt(pd, owner);
+                }
+                pmm::adopt(pdpt, owner);
+            }
+            pmm::adopt(self.root, owner);
         });
     }
 
@@ -455,8 +543,9 @@ impl AddressSpace {
                     // when they were made, and would never see this one.
                     fatal(b"new kernel-half PML4 entry after user address spaces copied the kernel half, address ", virt);
                 }
-                let new = match pmm::alloc_frame() {
-                    Some(frame) => frame as u64, // already zeroed
+                // A table belongs to whoever the address space does.
+                let new = match pmm::alloc(Kind::PageTable, self.owner()) {
+                    Some(frame) => frame.into_phys(), // already zeroed
                     None => return Err(MapError::OutOfMemory),
                 };
                 *entry = new | table_bits;
@@ -481,7 +570,8 @@ impl AddressSpace {
     }
 
     /// Remove the 4 KiB mapping at `virt` and return the frame it pointed
-    /// to. The frame is NOT freed: whoever owns it decides that.
+    /// to. The frame is NOT freed: whoever owns it decides that
+    /// (unmap_frame() takes it back for them, checked).
     ///
     /// Page tables that become empty are freed, except the PML4 and the
     /// PDPTs directly under it. Those stay, so that kernel-half PML4
@@ -538,7 +628,7 @@ impl AddressSpace {
                 break;
             }
             *parent = 0;
-            pmm::free_frame(child as usize);
+            Frame::reclaim(child, Kind::PageTable.bit(), self.owner()).free();
             child = *parents[(level + 1) as usize] & ADDR_MASK;
         }
 
@@ -661,13 +751,11 @@ pub unsafe fn selftest() -> bool {
     }
 
     // --- 1. map, translate, alias ---
-    let frame = match pmm::alloc_frame() {
-        Some(f) => f as u64,
-        None => {
-            check(&mut ok, b"(no frame to test with)", false);
-            return false;
-        }
+    let Some(test_frame) = pmm::alloc(Kind::Test, Owner::Kernel) else {
+        check(&mut ok, b"(no frame to test with)", false);
+        return false;
     };
+    let frame = test_frame.phys();
     let mapped = ks.map(va, frame, PageFlags::KERNEL_DATA).is_ok();
     let translated = ks.translate(va) == Some(frame) && ks.translate(va + 0x123) == Some(frame + 0x123);
     (va as *mut u64).write_volatile(0xF4E7_A0C0_DE00_0001);
@@ -719,19 +807,19 @@ pub unsafe fn selftest() -> bool {
     let returned = ks.unmap(va);
     check(&mut ok, b"unmap returns the frame, translate then finds nothing",
           returned == Ok(frame) && ks.translate(va).is_none());
-    pmm::free_frame(frame as usize);
+    test_frame.free();
 
     // --- 5. a full cycle leaves nothing behind ---
     // The first cycle created the PDPT for the dynamic region, which stays
     // by design. From here on, map + unmap must return every page-table
     // frame it took.
     let before = pmm::free_frames();
-    let residue_ok = match pmm::alloc_frame() {
-        Some(f) => {
-            let f = f as u64;
+    let residue_ok = match pmm::alloc(Kind::Test, Owner::Kernel) {
+        Some(frame) => {
+            let f = frame.phys();
             let far = va + 0x4000_0000; // different GiB: needs a new PD and PT
             let cycle = ks.map(far, f, PageFlags::KERNEL_DATA).is_ok() && ks.unmap(far) == Ok(f);
-            pmm::free_frame(f as usize);
+            frame.free();
             cycle && pmm::free_frames() == before
         }
         None => false,
@@ -742,9 +830,9 @@ pub unsafe fn selftest() -> bool {
     // Two views of one frame: write the bytes through the physical map
     // (writable, no-execute), run them through a KERNEL_CODE mapping
     // (read-only, executable). Neither view is both writable and executable.
-    let code_ok = match pmm::alloc_frame() {
-        Some(f) => {
-            let f = f as u64;
+    let code_ok = match pmm::alloc(Kind::Test, Owner::Kernel) {
+        Some(frame) => {
+            let f = frame.phys();
             let code: [u8; 6] = [0xB8, 42, 0, 0, 0, 0xC3]; // mov eax, 42 ; ret
             for (i, byte) in code.iter().enumerate() {
                 paging::phys_to_virt(f).add(i).write_volatile(*byte);
@@ -760,7 +848,7 @@ pub unsafe fn selftest() -> bool {
                 0
             };
             let unmapped = ks.unmap(code_va) == Ok(f);
-            pmm::free_frame(f as usize);
+            frame.free();
             mapped && shape_ok && result == 42 && unmapped
         }
         None => false,
@@ -795,16 +883,18 @@ pub unsafe fn selftest() -> bool {
     // Where user pages may go: only user space, only in a user address
     // space; and nothing but user pages there.
     let before = pmm::free_frames();
-    let regions_ok = match (AddressSpace::new_user(), pmm::alloc_frame()) {
-        (Ok(mut us), Some(frame)) => {
-            let frame = frame as u64;
+    // The page is what a process's code page is: the space's own (Entry 29),
+    // so destroy() takes it back with the rest.
+    let regions_ok = match (AddressSpace::new_user(), pmm::alloc(Kind::ProcessCode, Owner::Unassigned)) {
+        (Ok(mut us), Some(code_page)) => {
+            let frame = code_page.phys();
             let refused = ks.map(USER_BASE, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
                 && us.map(KERNEL_DYNAMIC_BASE, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
                 && us.map(0x10_0000, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
                 && us.map(USER_END, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
                 && us.map(USER_BASE, frame, PageFlags::KERNEL_DATA) == Err(MapError::WrongRegion)
                 && us.unmap(KERNEL_DYNAMIC_BASE) == Err(UnmapError::WrongRegion);
-            let accepted = us.map(USER_BASE, frame, PageFlags::USER_CODE).is_ok()
+            let accepted = us.map_frame(USER_BASE, code_page, PageFlags::USER_CODE).map_err(|(_, f)| f.free()).is_ok()
                 && us.user_page(USER_BASE, false) == Some(frame)
                 && us.user_page(USER_BASE, true).is_none(); // code is read-only
             // The kernel half and the low 1 GiB are there, the low 1 GiB
@@ -825,7 +915,7 @@ pub unsafe fn selftest() -> bool {
         }
         (Err(_), frame) => {
             if let Some(f) = frame {
-                pmm::free_frame(f);
+                f.free();
             }
             false
         }
@@ -853,8 +943,8 @@ pub unsafe fn selftest() -> bool {
 pub unsafe fn demo_use_after_unmap() {
     let mut ks = AddressSpace::kernel();
     let va = KERNEL_DYNAMIC_BASE + 0x10_0000;
-    if let Some(f) = pmm::alloc_frame() {
-        let _ = ks.map(va, f as u64, PageFlags::KERNEL_DATA);
+    if let Some(f) = pmm::alloc(Kind::Test, Owner::Kernel) {
+        let _ = ks.map(va, f.into_phys(), PageFlags::KERNEL_DATA);
         core::ptr::write_volatile(va as *mut u8, 1); // TLB now holds va
         let _ = ks.unmap(va);
         core::ptr::read_volatile(va as *const u8);
@@ -865,8 +955,8 @@ pub unsafe fn demo_use_after_unmap() {
 pub unsafe fn demo_write_read_only() {
     let mut ks = AddressSpace::kernel();
     let va = KERNEL_DYNAMIC_BASE + 0x10_0000;
-    if let Some(f) = pmm::alloc_frame() {
-        let _ = ks.map(va, f as u64, PageFlags::KERNEL_RODATA);
+    if let Some(f) = pmm::alloc(Kind::Test, Owner::Kernel) {
+        let _ = ks.map(va, f.into_phys(), PageFlags::KERNEL_RODATA);
         core::ptr::write_volatile(va as *mut u8, 1);
     }
 }

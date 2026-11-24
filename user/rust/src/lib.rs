@@ -603,9 +603,27 @@ pub fn holds(slot: u64, kind: i64) -> bool {
     matches!(cap_info(slot), Ok((k, ..)) if k == kind)
 }
 
-/// The snapshot's header, and one record per task after it.
-pub const INFO_HEADER: usize = 64;
-pub const INFO_RECORD: usize = 48;
+/// The snapshot's header, and one record per task after it (version 2,
+/// Entry 29: the header ends with the frames of each kind, and each record
+/// with the frames its task owns).
+pub const INFO_HEADER: usize = 64 + 8 * FRAME_KINDS;
+pub const INFO_RECORD: usize = 56;
+
+/// The kinds of frame the kernel counts (kernel/src/pmm.rs, Kind), in the
+/// order Info lists them. Kind 0 counts the free frames.
+pub const FRAME_KINDS: usize = 12;
+pub const FRAMES_FREE: usize = 0;
+pub const FRAMES_FIRMWARE: usize = 1;
+pub const FRAMES_KERNEL_IMAGE: usize = 2;
+pub const FRAMES_ALLOCATOR: usize = 3;
+pub const FRAMES_PAGE_TABLE: usize = 4;
+pub const FRAMES_KERNEL_STACK: usize = 5;
+pub const FRAMES_KERNEL_HEAP: usize = 6;
+pub const FRAMES_PROCESS_CODE: usize = 7;
+pub const FRAMES_PROCESS_DATA: usize = 8;
+pub const FRAMES_PROCESS_STACK: usize = 9;
+pub const FRAMES_PROCESS_HEAP: usize = 10;
+pub const FRAMES_TEST: usize = 11;
 
 /// What a task is doing (TaskInfo::what).
 pub const TASK_RUNNING: u32 = 1;
@@ -631,6 +649,8 @@ pub struct SystemInfo {
     pub usable_frames: u64,
     pub switches: u64,
     pub syscalls: u64,
+    /// Frames of each kind (FRAMES_*).
+    pub frames: [u64; FRAME_KINDS],
 }
 
 pub struct TaskInfo {
@@ -642,6 +662,9 @@ pub struct TaskInfo {
     pub slices: u64,
     pub caps: u32,
     pub flags: u32,
+    /// Frames of memory the task owns: for a process, its code, data,
+    /// stacks, heaps and page tables (Entry 29).
+    pub frames: u64,
 }
 
 impl TaskInfo {
@@ -668,8 +691,12 @@ pub fn info(slot: u64, buf: &mut [u8]) -> Result<SystemInfo, i64> {
     if n < 0 {
         return Err(n);
     }
-    if n < INFO_HEADER as i64 || &buf[..8] != b"FREYAINF" || u32_at(buf, 8) != 1 {
+    if n < INFO_HEADER as i64 || &buf[..8] != b"FREYAINF" || u32_at(buf, 8) != 2 {
         return Err(ERR_BAD_ARGUMENT);
+    }
+    let mut frames = [0u64; FRAME_KINDS];
+    for (k, n) in frames.iter_mut().enumerate() {
+        *n = u64_at(buf, 64 + 8 * k);
     }
     Ok(SystemInfo {
         tasks: u32_at(buf, 12) as usize,
@@ -679,6 +706,7 @@ pub fn info(slot: u64, buf: &mut [u8]) -> Result<SystemInfo, i64> {
         usable_frames: u64_at(buf, 40),
         switches: u64_at(buf, 48),
         syscalls: u64_at(buf, 56),
+        frames,
     })
 }
 
@@ -700,6 +728,7 @@ pub fn task_info(buf: &[u8], i: usize) -> TaskInfo {
         slices: u64_at(r, 32),
         caps: u32_at(r, 40),
         flags: u32_at(r, 44),
+        frames: u64_at(r, 48),
     }
 }
 

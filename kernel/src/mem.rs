@@ -38,7 +38,7 @@
 
 use crate::cap::{Cap, MAX_CAPS, MEM_UNCACHED, MEM_WRITE, MEM_WRITE_COMBINING};
 use crate::cpu::without_interrupts;
-use crate::pmm::{self, PAGE_SIZE};
+use crate::pmm::{self, Kind, PAGE_SIZE};
 use crate::sched;
 use crate::syscall::{ERR_BAD_ADDRESS, ERR_BAD_ARGUMENT, ERR_NO_CAPABILITY, ERR_NO_MEMORY, ERR_OVER_BUDGET};
 use crate::vmm::{AddressSpace, MapError, PageFlags};
@@ -148,19 +148,22 @@ fn resize(slot: u64, serial: u32, target: u64) -> Result<(), i64> {
                 if !crate::cap::budget_allows(slot, n) {
                     return Err(ERR_OVER_BUDGET);
                 }
+                // Each page the process's own (Entry 29), as its space is.
+                let owner = space.owner();
                 for i in have..have + n {
-                    let frame = unsafe { pmm::alloc_frame() }.ok_or(ERR_NO_MEMORY)? as u64; // zeroed
-                    if unsafe { space.map(base + i * PAGE_SIZE, frame, PageFlags::USER_DATA) }.is_err() {
-                        unsafe { pmm::free_frame(frame as usize) };
+                    let frame = pmm::alloc(Kind::ProcessHeap, owner).ok_or(ERR_NO_MEMORY)?; // zeroed
+                    if let Err((_, frame)) = unsafe { space.map_frame(base + i * PAGE_SIZE, frame, PageFlags::USER_DATA) } {
+                        frame.free();
                         return Err(ERR_NO_MEMORY); // no frame for a page table
                     }
                     crate::cap::set_heap(slot, i + 1);
                 }
             } else if have > target {
                 let n = (have - target).min(HEAP_BATCH);
+                let owner = space.owner();
                 for i in (have - n..have).rev() {
-                    if let Ok(frame) = unsafe { space.unmap(base + i * PAGE_SIZE) } {
-                        unsafe { pmm::free_frame(frame as usize) };
+                    if let Ok(frame) = unsafe { space.unmap_frame(base + i * PAGE_SIZE, Kind::ProcessHeap.bit(), owner) } {
+                        frame.free();
                     }
                     crate::cap::set_heap(slot, i);
                 }

@@ -35,7 +35,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::pmm::{self, PAGE_SIZE};
+use crate::pmm::{self, Kind, Owner, PAGE_SIZE};
 use crate::vmm::{AddressSpace, PageFlags};
 
 /// The heap's virtual region: PML4 slot 385, right after the general
@@ -220,24 +220,23 @@ impl Heap {
         let mut mapped = 0;
         while mapped < bytes {
             let va = self.top + mapped;
-            let ok = match pmm::alloc_frame() {
-                Some(frame) => {
-                    // pmm frames arrive zeroed, as give() requires.
-                    if ks.map(va, frame as u64, PageFlags::KERNEL_DATA).is_ok() {
-                        true
-                    } else {
-                        pmm::free_frame(frame);
+            let ok = match pmm::alloc(Kind::KernelHeap, Owner::Kernel) {
+                // pmm frames arrive zeroed, as give() requires.
+                Some(frame) => match ks.map_frame(va, frame, PageFlags::KERNEL_DATA) {
+                    Ok(()) => true,
+                    Err((_, frame)) => {
+                        frame.free();
                         false
                     }
-                }
+                },
                 None => false,
             };
             if !ok {
                 // Roll back this growth step.
                 while mapped > 0 {
                     mapped -= PAGE_SIZE;
-                    if let Ok(frame) = ks.unmap(self.top + mapped) {
-                        pmm::free_frame(frame as usize);
+                    if let Ok(frame) = ks.unmap_frame(self.top + mapped, Kind::KernelHeap.bit(), Owner::Kernel) {
+                        frame.free();
                     }
                 }
                 return false;

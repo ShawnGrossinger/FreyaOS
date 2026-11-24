@@ -314,7 +314,10 @@ fn info_tests() -> u64 {
                 && sys.ticks > 0
                 && sys.free_frames > 0
                 && sys.free_frames <= sys.usable_frames
-                && me.is_some_and(|t| t.what == TASK_RUNNING && t.flags & TASK_FLAG_PROCESS != 0 && t.caps == 3)
+                && me.is_some_and(|t| t.what == TASK_RUNNING && t.flags & TASK_FLAG_PROCESS != 0 && t.caps == 3 && t.frames > 0)
+                && sys.frames[FRAMES_PROCESS_CODE] > 0
+                && sys.frames[FRAMES_KERNEL_IMAGE] > 0
+                && sys.frames[FRAMES_FREE] > 0
         }
         Err(_) => false,
     };
