@@ -32,12 +32,12 @@ been practical on ordinary hardware all along, is in the manifesto (see
 | Drivers | I/O-port, interrupt-line and memory capabilities, and interrupts delivered as signals; a console driver, a PS/2 driver (keyboard and controller) and a mouse driver, all in Rust, running as user processes, started by init |
 | Shell | A first shell in Rust: line editing with history, built-in commands (help, echo, ps with each task's memory, caps, uptime, mem by kind, restart, off), programs started and stopped (run, jobs, kill), and what it lent them taken back (revoke), holding nine capabilities and nothing else |
 | Power | Restart and switch-off through ACPI, behind a Power capability (Ctrl+Alt+Del, Ctrl+Alt+End, or the shell's restart and off) |
-| Trust | Every `unsafe` in the kernel carries the reason it is sound, and the kernel doesn't build without them; the compiler is pinned, and two builds of the same source give the same image, byte for byte |
+| Trust | Every `unsafe` in the kernel carries the reason it is sound, and the kernel doesn't build without them; state shared between tasks and interrupt handlers is reached only through a lock, and taking one twice halts the kernel, naming the line; the compiler is pinned, and two builds of the same source give the same image, byte for byte |
 | Not yet | UEFI boot, disk, network, file system, memory that grows as a program runs, multiple CPUs |
 
-Every boot runs **101 self-tests** and shows the result on screen. `make test`
-checks the disk image and every `unsafe`'s reason, and boots **40
-configurations** headless, checking each one (42 cases in all).
+Every boot runs **102 self-tests** and shows the result on screen. `make test`
+checks the disk image and every `unsafe`'s reason, and boots **41
+configurations** headless, checking each one (43 cases in all).
 
 ## Design in brief
 
@@ -91,7 +91,16 @@ configurations** headless, checking each one (42 cases in all).
   (`#![deny(unsafe_op_in_unsafe_fn)]`). `build/unsafe_check.rs` fails the
   build if one is missing, and writes the list: `make unsafe` prints it,
   counted by category (port I/O, device registers, physical memory, page
-  tables, `static mut` state, context switches, ...).
+  tables, the locks' own insides, context switches, ...).
+- **Shared state is behind a lock** (Entry 31). What tasks and interrupt
+  handlers share (the task table, the endpoints, the capabilities'
+  derivation, the frame allocator, the heap, the screen) is reached only
+  through an `IrqLock`, whose guard is the one way to the value: interrupts
+  are off while it is held, and the compiler keeps every reference inside
+  the guard's life. Taking a lock that is already held halts the kernel,
+  naming the lock and the line, where before the same mistake would have
+  been two references to one piece of memory. Only tables the CPU reads
+  itself (GDT, IDT, TSS, the boot page tables) are still `static mut`.
 - **Init decides, the kernel enforces.** At the end of boot the kernel starts
   one process, init, with every capability the drivers will need. Init mints
   narrower copies, starts the console, PS/2 and mouse drivers and the shell
@@ -168,7 +177,7 @@ is. Then, from `build/`:
 ```bash
 make            # builds out/freya-os.img (1 MiB disk image); "make build" too
 make run        # boots it in QEMU, serial output in the terminal
-make test       # every test case, headless; expect "42 passed, 0 failed"
+make test       # every test case, headless; expect "43 passed, 0 failed"
 make unsafe     # every unsafe in the kernel, with its category and reason
 make reproduce  # builds a second copy elsewhere; the two images must match
 TEXT_MODE=1 make   # an image that stays in 80x25 text mode
@@ -367,7 +376,8 @@ why. `TEXT_MODE=1 make usb DEV=/dev/sdX` writes a stick that always does.
 
 The manifesto's Phase A is done: every frame has an identity, frames are
 held as typed handles, every `unsafe` is listed with its reason, and builds
-repeat byte for byte with the pinned compiler. Next is Phase B, the kernel's
+repeat byte for byte with the pinned compiler. Entry 31 put the kernel's
+shared state behind a lock the compiler checks. Next is Phase B, the kernel's
 audit chain: a hash chain of capability changes, processes starting and
 ending, and faults, first in software, then anchored in a TPM (QEMU's
 emulated one first).

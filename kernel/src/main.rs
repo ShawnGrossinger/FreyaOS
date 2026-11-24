@@ -21,6 +21,7 @@ mod idt;
 mod info;
 mod ipc;
 mod irq;
+mod lock;
 mod log;
 mod mem;
 mod paging;
@@ -180,25 +181,24 @@ struct ScreenLog {
     line_len: usize,
 }
 
-static mut SCREEN_LOG: ScreenLog = ScreenLog {
+static SCREEN_LOG: lock::IrqLock<ScreenLog> = lock::IrqLock::new(ScreenLog {
     history: [[b' '; display::MAX_COLS]; HISTORY],
     newest: 0,
     total: 1,
     col: 0,
     line: [0; LINE_MAX],
     line_len: 0,
-};
+});
 
 fn log_rows() -> usize {
     display::rows() - LOG_TOP
 }
 
 fn screen_log_byte(b: u8) {
-    cpu::without_interrupts(|| {
-        // SAFETY: [static] interrupts are off and there is one CPU, so
-        // nothing else reaches SCREEN_LOG until this closure returns; it is
-        // reached only from these three functions, each the same way.
-        let log = unsafe { &mut *(&raw mut SCREEN_LOG) };
+    // try_lock: output on a fatal path, from inside the screen log itself,
+    // goes to the other sinks rather than halting again (Entry 31).
+    if let Some(mut guard) = SCREEN_LOG.try_lock() {
+        let log = &mut *guard;
         match b {
             b'\r' => {}
             b'\n' => {
@@ -218,7 +218,7 @@ fn screen_log_byte(b: u8) {
                 }
             }
         }
-    });
+    }
 }
 
 fn screen_log_new_row(log: &mut ScreenLog) {
@@ -250,21 +250,19 @@ fn screen_log_draw(log: &ScreenLog) {
 /// before it prints anything, so the lines that led up to the crash aren't
 /// scrolled off by the report itself.
 fn screen_log_snapshot() -> Snapshot {
-    cpu::without_interrupts(|| {
-        // SAFETY: [static] a shared reference with interrupts off on one
-        // CPU: screen_log_byte, the only writer, can't run until it's gone.
-        let log = unsafe { &*(&raw const SCREEN_LOG) };
-        let mut out = [[b' '; SNAPSHOT_COLS]; SNAPSHOT_ROWS];
-        let kept = log.total.min(HISTORY);
-        for (r, row) in out.iter_mut().enumerate() {
-            let age = SNAPSHOT_ROWS - 1 - r;
-            if age < kept {
-                let src = &log.history[(log.newest + HISTORY - age) % HISTORY];
-                row.copy_from_slice(&src[..SNAPSHOT_COLS]);
-            }
+    let mut out = [[b' '; SNAPSHOT_COLS]; SNAPSHOT_ROWS];
+    // A crash in the middle of printing leaves the lock held: then the
+    // crash screen goes without the lines before it, rather than halting.
+    let Some(log) = SCREEN_LOG.try_lock() else { return out };
+    let kept = log.total.min(HISTORY);
+    for (r, row) in out.iter_mut().enumerate() {
+        let age = SNAPSHOT_ROWS - 1 - r;
+        if age < kept {
+            let src = &log.history[(log.newest + HISTORY - age) % HISTORY];
+            row.copy_from_slice(&src[..SNAPSHOT_COLS]);
         }
-        out
-    })
+    }
+    out
 }
 
 /// Rows 0 to 17 after a fatal error, for machines with no serial port:
@@ -291,13 +289,9 @@ fn crash_screen(lines: &[&[u8]], before: &Snapshot) {
 
 /// The line printed so far (up to LINE_MAX bytes), for selftest.rs.
 fn current_line(out: &mut [u8; LINE_MAX]) -> usize {
-    cpu::without_interrupts(|| {
-        // SAFETY: [static] as in screen_log_snapshot: read with interrupts
-        // off, so the only writer can't run meanwhile.
-        let log = unsafe { &*(&raw const SCREEN_LOG) };
-        *out = log.line;
-        log.line_len
-    })
+    let log = SCREEN_LOG.lock();
+    *out = log.line;
+    log.line_len
 }
 
 /// Text at a column, leaving the rest of the row as it is.
@@ -544,6 +538,8 @@ pub extern "C" fn rust_start() -> ! {
 
     // --- Kernel heap: Box, Vec, String, BTreeMap ---
     let heap_ok = heap::selftest();
+    // The lock types every shared state now lives behind (Entry 31).
+    let heap_ok = lock::selftest() & heap_ok;
 
     // --- Smoke-test: allocate a frame and verify it is zeroed ---
     let sanitize_ok = match pmm::alloc(pmm::Kind::Test, pmm::Owner::Kernel) {
@@ -959,6 +955,8 @@ fn run_requested_demo() {
         "write_read_only" => unsafe { vmm::demo_write_read_only() },
         // [heap] FATAL: double free
         "heap_double_free" => heap::demo_double_free(),
+        // [lock] FATAL (Entry 31): a lock taken while it is already held
+        "lock_twice" => lock::demo_lock_twice(),
         // [pmm] FATAL (Entry 29): a frame dropped while held, and the
         // kernel image's first frame given back as if it were heap
         "lost_frame" => pmm::demo_lost_frame(),
@@ -996,7 +994,7 @@ fn run_requested_demo() {
         }
         _ => {
             serial_write_str(b"[demo] unknown; known: ud2 page_fault stack_overflow \
-                               task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free panic \
+                               task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free lock_twice panic \
                                kill_console kill_init kill_console_often log_flood kill_shell\n");
             return;
         }

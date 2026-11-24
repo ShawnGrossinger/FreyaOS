@@ -51,6 +51,7 @@
 
 use crate::cap::{self, Cap, GRANT, RECV, SEND};
 use crate::cpu::without_interrupts;
+use crate::lock::{IrqGuard, IrqLock};
 use crate::sched::{self, State, TaskId};
 use crate::syscall::{ERR_BAD_ARGUMENT, ERR_INTERRUPTED, ERR_NO_GRANT, ERR_NO_REPLY, ERR_PEER_GONE, ERR_WRONG_CAPABILITY};
 
@@ -92,51 +93,40 @@ impl Message {
 /// empty task) is all zero bytes; nothing reads it until deliver() sets it.
 pub const EMPTY_MESSAGE: Message = Message { badge: 0, words: [0; 4], cap: Cap::None, cap_slot: 0, cap_from: 0, cap_serial: 0 };
 
-/// References to each endpoint (capabilities naming it, plus its creator's
-/// until released). 0 = free.
-static mut REFS: [u32; MAX_ENDPOINTS] = [0; MAX_ENDPOINTS];
-
-/// Who could still receive on each endpoint: its creator (until it lets go)
-/// plus every capability to it with RECV.
-static mut RECEIVERS: [u32; MAX_ENDPOINTS] = [0; MAX_ENDPOINTS];
-
-/// Signal bits waiting on each endpoint for its next receiver.
-static mut SIGNALS: [u64; MAX_ENDPOINTS] = [0; MAX_ENDPOINTS];
-
-// Each of these hands out the whole array, so the rule that keeps them
-// sound is the callers': interrupts off (checked here), one CPU, and each
-// result used at once, never kept while another is made or across a task
-// switch. Every caller indexes it in the same expression.
-fn refs() -> &'static mut [u32; MAX_ENDPOINTS] {
-    crate::cpu::assert_interrupts_off(b"ipc refs");
-    // SAFETY: [static] interrupts off on the one CPU (just checked), and
-    // used at once by the caller, as the comment above says.
-    unsafe { &mut *(&raw mut REFS) }
+struct Endpoints {
+    /// References to each endpoint (capabilities naming it, plus its
+    /// creator's until released). 0 = free.
+    refs: [u32; MAX_ENDPOINTS],
+    /// Who could still receive on each endpoint: its creator (until it lets
+    /// go) plus every capability to it with RECV.
+    receivers: [u32; MAX_ENDPOINTS],
+    /// Signal bits waiting on each endpoint for its next receiver.
+    signals: [u64; MAX_ENDPOINTS],
 }
 
-fn receivers() -> &'static mut [u32; MAX_ENDPOINTS] {
-    crate::cpu::assert_interrupts_off(b"ipc receivers");
-    // SAFETY: [static] as refs().
-    unsafe { &mut *(&raw mut RECEIVERS) }
-}
+/// Entry 31: one lock over all three (lock.rs). Nothing here holds it
+/// while calling out (deliver can come back through cap::put to retain),
+/// or across sched::block. The operations below that take it more than
+/// once, or take it and the task table, still run inside
+/// without_interrupts, so an interrupt handler's signal() can't land
+/// between the steps.
+static ENDPOINTS: IrqLock<Endpoints> =
+    IrqLock::new(Endpoints { refs: [0; MAX_ENDPOINTS], receivers: [0; MAX_ENDPOINTS], signals: [0; MAX_ENDPOINTS] });
 
-fn signals() -> &'static mut [u64; MAX_ENDPOINTS] {
-    crate::cpu::assert_interrupts_off(b"ipc signals");
-    // SAFETY: [static] as refs().
-    unsafe { &mut *(&raw mut SIGNALS) }
+#[track_caller]
+fn endpoints() -> IrqGuard<'static, Endpoints> {
+    ENDPOINTS.lock()
 }
 
 /// A new endpoint, with one reference held by the caller: let go of it
 /// with release_created when done handing out capabilities to it.
 pub fn create() -> Option<u8> {
-    without_interrupts(|| {
-        let r = refs();
-        let ep = r.iter().position(|&n| n == 0)?;
-        r[ep] = 1;
-        receivers()[ep] = 1;
-        signals()[ep] = 0;
-        Some(ep as u8)
-    })
+    let mut e = endpoints();
+    let ep = e.refs.iter().position(|&n| n == 0)?;
+    e.refs[ep] = 1;
+    e.receivers[ep] = 1;
+    e.signals[ep] = 0;
+    Some(ep as u8)
 }
 
 /// The creator lets go of its reference (and so of its chance to hand out
@@ -148,20 +138,23 @@ pub fn release_created(ep: u8) {
 
 /// A capability with RECV to `ep` was stored in a table.
 pub fn retain_receiver(ep: u8) {
-    without_interrupts(|| receivers()[ep as usize % MAX_ENDPOINTS] += 1);
+    endpoints().receivers[ep as usize % MAX_ENDPOINTS] += 1;
 }
 
 /// One fewer who could receive on `ep`. At none, nobody ever will again:
 /// every sender waiting there wakes with ERR_PEER_GONE.
 pub fn release_receiver(ep: u8) {
     without_interrupts(|| {
-        let n = &mut receivers()[ep as usize % MAX_ENDPOINTS];
-        *n = n.saturating_sub(1);
-        if *n > 0 {
+        let left = {
+            let mut e = endpoints();
+            let n = &mut e.receivers[ep as usize % MAX_ENDPOINTS];
+            *n = n.saturating_sub(1);
+            *n
+        };
+        if left > 0 {
             return;
         }
-        for id in 0..sched::MAX_TASKS {
-            let t = sched::task(id);
+        for t in sched::tasks().iter_mut() {
             if t.state == State::Sending(ep) {
                 t.result = ERR_PEER_GONE;
                 t.state = State::Ready;
@@ -176,17 +169,17 @@ pub fn release_receiver(ep: u8) {
 pub fn signal(ep: u8, bits: u64) {
     without_interrupts(|| {
         let ep_index = ep as usize % MAX_ENDPOINTS;
-        if refs()[ep_index] == 0 {
+        if endpoints().refs[ep_index] == 0 {
             return;
         }
-        let pending = signals()[ep_index] | bits;
+        let pending = endpoints().signals[ep_index] | bits;
         match sched::oldest(|t| t.state == State::Receiving(ep)) {
             Some(receiver) => {
-                signals()[ep_index] = 0;
+                endpoints().signals[ep_index] = 0;
                 deliver(receiver, signal_message(pending));
                 sched::task(receiver).state = State::Ready;
             }
-            None => signals()[ep_index] = pending,
+            None => endpoints().signals[ep_index] = pending,
         }
     });
 }
@@ -196,24 +189,23 @@ fn signal_message(bits: u64) -> Message {
 }
 
 pub fn retain(ep: u8) {
-    without_interrupts(|| refs()[ep as usize % MAX_ENDPOINTS] += 1);
+    endpoints().refs[ep as usize % MAX_ENDPOINTS] += 1;
 }
 
 pub fn release(ep: u8) {
-    without_interrupts(|| {
-        let n = &mut refs()[ep as usize % MAX_ENDPOINTS];
-        *n = n.saturating_sub(1);
-    });
+    let mut e = endpoints();
+    let n = &mut e.refs[ep as usize % MAX_ENDPOINTS];
+    *n = n.saturating_sub(1);
 }
 
 /// References to endpoint `ep` (for the self-tests).
 pub fn refcount(ep: u8) -> u32 {
-    without_interrupts(|| refs()[ep as usize % MAX_ENDPOINTS])
+    endpoints().refs[ep as usize % MAX_ENDPOINTS]
 }
 
 /// Endpoints that exist.
 pub fn in_use() -> usize {
-    without_interrupts(|| refs().iter().filter(|&&n| n > 0).count())
+    endpoints().refs.iter().filter(|&&n| n > 0).count()
 }
 
 // ===========================================================================
@@ -252,13 +244,16 @@ fn outgoing(xfer: u64, may_grant: bool) -> Result<(Cap, cap::Origin), i64> {
 fn deliver(to: TaskId, mut msg: Message) {
     msg.cap_slot = NO_SLOT;
     if msg.cap != Cap::None {
-        if let Some(slot) = cap::free_slot(&sched::task(to).caps) {
+        // Bound first: in the `if let` below, the guard would live through
+        // its body, and cap::put takes the table again.
+        let free = cap::free_slot(&sched::task(to).caps);
+        if let Some(slot) = free {
             if cap::put(to, slot, msg.cap, msg.origin()) {
                 msg.cap_slot = slot as u64;
             }
         }
     }
-    let t = sched::task(to);
+    let mut t = sched::task(to);
     t.msg = msg;
     t.result = 0;
 }
@@ -276,12 +271,8 @@ pub fn send(slot: u64, words: [u64; 4], xfer: u64, call: bool) -> (i64, Message)
     };
     let msg = Message::with(badge, words, cap);
 
-    // SAFETY: [switch] sched::block with interrupts off (inside
-    // without_interrupts), in a state something ends: AwaitingReply by the
-    // receiver's reply, Sending(ep) by a receiver taking the message; either
-    // by kill or by the endpoint's last receiver going (ERR_PEER_GONE).
-    without_interrupts(|| unsafe {
-        if receivers()[ep as usize % MAX_ENDPOINTS] == 0 {
+    without_interrupts(|| {
+        if endpoints().receivers[ep as usize % MAX_ENDPOINTS] == 0 {
             return (ERR_PEER_GONE, EMPTY_MESSAGE); // nobody can ever receive it
         }
         let me = sched::current();
@@ -293,15 +284,23 @@ pub fn send(slot: u64, words: [u64; 4], xfer: u64, call: bool) -> (i64, Message)
                     return (0, EMPTY_MESSAGE);
                 }
                 sched::task(receiver).reply_to = Some(me);
-                sched::block(State::AwaitingReply(receiver));
+                // SAFETY: [switch] interrupts off (inside
+                // without_interrupts) and no guard held, in a state the
+                // receiver's reply ends, or kill.
+                unsafe { sched::block(State::AwaitingReply(receiver)) };
             }
             None => {
                 // Nobody waiting: offer it and wait. A receiver takes it
                 // from here (and, for a call, moves us to AwaitingReply).
-                let t = sched::task(me);
-                t.msg = msg;
-                t.calling = call;
-                sched::block(State::Sending(ep));
+                {
+                    let mut t = sched::task(me);
+                    t.msg = msg;
+                    t.calling = call;
+                }
+                // SAFETY: [switch] interrupts off and the guard above gone,
+                // in a state a receiver taking the message ends, or kill,
+                // or the endpoint's last receiver going (ERR_PEER_GONE).
+                unsafe { sched::block(State::Sending(ep)) };
             }
         }
         // Woken: delivered (send), answered (call), or interrupted.
@@ -316,26 +315,31 @@ pub fn recv(slot: u64) -> (i64, Message) {
         Ok(e) => e,
         Err(e) => return (e, EMPTY_MESSAGE),
     };
-    // SAFETY: [switch] sched::block with interrupts off, in Receiving(ep):
-    // a sender, a signal, or kill ends it.
-    without_interrupts(|| unsafe {
+    without_interrupts(|| {
         let me = sched::current();
-        let pending = core::mem::take(&mut signals()[ep as usize % MAX_ENDPOINTS]);
+        let pending = core::mem::take(&mut endpoints().signals[ep as usize % MAX_ENDPOINTS]);
         if pending != 0 {
             deliver(me, signal_message(pending));
         } else if let Some(sender) = sched::oldest(|t| t.state == State::Sending(ep)) {
-            let s = sched::task(sender);
-            let msg = s.msg;
-            if s.calling {
-                s.state = State::AwaitingReply(me);
+            let (msg, calling) = {
+                let mut s = sched::task(sender);
+                if s.calling {
+                    s.state = State::AwaitingReply(me);
+                } else {
+                    s.result = 0;
+                    s.state = State::Ready;
+                }
+                (s.msg, s.calling)
+            };
+            if calling {
                 sched::task(me).reply_to = Some(sender);
-            } else {
-                s.result = 0;
-                s.state = State::Ready;
             }
             deliver(me, msg);
         } else {
-            sched::block(State::Receiving(ep));
+            // SAFETY: [switch] interrupts off (inside without_interrupts)
+            // and no guard held, in Receiving(ep): a sender, a signal, or
+            // kill ends it.
+            unsafe { sched::block(State::Receiving(ep)) };
         }
         let t = sched::task(me);
         (t.result, t.msg)
@@ -359,7 +363,7 @@ pub fn signal_through(slot: u64) -> i64 {
         return ERR_BAD_ARGUMENT;
     }
     without_interrupts(|| {
-        if receivers()[ep as usize % MAX_ENDPOINTS] == 0 {
+        if endpoints().receivers[ep as usize % MAX_ENDPOINTS] == 0 {
             return ERR_PEER_GONE;
         }
         signal(ep, badge);
@@ -389,8 +393,7 @@ pub fn reply(words: [u64; 4], xfer: u64) -> i64 {
 
 /// sched::exit_with: task `dead` is gone; nobody will answer its callers.
 pub fn on_exit(dead: TaskId) {
-    for id in 0..sched::MAX_TASKS {
-        let t = sched::task(id);
+    for t in sched::tasks().iter_mut() {
         if t.state == State::AwaitingReply(dead) {
             t.result = ERR_PEER_GONE;
             t.state = State::Ready;
@@ -401,7 +404,7 @@ pub fn on_exit(dead: TaskId) {
 /// sched::kill: a process blocked in IPC or waiting for an interrupt wakes
 /// with ERR_INTERRUPTED, and its system call's return path ends it.
 pub fn interrupt_wait(id: TaskId) {
-    let t = sched::task(id);
+    let mut t = sched::task(id);
     // Sleeping too (Entry 25: system call sleep), so a killed process
     // doesn't sleep out its time first.
     if matches!(

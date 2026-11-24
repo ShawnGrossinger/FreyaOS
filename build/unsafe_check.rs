@@ -38,7 +38,7 @@ const CATEGORIES: &[(&str, &str)] = &[
     ("mmio",   "a device's registers, or the firmware's tables, through memory the kernel mapped for them"),
     ("phys",   "memory by physical address: frames through the physical map, and what the boot stages left at fixed addresses"),
     ("paging", "page tables: building, changing or loading them, and memory reached through a mapping just made"),
-    ("static", "kernel state in a `static mut`: one CPU, touched with interrupts off or by one task only"),
+    ("static", "shared kernel state: inside the lock types (lock.rs, sync.rs), and what makes a value safe to put in one"),
     ("heap",   "the kernel heap's allocator: its free list and the memory it hands out"),
     ("switch", "stacks and context switches, entering ring 3, and functions written in assembly"),
     ("user",   "a process's memory, read or written for a system call"),

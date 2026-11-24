@@ -14,7 +14,8 @@ static FAILED: AtomicU32 = AtomicU32::new(0);
 /// The first few failing self-test lines, repeated after the summary so
 /// they end up on screen (the T430 has no serial port to read them from).
 const KEEP: usize = 4;
-static mut FAILED_LINES: [([u8; crate::LINE_MAX], usize); KEEP] = [([0; crate::LINE_MAX], 0); KEEP];
+static FAILED_LINES: crate::lock::IrqLock<[([u8; crate::LINE_MAX], usize); KEEP]> =
+    crate::lock::IrqLock::new([([0; crate::LINE_MAX], 0); KEEP]);
 
 /// End the current serial line with the verdict and count it. Returns
 /// `pass` so callers can fold it into their own result.
@@ -24,13 +25,9 @@ pub fn verdict(pass: bool) -> bool {
         crate::serial_write_str(b": PASS\n");
     } else {
         let n = FAILED.fetch_add(1, Ordering::Relaxed) as usize;
-        crate::cpu::without_interrupts(|| {
-            // SAFETY: [static] interrupts are off on the one CPU, so no other
-            // verdict or summary can run until this closure returns.
-            if let Some(slot) = unsafe { (*(&raw mut FAILED_LINES)).get_mut(n) } {
-                slot.1 = crate::current_line(&mut slot.0);
-            }
-        });
+        if let Some(slot) = FAILED_LINES.lock().get_mut(n) {
+            slot.1 = crate::current_line(&mut slot.0);
+        }
         crate::serial_write_str(b": FAIL\n");
     }
     pass
@@ -58,13 +55,8 @@ pub fn summary() -> bool {
     crate::serial_write_str(b" passed, ");
     crate::serial_write_u64(failed as u64);
     crate::serial_write_str(b" failed\n");
-    // A copy, taken with interrupts off (as verdict writes it): printing
-    // below can be interrupted.
-    let lines = crate::cpu::without_interrupts(|| {
-        // SAFETY: [static] read with interrupts off on the one CPU, so
-        // verdict, the only writer, can't run meanwhile.
-        unsafe { *(&raw const FAILED_LINES) }
-    });
+    // A copy: printing below takes the screen log's lock.
+    let lines = *FAILED_LINES.lock();
     for (text, len) in lines.iter().take(failed as usize) {
         crate::serial_write_str(b"  FAILED: ");
         crate::serial_write_str(text.get(..*len).unwrap_or(text));

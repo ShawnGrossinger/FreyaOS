@@ -75,6 +75,30 @@ struct StartInfo {
     _reserved: u32,
 }
 
+/// The magic, then 28 u32s: the console driver reads the struct as its
+/// repr(C) layout, which has no padding.
+const START_INFO_BYTES: usize = 8 + 28 * 4;
+const _: () = assert!(core::mem::size_of::<StartInfo>() == START_INFO_BYTES);
+
+impl StartInfo {
+    /// Its bytes as repr(C) lays them out, little-endian: written field by
+    /// field, so no unsafe copy of the struct's memory is needed (Entry 31).
+    fn write_to(&self, out: &mut [u8; START_INFO_BYTES]) {
+        let mut words = [0u32; 28];
+        words[..10].copy_from_slice(&[
+            self.version, self.graphics, self.cols, self.rows, self.log_top,
+            self.panel_stride, self.width, self.height, self.pitch, self.bytes_per_pixel,
+        ]);
+        words[10..26].copy_from_slice(&self.colours);
+        words[26] = self.log_data_bytes;
+        words[27] = self._reserved;
+        out[..8].copy_from_slice(&self.magic);
+        for (i, w) in words.iter().enumerate() {
+            out[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
+        }
+    }
+}
+
 const START_MAGIC: [u8; 8] = *b"FREYACON";
 const FONT_OFFSET: usize = 0x1000;
 const DESCRIPTION_BYTES: usize = 0x2000;
@@ -83,7 +107,7 @@ const DESCRIPTION_BYTES: usize = 0x2000;
 /// lending them lends nothing else of the kernel's.
 #[repr(C, align(4096))]
 struct Description([u8; DESCRIPTION_BYTES]);
-static mut DESCRIPTION: Description = Description([0; DESCRIPTION_BYTES]);
+static DESCRIPTION: crate::lock::IrqLock<Description> = crate::lock::IrqLock::new(Description([0; DESCRIPTION_BYTES]));
 
 /// What prepare() made for the console driver, to give to init.
 pub struct ConsoleCaps {
@@ -144,17 +168,13 @@ pub fn prepare() -> Option<ConsoleCaps> {
         log_data_bytes: log::LOG_DATA_BYTES as u32,
         _reserved: 0,
     };
-    // SAFETY: [static] prepare is the only code that writes DESCRIPTION,
-    // and main calls it once, at boot, before the pages are lent to anyone.
-    let block = unsafe { &mut (*(&raw mut DESCRIPTION)).0 };
-    let size = core::mem::size_of::<StartInfo>();
-    // SAFETY: [static] copies StartInfo's 108 bytes (repr(C): eight bytes,
-    // then only u32s, so no padding to copy uninitialised) into the start
-    // of the 8 KiB block, well clear of the font at FONT_OFFSET.
-    unsafe {
-        core::ptr::copy_nonoverlapping(&info as *const StartInfo as *const u8, block.as_mut_ptr(), size);
+    {
+        let mut d = DESCRIPTION.lock();
+        let mut bytes = [0u8; START_INFO_BYTES];
+        info.write_to(&mut bytes);
+        d.0[..START_INFO_BYTES].copy_from_slice(&bytes);
+        d.0[FONT_OFFSET..FONT_OFFSET + display::font().len()].copy_from_slice(display::font());
     }
-    block[FONT_OFFSET..FONT_OFFSET + display::font().len()].copy_from_slice(display::font());
 
     SCREEN_BASE.store(screen_base, Ordering::Relaxed);
     ENDPOINT.store(ep as u32, Ordering::Relaxed);
@@ -164,7 +184,7 @@ pub fn prepare() -> Option<ConsoleCaps> {
         log: Cap::Memory { base: log::phys(), pages: log::LOG_PAGES, flags: 0 },
         panel: display::panel_memory(),
         // The kernel image is in the identity map: the address is physical.
-        description: Cap::Memory { base: (&raw const DESCRIPTION) as u64, pages: (DESCRIPTION_BYTES / 4096) as u32, flags: 0 },
+        description: Cap::Memory { base: DESCRIPTION.addr(), pages: (DESCRIPTION_BYTES / 4096) as u32, flags: 0 },
     })
 }
 

@@ -41,9 +41,10 @@
 //! is the whole locking story.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::cpu::without_interrupts;
+use crate::lock::{IrqGuard, IrqLock, IrqMapped};
 use crate::pmm::{self, Kind, Owner, PAGE_SIZE};
 use crate::cap::{self, Cap, Caps, NO_CAPS};
 use crate::ipc::{Message, EMPTY_MESSAGE};
@@ -160,8 +161,10 @@ const EMPTY: Task = Task {
 // A task's exit signal is bit (1 << id) of one 64-bit word.
 const _: () = assert!(MAX_TASKS <= 64);
 
-static mut TASKS: [Task; MAX_TASKS] = [EMPTY; MAX_TASKS];
-static mut CURRENT: TaskId = 0;
+static TASKS: IrqLock<[Task; MAX_TASKS]> = IrqLock::new([EMPTY; MAX_TASKS]);
+/// The running task: written only by schedule() and init(), with
+/// interrupts off; read anywhere.
+static CURRENT: AtomicUsize = AtomicUsize::new(0);
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static IDLE: AtomicU64 = AtomicU64::new(0); // the idle task's id, once init() ran
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
@@ -173,33 +176,36 @@ extern "C" {
     fn switch_context(save_rsp: *mut u64, load_rsp: u64);
 }
 
-/// The task table. Only touched with interrupts disabled (or, for a task's
-/// own fields, by that task), and never held across a switch.
-fn table() -> &'static mut [Task; MAX_TASKS] {
-    // SAFETY: [static] the rule above, which callers keep and the compiler
-    // doesn't check: one CPU; interrupts off (or a task's own fields, which
-    // nobody else writes); the result used and dropped before another is
-    // made, and never kept across a task switch. (Entry 30 found exit_with
-    // keeping one across calls that make their own, and fixed it.)
-    unsafe { &mut *(&raw mut TASKS) }
+/// The task table, locked (Entry 31: until then a `&'static mut` handed
+/// out on trust). Let go of it before anything that takes it again (most
+/// of this file, ipc, cap) and before a task switch: holding it into
+/// either halts, naming the line that asked again (#[track_caller] on
+/// each accessor passes the caller's line through to IrqLock::lock).
+#[track_caller]
+fn table() -> IrqGuard<'static, [Task; MAX_TASKS]> {
+    TASKS.lock()
+}
+
+/// The same, for ipc.rs, irq.rs and cap.rs.
+#[track_caller]
+pub(crate) fn tasks() -> IrqGuard<'static, [Task; MAX_TASKS]> {
+    TASKS.lock()
 }
 
 fn current_id() -> TaskId {
-    // SAFETY: [static] a plain read of a word only schedule() and init()
-    // write, both with interrupts off; on one CPU no read can see half a
-    // write.
-    unsafe { *(&raw const CURRENT) }
+    CURRENT.load(Ordering::Relaxed)
 }
 
-/// Task `id`'s entry, for ipc.rs, sync.rs and irq.rs. Interrupts must be
-/// off while it is used, and it must not be held across a switch.
-pub(crate) fn task(id: TaskId) -> &'static mut Task {
-    &mut table()[id % MAX_TASKS]
+/// Task `id`'s entry, locked (the whole table is, while it is held).
+#[track_caller]
+pub(crate) fn task(id: TaskId) -> IrqMapped<'static, Task> {
+    TASKS.lock().map(|t| &mut t[id % MAX_TASKS])
 }
 
 /// The task that has waited longest among those matching `pred`.
 pub(crate) fn oldest(pred: impl Fn(&Task) -> bool) -> Option<TaskId> {
-    (0..MAX_TASKS).filter(|&i| pred(&table()[i])).min_by_key(|&i| table()[i].wait_seq)
+    let t = table();
+    (0..MAX_TASKS).filter(|&i| pred(&t[i])).min_by_key(|&i| t[i].wait_seq)
 }
 
 /// Put the current task in waiting state `state` and run something else;
@@ -209,11 +215,13 @@ pub(crate) fn oldest(pred: impl Fn(&Task) -> bool) -> Option<TaskId> {
 /// Interrupts off. `state` must be one that something will end.
 pub(crate) unsafe fn block(state: State) {
     let me = current_id();
-    let t = &mut table()[me];
-    t.state = state;
-    t.wait_seq = WAIT_SEQ.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: [switch] interrupts are off (# Safety), and t is dead: no
-    // reference to the table is kept across the switch.
+    {
+        let mut t = table();
+        t[me].state = state;
+        t[me].wait_seq = WAIT_SEQ.fetch_add(1, Ordering::Relaxed);
+    }
+    // SAFETY: [switch] interrupts are off (# Safety), and the table's lock
+    // was let go just above.
     unsafe { schedule() };
 }
 
@@ -243,9 +251,7 @@ fn kernel_stack_top(id: TaskId) -> u64 {
 pub fn init() -> Result<(), SpawnError> {
     without_interrupts(|| {
         table()[0] = Task { state: State::Running, name: Some("boot"), slices: 1, ..EMPTY };
-        // SAFETY: [static] interrupts off, and the scheduler isn't running
-        // yet (ENABLED is false), so nothing else reads or writes CURRENT.
-        unsafe { *(&raw mut CURRENT) = 0 };
+        CURRENT.store(0, Ordering::Relaxed);
     });
     let idle = spawn("idle", idle_task, 0)?;
     IDLE.store(idle as u64, Ordering::Relaxed);
@@ -294,20 +300,17 @@ pub fn spawn_in(name: &'static str, entry: fn(u64), arg: u64, space: u64, caps: 
 /// included, so that a Process capability naming an earlier one can be
 /// told apart from whoever holds the slot now; and how the last one ended,
 /// kept after it is reaped, until the slot is used again.
-static mut GENERATIONS: [u32; MAX_TASKS] = [0; MAX_TASKS];
-static mut ENDINGS: [Option<ExitStatus>; MAX_TASKS] = [None; MAX_TASKS];
+static GENERATIONS: IrqLock<[u32; MAX_TASKS]> = IrqLock::new([0; MAX_TASKS]);
+static ENDINGS: IrqLock<[Option<ExitStatus>; MAX_TASKS]> = IrqLock::new([None; MAX_TASKS]);
 
-fn generations() -> &'static mut [u32; MAX_TASKS] {
-    crate::cpu::assert_interrupts_off(b"sched generations");
-    // SAFETY: [static] interrupts off on the one CPU (just checked), and each
-    // caller indexes the result at once and keeps nothing.
-    unsafe { &mut *(&raw mut GENERATIONS) }
+#[track_caller]
+fn generations() -> IrqGuard<'static, [u32; MAX_TASKS]> {
+    GENERATIONS.lock()
 }
 
-fn endings() -> &'static mut [Option<ExitStatus>; MAX_TASKS] {
-    crate::cpu::assert_interrupts_off(b"sched endings");
-    // SAFETY: [static] as generations().
-    unsafe { &mut *(&raw mut ENDINGS) }
+#[track_caller]
+fn endings() -> IrqGuard<'static, [Option<ExitStatus>; MAX_TASKS]> {
+    ENDINGS.lock()
 }
 
 /// spawn_in(), and when the task ends, signal endpoint `exit_signal` with
@@ -326,12 +329,13 @@ pub fn spawn_in_signalling(
     exit_signal: Option<u8>,
 ) -> Result<(TaskId, u32), SpawnError> {
     let (id, generation) = without_interrupts(|| {
-        let t = table();
+        let mut t = table();
         let id = (1..MAX_TASKS).find(|&i| t[i].state == State::Free)?;
         t[id] = Task { state: State::Creating, name: Some(name), ..EMPTY };
-        generations()[id] = generations()[id].wrapping_add(1);
+        let mut g = generations();
+        g[id] = g[id].wrapping_add(1);
         endings()[id] = None;
-        Some((id, generations()[id]))
+        Some((id, g[id]))
     })
     .ok_or(SpawnError::TableFull)?;
     let owner = Owner::Task { id: id as u8, generation };
@@ -435,10 +439,11 @@ unsafe fn free_stack_pages(id: TaskId, pages: u64) {
 
 /// Every new task starts here: switch_context `ret`s into it.
 extern "C" fn task_entry() -> ! {
-    let (entry, arg) = without_interrupts(|| {
-        let task = &table()[current_id()];
-        (task.entry, task.arg)
-    });
+    let (entry, arg) = {
+        let t = table();
+        let me = current_id();
+        (t[me].entry, t[me].arg)
+    };
     // We came from inside schedule(), which runs with interrupts off.
     // Tasks run with them on.
     // SAFETY: [cpu] a new task holds nothing yet: no lock, no reference to
@@ -463,15 +468,17 @@ pub fn exit_with(status: ExitStatus) -> ! {
     // never comes back: they stay off for the rest of this task's life.
     unsafe { asm!("cli", options(nomem, nostack)) };
     let me = current_id();
-    let t = table();
-    t[me].state = State::Finished;
-    t[me].status = status;
-    endings()[me] = Some(status);
-    for task in t.iter_mut() {
-        if matches!(task.state, State::Joining(id, _) if id == me) {
-            task.state = State::Ready;
+    {
+        let mut t = table();
+        t[me].state = State::Finished;
+        t[me].status = status;
+        for task in t.iter_mut() {
+            if matches!(task.state, State::Joining(id, _) if id == me) {
+                task.state = State::Ready;
+            }
         }
     }
+    endings()[me] = Some(status);
     crate::ipc::on_exit(me);
     crate::console::on_exit(me);
     // Its capabilities go now, not when it's reaped (Entry 25): a process
@@ -481,13 +488,12 @@ pub fn exit_with(status: ExitStatus) -> ! {
     for slot in 0..cap::MAX_CAPS {
         cap::remove(me, slot, false);
     }
-    // A fresh look at the table: ipc, console and cap have each made their
-    // own reference to it since `t` (Entry 30).
-    if let Some(ep) = table()[me].exit_signal {
+    let exit_signal = table()[me].exit_signal;
+    if let Some(ep) = exit_signal {
         crate::ipc::signal(ep, 1 << me);
     }
     // SAFETY: [switch] interrupts are off (since the cli above), and no
-    // reference to the table is kept.
+    // lock is held.
     unsafe { schedule() };
     // schedule() never picks a finished task, so this is unreachable.
     crate::halt();
@@ -561,7 +567,7 @@ unsafe fn schedule() {
     let cur = current_id();
     let idle = idle_id();
     let next = {
-        let t = table();
+        let mut t = table();
         let mut next = idle;
         for k in 1..=MAX_TASKS {
             let i = (cur + k) % MAX_TASKS;
@@ -602,17 +608,18 @@ unsafe fn schedule() {
     };
 
     SWITCHES.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: [switch] interrupts off (# Safety) and `t` is gone, so these
-    // raw accesses are the only ones to TASKS and CURRENT. switch_context
-    // (entry.asm) saves this task's callee-saved registers and stack pointer
-    // in its own entry, then resumes next from the stack pointer saved in
-    // next's: spawn laid out a new task's, and a suspended task's is what
-    // its own switch_context left.
-    unsafe {
-        *(&raw mut CURRENT) = next;
-        let tasks = &raw mut TASKS;
-        switch_context(&raw mut (*tasks)[cur].rsp, (*tasks)[next].rsp);
-    }
+    CURRENT.store(next, Ordering::Relaxed);
+    // The two saved stack pointers are reached across the switch itself,
+    // where no guard can be held (the next task would find the lock held),
+    // so by raw pointer; unheld() halts if anything holds the lock.
+    let tasks = TASKS.unheld();
+    // SAFETY: [switch] interrupts off (# Safety) and the table's lock not
+    // held (checked by unheld), so these raw accesses are the only ones to
+    // the table. switch_context (entry.asm) saves this task's callee-saved
+    // registers and stack pointer in its own entry, then resumes next from
+    // the stack pointer saved in next's: spawn laid out a new task's, and a
+    // suspended task's is what its own switch_context left.
+    unsafe { switch_context(&raw mut (*tasks)[cur].rsp, (*tasks)[next].rsp) };
     // Back: a later schedule() has picked this task again.
 }
 
@@ -672,8 +679,14 @@ pub fn join_timeout(id: TaskId, ticks: u64) -> Option<ExitStatus> {
         }
         let deadline = crate::apic::ticks().saturating_add(ticks);
         loop {
-            match table()[id].state {
-                State::Finished => return Some(table()[id].status),
+            // Copied out first: a guard made in the match's scrutinee would
+            // be held through its arms, and the first arm takes it again.
+            let (state, status) = {
+                let t = table();
+                (t[id].state, t[id].status)
+            };
+            match state {
+                State::Finished => return Some(status),
                 State::Free => return None,
                 _ if crate::apic::ticks() >= deadline => return None,
                 _ => {}
@@ -690,16 +703,21 @@ pub fn join_timeout(id: TaskId, ticks: u64) -> Option<ExitStatus> {
 /// they might be holding something. Returns false if `id` isn't a live
 /// process.
 pub fn kill(id: TaskId) -> bool {
+    if id >= MAX_TASKS {
+        return false;
+    }
     without_interrupts(|| {
-        let task = &mut table()[id % MAX_TASKS];
-        let alive = !matches!(task.state, State::Free | State::Finished | State::Creating);
-        if id < MAX_TASKS && alive && task.space != 0 {
+        {
+            let mut t = table();
+            let task = &mut t[id];
+            let alive = !matches!(task.state, State::Free | State::Finished | State::Creating);
+            if !alive || task.space == 0 {
+                return false;
+            }
             task.kill = true;
-            crate::ipc::interrupt_wait(id); // if it's blocked, wake it
-            true
-        } else {
-            false
         }
+        crate::ipc::interrupt_wait(id); // if it's blocked, wake it
+        true
     })
 }
 
@@ -735,10 +753,7 @@ pub fn current_cap(handle: u64) -> Cap {
     if handle >= cap::MAX_CAPS as u64 {
         return Cap::None;
     }
-    without_interrupts(|| {
-        let caps = &table()[current_id()].caps;
-        caps.get(handle as usize).copied().unwrap_or(Cap::None)
-    })
+    table()[current_id()].caps.get(handle as usize).copied().unwrap_or(Cap::None)
 }
 
 /// Does slot `id` still hold its `generation`th task, running or ended but

@@ -4,3 +4,5 @@ user/rust/target/
 *.patch
 # A saved terminal session, kept beside the code (Entry 19).
 Terminal-Log
+# LibreOffice keeps one of these beside a document while it is open (Entry 31).
+.~lock.*#

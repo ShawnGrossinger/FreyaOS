@@ -34,6 +34,7 @@
 
 use crate::boot::{self, DisplayInfo};
 use crate::cpu;
+use crate::lock::{BootCell, IrqGuard, IrqLock};
 
 pub const MAX_COLS: usize = 240; // 1920 pixels
 pub const MAX_ROWS: usize = 80; // 1280 pixels
@@ -79,7 +80,7 @@ struct Screen {
     drawn: [[u16; MAX_COLS]; MAX_ROWS],
 }
 
-static mut SCREEN: Screen = Screen {
+static SCREEN: IrqLock<Screen> = IrqLock::new(Screen {
     cols: TEXT_COLS,
     rows: TEXT_ROWS,
     graphics: false,
@@ -88,7 +89,7 @@ static mut SCREEN: Screen = Screen {
     write_combining: false,
     console_draws: false,
     drawn: [[0; MAX_COLS]; MAX_ROWS],
-};
+});
 
 /// What should be on screen, row by row (MAX_COLS cells a row, whatever the
 /// mode). Page-aligned and a whole number of pages: its first pages, the
@@ -97,26 +98,24 @@ static mut SCREEN: Screen = Screen {
 #[repr(C, align(4096))]
 struct Cells([[u16; MAX_COLS]; MAX_ROWS]);
 
-static mut CELLS: Cells = Cells([[0; MAX_COLS]; MAX_ROWS]);
+static CELLS: IrqLock<Cells> = IrqLock::new(Cells([[0; MAX_COLS]; MAX_ROWS]));
 
-// cells() and screen() hand out the whole static. What keeps that sound:
-// interrupts are off whenever either is called (checked), there is one CPU,
-// and no caller keeps a result while it calls something that makes another
-// (put() makes its own; that's why callers outside the lock use mode()).
-fn cells() -> &'static mut [[u16; MAX_COLS]; MAX_ROWS] {
-    cpu::assert_interrupts_off(b"display cells");
-    // SAFETY: [static] interrupts off on the one CPU (just checked), and
-    // used by the caller without making another, as the comment above says.
-    unsafe { &mut (*(&raw mut CELLS)).0 }
+// Each behind its own lock (Entry 31): a caller that holds one and asks for
+// it again halts, so code that runs outside them reads mode()'s copy.
+#[track_caller]
+fn cells() -> IrqGuard<'static, Cells> {
+    CELLS.lock()
 }
 
-/// The VGA ROM's 8x16 font, copied from where stage 2 left it.
-static mut FONT: [u8; 256 * GLYPH_H] = [0; 256 * GLYPH_H];
+/// The VGA ROM's 8x16 font, copied from where stage 2 left it: set once, by
+/// init, in graphics mode.
+static FONT: BootCell<[u8; 256 * GLYPH_H]> = BootCell::new();
+/// What font() gives in text mode, where there is none.
+static NO_FONT: [u8; 256 * GLYPH_H] = [0; 256 * GLYPH_H];
 
-fn screen() -> &'static mut Screen {
-    cpu::assert_interrupts_off(b"display screen");
-    // SAFETY: [static] as cells().
-    unsafe { &mut *(&raw mut SCREEN) }
+#[track_caller]
+fn screen() -> IrqGuard<'static, Screen> {
+    SCREEN.lock()
 }
 
 /// What init() and attach() decided, which nothing changes after them: a
@@ -142,24 +141,20 @@ fn mode() -> Mode {
 /// First thing in rust_start: learn the mode, take the font, blank the
 /// screen. In text mode it is usable at once.
 pub fn init() {
-    let s = screen();
+    let mut s = screen();
     s.info = boot::display_info();
     match s.info {
         Some(info) if info.status == 0 && info.font => {
             s.graphics = true;
             s.cols = (info.width as usize / GLYPH_W).min(MAX_COLS);
             s.rows = (info.height as usize / GLYPH_H).min(MAX_ROWS);
-            // SAFETY: [phys] init runs once, first thing at boot, so this is
-            // the only reference to FONT there will ever be while it is
-            // written (font() and draw_cell only read it, later). The bytes
-            // come from the ROM font stage 2 copied to FONT_ADDR, in the
-            // identity-mapped low 1 MiB.
-            unsafe {
-                let font = &mut *(&raw mut FONT);
-                for (i, byte) in font.iter_mut().enumerate() {
-                    *byte = ((boot::FONT_ADDR + i) as *const u8).read_volatile();
-                }
+            let mut font = [0u8; 256 * GLYPH_H];
+            for (i, byte) in font.iter_mut().enumerate() {
+                // SAFETY: [phys] the ROM font stage 2 copied to FONT_ADDR, 4
+                // KiB in the identity-mapped low 1 MiB, which nothing writes.
+                *byte = unsafe { ((boot::FONT_ADDR + i) as *const u8).read_volatile() };
             }
+            FONT.set(font);
         }
         _ => {
             s.graphics = false;
@@ -174,6 +169,7 @@ pub fn init() {
             }
         }
     }
+    drop(s); // clear() takes it, through put()
     clear();
 }
 
@@ -197,13 +193,14 @@ pub fn rows() -> usize {
 
 /// One character cell. Out-of-range cells are ignored.
 pub fn put(row: usize, col: usize, ch: u8, attr: u8) {
-    cpu::without_interrupts(|| {
-        let s = screen();
+    {
+        let mut s = screen();
         if row >= s.rows || col >= s.cols {
             return;
         }
         let value = (attr as u16) << 8 | ch as u16;
-        let cell = &mut cells()[row][col];
+        let mut c = cells();
+        let cell = &mut c.0[row][col];
         if row < PANEL_ROWS && *cell != value {
             crate::console::notify(crate::console::SIGNAL_PANEL);
         }
@@ -224,7 +221,7 @@ pub fn put(row: usize, col: usize, ch: u8, attr: u8) {
                 s.drawn[row][col] = value;
             }
         }
-    });
+    }
 }
 
 /// Every cell blank (grey on black).
@@ -243,9 +240,7 @@ pub fn clear() {
 /// `fb` must be the framebuffer attach() mapped, and the cell inside the
 /// grid (row < rows, col < cols), so every pixel is inside the mapping.
 unsafe fn draw_cell(fb: &Framebuffer, row: usize, col: usize, value: u16) {
-    // SAFETY: [static] FONT is written once, by init at boot; from then on
-    // it is only read, so a shared reference is fine.
-    let font = unsafe { &*(&raw const FONT) };
+    let font = font();
     let ch = (value & 0xFF) as usize;
     let attr = (value >> 8) as usize;
     let fg = fb.colours[attr & 0x0F];
@@ -312,7 +307,7 @@ const PAT_WC: u64 = 0x01;
 /// # Safety
 /// Once, after the frame allocator is up.
 pub unsafe fn attach() -> Result<(), &'static [u8]> {
-    let s = screen();
+    let mut s = screen();
     let info = match (s.graphics, s.info) {
         (true, Some(info)) => info,
         _ => return Ok(()),
@@ -376,7 +371,7 @@ pub unsafe fn attach() -> Result<(), &'static [u8]> {
     cpu::without_interrupts(|| {
         for row in 0..s.rows {
             for col in 0..s.cols {
-                let value = cells()[row][col];
+                let value = cells().0[row][col];
                 // SAFETY: [mmio] fb is mapped, and row and col are inside
                 // the grid, as draw_cell requires.
                 unsafe { draw_cell(&fb, row, col, value) };
@@ -394,21 +389,21 @@ pub unsafe fn attach() -> Result<(), &'static [u8]> {
 
 /// The console driver draws from now on.
 pub fn hand_over() {
-    cpu::without_interrupts(|| screen().console_draws = true);
+    screen().console_draws = true;
 }
 
 /// The kernel draws again, starting with the whole screen: whatever the
 /// console driver left there is overwritten with `cells`.
 pub fn reclaim() {
     cpu::without_interrupts(|| {
-        let s = screen();
+        let mut s = screen();
         if !s.console_draws {
             return;
         }
         s.console_draws = false;
         for row in 0..s.rows {
             for col in 0..s.cols {
-                let value = cells()[row][col];
+                let value = cells().0[row][col];
                 if !s.graphics {
                     let cell = (0xB8000 + (row * TEXT_COLS + col) * 2) as *mut u16;
                     // SAFETY: [mmio] VGA text memory, a cell inside the grid.
@@ -442,7 +437,7 @@ pub fn screen_memory() -> Option<crate::cap::Cap> {
 /// A read-only Memory capability for the status rows in `cells`.
 pub fn panel_memory() -> crate::cap::Cap {
     let bytes = (PANEL_ROWS * MAX_COLS * 2) as u64;
-    crate::cap::Cap::Memory { base: (&raw const CELLS) as u64, pages: bytes.div_ceil(4096) as u32, flags: 0 }
+    crate::cap::Cap::Memory { base: CELLS.addr(), pages: bytes.div_ceil(4096) as u32, flags: 0 }
 }
 
 /// What the console driver needs to know to draw (console.rs puts it in
@@ -475,9 +470,7 @@ pub fn geometry() -> Geometry {
 
 /// The ROM font the kernel draws with (256 glyphs of 16 bytes).
 pub fn font() -> &'static [u8; 256 * GLYPH_H] {
-    // SAFETY: [static] FONT is written once, by init at boot, before anyone
-    // can call this; after that it is only read.
-    unsafe { &*(&raw const FONT) }
+    FONT.get().unwrap_or(&NO_FONT)
 }
 
 /// For the boot log: what stage 2 chose, and why.
@@ -616,7 +609,7 @@ pub fn selftest() -> bool {
         (true, None) => return true,
     };
     let (row, col) = (s.rows - 1, s.cols - 1);
-    let saved = cpu::without_interrupts(|| cells()[row][col]);
+    let saved = cells().0[row][col];
     put(row, col, b'F', 0x1E); // yellow on blue
     // SAFETY: [cpu] sfence only orders this CPU's stores: the glyph's
     // write-combined pixels reach the framebuffer before they are read back.
@@ -694,7 +687,7 @@ fn selftest_text() -> bool {
     use crate::serial_write_str as w;
     let s = mode();
     let (row, col) = (s.rows - 1, s.cols - 1);
-    let saved = cpu::without_interrupts(|| cells()[row][col]);
+    let saved = cells().0[row][col];
     let at = 0xB8000 + (row * TEXT_COLS + col) * 2;
     put(row, col, b'F', 0x1E);
     // SAFETY: [mmio] the last cell of VGA text memory (identity-mapped).

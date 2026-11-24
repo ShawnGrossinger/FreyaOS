@@ -73,6 +73,8 @@ CASES=(
   "use_after_unmap|use_after_unmap|128M|vector 14 #PF Page Fault;;cr2=0xffffc00000100000;;page not present, read"
   "write_read_only|write_read_only|128M|vector 14 #PF Page Fault;;protection violation, write"
   "heap_double_free|heap_double_free|128M|\[heap\] FATAL: double free"
+  # Entry 31: a lock taken while its holder still holds it
+  "lock_twice|lock_twice|128M|\[lock\] FATAL: the lock at 0x[0-9a-f]+ was taken while already held: by this same code, or by a task that switched away holding it \(asked for at src/lock.rs:[0-9]+\)"
   # Entry 29: a frame dropped while held; the kernel image given back as heap
   "lost_frame|lost_frame|128M|\[pmm\] FATAL: a frame was dropped while still held, neither stored nor freed: 0x"
   "free_kernel_image|free_kernel_image|128M|\[pmm\] FATAL: frame 0x0000000000100000 given back as kernel heap of the kernel, but it is reserved kernel image of the kernel"

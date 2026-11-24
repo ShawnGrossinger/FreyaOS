@@ -24,10 +24,12 @@
 //! kernel's Rust a held frame is a Frame<Raw>, Frame<Sanitized> or
 //! Frame<Typed>, so the compiler keeps the order (see "Frame identity").
 //!
-//! Concurrency: alloc, free and reclaim run with interrupts disabled
-//! (cpu::without_interrupts), so a task switch can never land half-way
-//! through a bitmap update. That is sufficient on one CPU; SMP will need a
-//! real lock.
+//! Concurrency: the allocator is behind a lock (Entry 31; lock.rs) that
+//! also turns interrupts off, so a task switch can never land half-way
+//! through a bitmap update, and taking it twice halts instead of
+//! corrupting it. alloc runs take -> sanitize -> assign with interrupts off
+//! throughout, locking for each step. One CPU; SMP will need the lock to
+//! wait instead of halting.
 
 use crate::boot::E820Entry;
 use crate::paging;
@@ -435,13 +437,11 @@ impl Frame<Raw> {
         crate::cpu::assert_interrupts_off(b"pmm sanitize");
         // SAFETY: [phys] a Frame<Raw> comes only from take(), which has just
         // taken it out of the pool, so the frame is this handle's alone; the
-        // physical map reaches it. Then its record, with interrupts off (the
-        // allocator's lock; alloc() holds it, and it is checked above), and
-        // in range (take() only hands out frames the bitmap covers).
-        unsafe {
-            core::ptr::write_bytes(paging::phys_to_virt(self.phys), 0, PAGE_SIZE as usize);
-            (*(&raw mut PMM)).set(self.phys, Record::of(State::Sanitized, Kind::None, Owner::Nobody));
-        }
+        // physical map reaches it.
+        unsafe { core::ptr::write_bytes(paging::phys_to_virt(self.phys), 0, PAGE_SIZE as usize) };
+        // SAFETY: [phys] its record, with the allocator's lock held, and in
+        // range (take() only hands out frames the bitmap covers).
+        unsafe { PMM.lock().set(self.phys, Record::of(State::Sanitized, Kind::None, Owner::Nobody)) };
         self.become_()
     }
 }
@@ -451,9 +451,9 @@ impl Frame<Sanitized> {
     /// Typed frame (but for reclaim(), which takes back one already Typed).
     pub fn assign(self, kind: Kind, owner: Owner) -> Frame<Typed> {
         crate::cpu::assert_interrupts_off(b"pmm assign");
-        // SAFETY: [phys] the frame's record, with the allocator's lock held
-        // (checked above), for a frame in range (it came from take()).
-        unsafe { (*(&raw mut PMM)).set(self.phys, Record::of(State::Typed, kind, owner)) };
+        // SAFETY: [phys] the frame's record, with the allocator's lock held,
+        // for a frame in range (it came from take()).
+        unsafe { PMM.lock().set(self.phys, Record::of(State::Typed, kind, owner)) };
         self.become_()
     }
 }
@@ -515,36 +515,31 @@ impl Frame<Typed> {
     /// # Safety
     /// As for reclaim().
     pub unsafe fn try_reclaim(phys: u64, kinds: u32, owner: Owner) -> Result<Frame<Typed>, Record> {
-        crate::cpu::without_interrupts(|| {
-            // SAFETY: [static] the allocator's lock (interrupts off) is held,
-            // so nothing changes PMM while this shared reference lives.
-            let pmm = unsafe { &*(&raw const PMM) };
-            if phys % PAGE_SIZE != 0 || phys / PAGE_SIZE >= pmm.frames {
-                return Err(Record::of(State::Reserved, Kind::Firmware, Owner::Nobody));
-            }
-            // SAFETY: [phys] the lock is held, and phys is in range (just
-            // checked).
-            let r = unsafe { pmm.get(phys) };
-            if r.state() != State::Typed || kinds & r.kind().bit() == 0 || r.owner() != owner {
-                return Err(r);
-            }
-            Ok(Frame { phys, state: PhantomData })
-        })
+        let pmm = PMM.lock();
+        if phys % PAGE_SIZE != 0 || phys / PAGE_SIZE >= pmm.frames {
+            return Err(Record::of(State::Reserved, Kind::Firmware, Owner::Nobody));
+        }
+        // SAFETY: [phys] the lock is held, and phys is in range (just
+        // checked).
+        let r = unsafe { pmm.get(phys) };
+        if r.state() != State::Typed || kinds & r.kind().bit() == 0 || r.owner() != owner {
+            return Err(r);
+        }
+        Ok(Frame { phys, state: PhantomData })
     }
 
     /// Typed -> Raw: back to the pool. It is zeroed again before anyone
     /// else can have it.
     pub fn free(self) {
         let phys = self.into_phys();
-        // SAFETY: [phys] the lock is held (interrupts off), so this is the
-        // only reference to PMM; phys is a Frame<Typed>'s, so in range. The
-        // handle is gone (into_phys), so nothing keeps the frame: release
-        // halts if the bitmap already has it free.
-        crate::cpu::without_interrupts(|| unsafe {
-            let pmm = &mut *(&raw mut PMM);
+        let mut pmm = PMM.lock();
+        // SAFETY: [phys] the lock is held; phys is a Frame<Typed>'s, so in
+        // range. The handle is gone (into_phys), so nothing keeps the frame:
+        // release halts if the bitmap already has it free.
+        unsafe {
             pmm.set(phys, RAW);
             pmm.release(phys / PAGE_SIZE);
-        });
+        }
     }
 }
 
@@ -557,11 +552,13 @@ pub fn alloc(kind: Kind, owner: Owner) -> Option<Frame<Typed>> {
 
 /// A frame's record (Raw for anything outside the table).
 pub fn record(phys: u64) -> Record {
-    // SAFETY: [phys] the lock is held; get() only for a frame in range.
-    crate::cpu::without_interrupts(|| unsafe {
-        let pmm = &*(&raw const PMM);
-        if phys / PAGE_SIZE < pmm.frames { pmm.get(phys) } else { Record::of(State::Reserved, Kind::Firmware, Owner::Nobody) }
-    })
+    let pmm = PMM.lock();
+    if phys / PAGE_SIZE >= pmm.frames {
+        return Record::of(State::Reserved, Kind::Firmware, Owner::Nobody);
+    }
+    // SAFETY: [phys] the lock is held, and the frame is in range (just
+    // checked).
+    unsafe { pmm.get(phys) }
 }
 
 /// Hand a frame of a process being built (Owner::Unassigned) to the task
@@ -570,55 +567,45 @@ pub fn record(phys: u64) -> Record {
 /// # Safety
 /// `phys` must be a frame of that process's address space.
 pub(crate) unsafe fn adopt(phys: u64, owner: Owner) {
-    crate::cpu::without_interrupts(|| {
-        // SAFETY: [static] the lock is held: the only reference to PMM.
-        let pmm = unsafe { &mut *(&raw mut PMM) };
-        // SAFETY: [phys] get() only for a frame in range.
-        let r = if phys / PAGE_SIZE < pmm.frames { unsafe { pmm.get(phys) } } else { RAW };
-        if r.state() != State::Typed || r.owner() != Owner::Unassigned {
-            crate::serial_write_str(b"[pmm] FATAL: frame ");
-            crate::serial_write_hex(phys);
-            crate::serial_write_str(b" handed to a new process, but it is ");
-            r.print();
-            crate::serial_write_str(b"\n");
-            crate::halt();
-        }
-        // SAFETY: [phys] the lock is held, and the frame is in range (its
-        // record was read above, Typed).
-        unsafe { pmm.set(phys, Record::of(State::Typed, r.kind(), owner)) };
-    })
+    let mut pmm = PMM.lock();
+    // SAFETY: [phys] the lock is held; get() only for a frame in range.
+    let r = if phys / PAGE_SIZE < pmm.frames { unsafe { pmm.get(phys) } } else { RAW };
+    if r.state() != State::Typed || r.owner() != Owner::Unassigned {
+        crate::serial_write_str(b"[pmm] FATAL: frame ");
+        crate::serial_write_hex(phys);
+        crate::serial_write_str(b" handed to a new process, but it is ");
+        r.print();
+        crate::serial_write_str(b"\n");
+        crate::halt();
+    }
+    // SAFETY: [phys] the lock is held, and the frame is in range (its
+    // record was read above, Typed).
+    unsafe { pmm.set(phys, Record::of(State::Typed, r.kind(), owner)) };
 }
 
 /// Frames of `kind` right now (Kind::None: the free ones).
 pub fn frames_of(kind: Kind) -> u64 {
-    // SAFETY: [static] a counter read with the lock held.
-    crate::cpu::without_interrupts(|| unsafe {
-        let pmm = &*(&raw const PMM);
-        if kind == Kind::None { pmm.free } else { pmm.kinds[kind as usize] }
-    })
+    let pmm = PMM.lock();
+    if kind == Kind::None { pmm.free } else { pmm.kinds[kind as usize] }
 }
 
 /// Frames task slot `id` owns right now (whatever their generation: a slot
 /// holds one task at a time).
 pub fn frames_owned_by(id: u8) -> u64 {
     let byte = Owner::Task { id, generation: 0 }.byte();
-    // SAFETY: [static] a counter read with the lock held.
-    crate::cpu::without_interrupts(|| unsafe { (*(&raw const PMM)).owned[byte as usize] as u64 })
+    PMM.lock().owned[byte as usize] as u64
 }
 
 /// Frames still with a process being built (Owner::Unassigned): none once
 /// every process has its task (Entry 29).
 pub fn frames_being_built() -> u64 {
-    // SAFETY: [static] a counter read with the lock held.
-    crate::cpu::without_interrupts(|| unsafe { (*(&raw const PMM)).owned[OWNER_UNASSIGNED as usize] as u64 })
+    PMM.lock().owned[OWNER_UNASSIGNED as usize] as u64
 }
 
 /// Frames that name as their owner a task that no longer runs: `live(id,
 /// generation)` says which do. Reads the whole table (for the self-tests).
 pub fn orphans(live: impl Fn(u8, u32) -> bool) -> u64 {
-    // SAFETY: [static] `frames` is written once, by init at boot, and only
-    // read after; the lock keeps the read whole all the same.
-    let frames = crate::cpu::without_interrupts(|| unsafe { (*(&raw const PMM)).frames });
+    let frames = PMM.lock().frames;
     let mut n = 0;
     for f in 0..frames {
         let r = record(f * PAGE_SIZE);
@@ -646,7 +633,12 @@ struct FrameAllocator {
     owned: [u32; 256], // frames owned, by owner byte (a task's slot, 0xFE, 0xFF)
 }
 
-static mut PMM: FrameAllocator = FrameAllocator {
+// SAFETY: [static] the two pointers are physical-map addresses, the same
+// from every task and every context; what they reach is only touched
+// through the lock below.
+unsafe impl Send for FrameAllocator {}
+
+static PMM: crate::lock::IrqLock<FrameAllocator> = crate::lock::IrqLock::new(FrameAllocator {
     bitmap: core::ptr::null_mut(),
     table: core::ptr::null_mut(),
     words: 0,
@@ -655,7 +647,7 @@ static mut PMM: FrameAllocator = FrameAllocator {
     free: 0,
     kinds: [0; KINDS],
     owned: [0; 256],
-};
+});
 
 impl FrameAllocator {
     /// Mark frames [first, last) used or free. Whole 64-frame words are
@@ -828,7 +820,7 @@ pub struct PmmStats {
 /// early frames used.
 pub unsafe fn init(e820: &[E820Entry], early_used: (u64, u64)) -> PmmStats {
     // SAFETY: [phys] the one call, at boot, with nothing else running and
-    // interrupts off (# Safety), so this is the only reference to PMM. The
+    // interrupts off (# Safety), and the allocator's lock held. The
     // bitmap and the table go in usable RAM that first_fit found big enough
     // for both (meta_bytes), reached through the physical map, which is up;
     // they are reserved in the bitmap before anything can be allocated. Every
@@ -867,7 +859,7 @@ pub unsafe fn init(e820: &[E820Entry], early_used: (u64, u64)) -> PmmStats {
             fatal(b"no usable RAM large enough for the frame bitmap and table, bytes needed: ", meta_bytes);
         }
 
-        let pmm = &mut *(&raw mut PMM);
+        let mut pmm = PMM.lock();
         *pmm = FrameAllocator {
             bitmap: paging::phys_to_virt(bitmap_phys) as *mut u64,
             table: paging::phys_to_virt(bitmap_phys + bitmap_bytes) as *mut u64,
@@ -931,12 +923,12 @@ pub unsafe fn init(e820: &[E820Entry], early_used: (u64, u64)) -> PmmStats {
 /// Scans 64 frames per step, starting at the hint instead of frame 0.
 fn take() -> Option<Frame<Raw>> {
     crate::cpu::assert_interrupts_off(b"pmm take");
-    // SAFETY: [static] the lock is held (just checked): the only reference.
-    let pmm = unsafe { &mut *(&raw mut PMM) };
+    let mut pmm = PMM.lock();
     if pmm.bitmap.is_null() {
         fatal(b"a frame asked for before pmm::init, caller near ", 0);
     }
-    for w in pmm.hint..pmm.words {
+    let (hint, words) = (pmm.hint, pmm.words);
+    for w in hint..words {
         // SAFETY: [phys] word w of the bitmap (w < words), which init placed
         // in RAM it reserved, reached through the physical map.
         let word = unsafe { *pmm.bitmap.add(w) };
@@ -955,14 +947,14 @@ fn take() -> Option<Frame<Raw>> {
 
 /// Is the frame at `phys` free? (For self-tests: false outside the bitmap.)
 pub fn is_frame_free(phys: u64) -> bool {
+    let pmm = PMM.lock();
     // SAFETY: [phys] the lock is held; is_free answers false past the end.
-    crate::cpu::without_interrupts(|| unsafe { (*(&raw const PMM)).is_free(phys / PAGE_SIZE) })
+    unsafe { pmm.is_free(phys / PAGE_SIZE) }
 }
 
 /// Free frames right now.
 pub fn free_frames() -> u64 {
-    // SAFETY: [static] a counter read with the lock held.
-    crate::cpu::without_interrupts(|| unsafe { (*(&raw const PMM)).free })
+    PMM.lock().free
 }
 
 static USABLE_FRAMES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -992,21 +984,22 @@ pub fn usable_frames() -> u64 {
 /// # Safety
 /// Call after init().
 pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
-    // SAFETY: [phys] boot, after init (# Safety), nothing else running: PMM's
-    // fields and its methods are read with nothing changing them, the
-    // methods only for frames in range. The frames written are ones this
+    // SAFETY: [phys] boot, after init (# Safety): the allocator's methods
+    // are called with its lock held, only for frames in range. The frames written are ones this
     // test allocated and still holds, through the physical map; reclaim and
     // try_reclaim get back only frames this test stored by address, or ones
     // they must refuse.
     unsafe {
         use crate::{serial_write_hex as hex, serial_write_str as s, serial_write_u64 as dec};
 
-        let pmm = &*(&raw const PMM);
-
-        let counted = pmm.count_free();
-        let count_ok = counted == pmm.free;
+        // Each section takes the lock for itself: alloc() below takes it too.
+        let (counted, free) = {
+            let pmm = PMM.lock();
+            (pmm.count_free(), pmm.free)
+        };
+        let count_ok = counted == free;
         s(b"[pmm] self-test free counter (");
-        dec(pmm.free);
+        dec(free);
         s(b") matches bitmap recount (");
         dec(counted);
         s(b")");
@@ -1019,7 +1012,7 @@ pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
             }
         }
         let last = last.min(paging::PHYS_MAP_MAX - PAGE_SIZE);
-        let top_ok = pmm.is_free(last / PAGE_SIZE);
+        let top_ok = PMM.lock().is_free(last / PAGE_SIZE);
         s(b"[pmm] self-test last usable frame ");
         hex(last);
         s(b" is tracked and free");
@@ -1047,6 +1040,7 @@ pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
         crate::selftest::verdict(round_trip_ok);
 
         // --- 5. the table against the bitmap, and its counters ---
+        let pmm = PMM.lock();
         let mut kinds = [0u64; KINDS];
         let mut disagree = 0u64;
         for frame in 0..pmm.frames {
@@ -1074,6 +1068,7 @@ pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
         s(b" allocator; ");
         dec(kinds[Kind::PageTable as usize]);
         s(b" page tables so far; the counters match a recount");
+        drop(pmm);
         crate::selftest::verdict(table_ok);
 
         // --- 6. a frame's life ---
@@ -1085,7 +1080,7 @@ pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
                     && f.owner() == Owner::Kernel;
                 let words = paging::phys_to_virt(phys) as *const u64;
                 let zeroed = (0..PAGE_SIZE as usize / 8).all(|i| words.add(i).read_volatile() == 0);
-                let counted = frames_of(Kind::Test) == 1 && (*(&raw const PMM)).owned[OWNER_KERNEL as usize] > 0;
+                let counted = frames_of(Kind::Test) == 1 && PMM.lock().owned[OWNER_KERNEL as usize] > 0;
                 // Dirty it, free it, and see it come back clean.
                 (paging::phys_to_virt(phys) as *mut u64).write_volatile(0xD1D1_D1D1_D1D1_D1D1);
                 f.free();

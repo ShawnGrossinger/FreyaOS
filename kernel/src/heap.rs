@@ -29,11 +29,13 @@
 //! allocating or freeing inside a hardware interrupt handler, or
 //! re-entering the allocator.
 //!
-//! Concurrency: the allocator runs with interrupts disabled, so a task
-//! switch can never land in the middle of a free-list update.
+//! Concurrency: the allocator is behind a lock (Entry 31; lock.rs) that
+//! also turns interrupts off, so a task switch can never land in the
+//! middle of a free-list update.
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::lock::{IrqGuard, IrqLock};
 
 use crate::pmm::{self, Kind, Owner, PAGE_SIZE};
 use crate::vmm::{AddressSpace, PageFlags};
@@ -64,21 +66,22 @@ struct Heap {
     frees: u64,
 }
 
-static mut HEAP: Heap = Heap {
-    head: core::ptr::null_mut(),
-    top: HEAP_BASE,
-    in_use: 0,
-    allocations: 0,
-    frees: 0,
-};
+// SAFETY: [static] `head` points into the heap's own mapping in the kernel
+// half, the same from every task and every context, and is only followed
+// with the lock below held.
+unsafe impl Send for Heap {}
 
 /// Held for the duration of every alloc/free, with interrupts disabled.
 /// With one CPU, finding it already held can only mean re-entry (for
 /// example an exception raised inside the allocator, whose handler then
 /// allocates).
-static LOCK: AtomicBool = AtomicBool::new(false);
-/// Whether interrupts were enabled when the lock was taken.
-static LOCK_RESTORE_IF: AtomicBool = AtomicBool::new(false);
+static HEAP: IrqLock<Heap> = IrqLock::new(Heap {
+    head: core::ptr::null_mut(),
+    top: HEAP_BASE,
+    in_use: 0,
+    allocations: 0,
+    frees: 0,
+});
 
 fn fatal(msg: &[u8], value: u64) -> ! {
     crate::serial_write_str(b"[heap] FATAL: ");
@@ -88,31 +91,17 @@ fn fatal(msg: &[u8], value: u64) -> ! {
     crate::halt();
 }
 
-fn lock() {
+/// The heap, locked until the guard goes.
+fn lock() -> IrqGuard<'static, Heap> {
     // Interrupt handlers must not allocate: a tick can arrive at any
     // instruction, including ones that hold this lock or that the
     // scheduler is in the middle of.
     if crate::idt::irq_depth() > 0 {
         fatal(b"heap used inside a hardware interrupt handler, depth ", crate::idt::irq_depth());
     }
-    let interrupts_were_on = crate::cpu::interrupts_enabled();
-    // SAFETY: [cpu] masks interrupts for the allocator's critical section;
-    // unlock turns them on again only if they were on here.
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
-    if LOCK.swap(true, Ordering::Acquire) {
-        fatal(b"allocator re-entered (allocating inside an exception handler?) ", 0);
-    }
-    LOCK_RESTORE_IF.store(interrupts_were_on, Ordering::Relaxed);
-    crate::cpu::assert_interrupts_off(b"heap");
-}
-
-fn unlock() {
-    let restore = LOCK_RESTORE_IF.load(Ordering::Relaxed);
-    LOCK.store(false, Ordering::Release);
-    if restore {
-        // SAFETY: [cpu] interrupts were on when lock() turned them off, and
-        // the heap is consistent again: the lock was just let go.
-        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    match HEAP.try_lock() {
+        Some(heap) => heap,
+        None => fatal(b"allocator re-entered (allocating inside an exception handler?) ", 0),
     }
 }
 
@@ -308,10 +297,7 @@ unsafe impl GlobalAlloc for KernelHeap {
     /// # Safety
     /// GlobalAlloc's: layout.size() is not zero.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        lock();
-        // SAFETY: [static] lock() is held (interrupts off, re-entry halts),
-        // so this is the only reference to HEAP until unlock().
-        let heap = unsafe { &mut *(&raw mut HEAP) };
+        let mut heap = lock();
         let size = block_size(layout);
         let align = layout.align().max(BLOCK);
 
@@ -333,7 +319,6 @@ unsafe impl GlobalAlloc for KernelHeap {
             }
             None => core::ptr::null_mut(), // Rust's alloc error path takes over
         };
-        unlock();
         ptr
     }
 
@@ -341,9 +326,7 @@ unsafe impl GlobalAlloc for KernelHeap {
     /// GlobalAlloc's: ptr came from alloc with this same layout, and is
     /// freed once.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        lock();
-        // SAFETY: [static] lock() is held, as in alloc.
-        let heap = unsafe { &mut *(&raw mut HEAP) };
+        let mut heap = lock();
         let size = block_size(layout);
         let start = ptr as u64;
 
@@ -362,7 +345,6 @@ unsafe impl GlobalAlloc for KernelHeap {
         }
         heap.in_use -= size as u64;
         heap.frees += 1;
-        unlock();
     }
 }
 
@@ -383,10 +365,7 @@ pub struct HeapStats {
 }
 
 pub fn stats() -> HeapStats {
-    lock();
-    // SAFETY: [static] the heap's lock is held: nothing changes HEAP until
-    // unlock().
-    let heap = unsafe { &*(&raw const HEAP) };
+    let heap = lock();
     let mut free_blocks = 0;
     let mut largest_free = 0;
     let mut block = heap.head;
@@ -407,7 +386,6 @@ pub fn stats() -> HeapStats {
         allocations: heap.allocations,
         frees: heap.frees,
     };
-    unlock();
     stats
 }
 

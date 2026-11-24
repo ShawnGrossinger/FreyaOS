@@ -221,55 +221,47 @@ pub fn drop_cap(slot: u64) -> i64 {
 //
 // A position is a slot in a task's table: task * MAX_CAPS + slot. For each
 // one the kernel keeps, besides the capability (in sched's task table):
-//   SERIALS  a number no other capability has had (0: the slot is empty), so
+//   serials  a number no other capability has had (0: the slot is empty), so
 //            a copy in flight can tell whether its original is still there
-//   PARENTS  the position of the capability it was copied from, plus one
+//   parents  the position of the capability it was copied from, plus one
 //            (0: none). A parent always exists: when one is removed, its
 //            children are handed to its own parent.
-//   MAPPINGS where a Memory capability is mapped in its task (0: nowhere)
-//   HEAPS    how many pages long a Budget capability's heap is (Entry 26);
+//   mappings where a Memory capability is mapped in its task (0: nowhere)
+//   heaps    how many pages long a Budget capability's heap is (Entry 26);
 //            where it is follows from the slot (mem.rs: heap_base)
-// All of it is touched with interrupts off only.
+// All of it under one lock (Entry 31; lock.rs). Each operation takes it
+// once and hands it to the helpers below, and lets go of it before
+// anything that takes it again (put, remove).
 
 use crate::cpu::without_interrupts;
+use crate::lock::{IrqGuard, IrqLock};
 use crate::sched::TaskId;
 
 const POSITIONS: usize = crate::sched::MAX_TASKS * MAX_CAPS;
 const _: () = assert!(POSITIONS < u16::MAX as usize);
 
-static mut SERIALS: [u32; POSITIONS] = [0; POSITIONS];
-static mut PARENTS: [u16; POSITIONS] = [0; POSITIONS];
-static mut MAPPINGS: [u64; POSITIONS] = [0; POSITIONS];
-static mut HEAPS: [u32; POSITIONS] = [0; POSITIONS];
-static mut NEXT_SERIAL: u32 = 1;
-
-// Each of these hands out the whole array, so the rule that keeps them
-// sound is the callers': interrupts off (checked here), one CPU, and each
-// result used at once, never kept while another is made or across a task
-// switch. Every caller indexes it in the same expression.
-fn serials() -> &'static mut [u32; POSITIONS] {
-    crate::cpu::assert_interrupts_off(b"cap serials");
-    // SAFETY: [static] interrupts off on the one CPU (just checked), and
-    // used at once by the caller, as the comment above says.
-    unsafe { &mut *(&raw mut SERIALS) }
+struct Derivation {
+    serials: [u32; POSITIONS],
+    parents: [u16; POSITIONS],
+    mappings: [u64; POSITIONS],
+    heaps: [u32; POSITIONS],
+    /// The serial number given out last (0: none yet). Kept as the last
+    /// rather than the next so that the whole table starts as zeros and
+    /// stays out of the kernel image (.bss).
+    last_serial: u32,
 }
 
-fn parents() -> &'static mut [u16; POSITIONS] {
-    crate::cpu::assert_interrupts_off(b"cap parents");
-    // SAFETY: [static] as serials().
-    unsafe { &mut *(&raw mut PARENTS) }
-}
+static DERIVATION: IrqLock<Derivation> = IrqLock::new(Derivation {
+    serials: [0; POSITIONS],
+    parents: [0; POSITIONS],
+    mappings: [0; POSITIONS],
+    heaps: [0; POSITIONS],
+    last_serial: 0,
+});
 
-fn mappings() -> &'static mut [u64; POSITIONS] {
-    crate::cpu::assert_interrupts_off(b"cap mappings");
-    // SAFETY: [static] as serials().
-    unsafe { &mut *(&raw mut MAPPINGS) }
-}
-
-fn heaps() -> &'static mut [u32; POSITIONS] {
-    crate::cpu::assert_interrupts_off(b"cap heaps");
-    // SAFETY: [static] as serials().
-    unsafe { &mut *(&raw mut HEAPS) }
+#[track_caller]
+fn derivation() -> IrqGuard<'static, Derivation> {
+    DERIVATION.lock()
 }
 
 /// Where a copy comes from: the original's position and serial number.
@@ -287,7 +279,8 @@ pub fn with_origin(task: TaskId, slot: usize) -> (Cap, Origin) {
     }
     let p = position(task, slot);
     let cap = crate::sched::task(task).caps[slot];
-    (cap, (cap != Cap::None).then_some((p, serials()[p])))
+    let serial = derivation().serials[p];
+    (cap, (cap != Cap::None).then_some((p, serial)))
 }
 
 /// with_origin for the current task, with interrupts off for it.
@@ -300,11 +293,6 @@ pub fn current_with_origin(slot: u64) -> (Cap, Origin) {
     })
 }
 
-/// Is the capability an origin names still where it was?
-fn still_there(origin: (usize, u32)) -> bool {
-    serials()[origin.0] == origin.1
-}
-
 /// Put `cap` in `task`'s empty `slot`, copied from `from` (None: the
 /// kernel made it). If `from` has been removed meanwhile, the copy goes
 /// with it: nothing is stored, and the answer is false. Interrupts off.
@@ -312,23 +300,25 @@ pub fn put(task: TaskId, slot: usize, cap: Cap, from: Origin) -> bool {
     if cap == Cap::None || slot >= MAX_CAPS {
         return false;
     }
-    let parent = match from {
-        Some(origin) if still_there(origin) => origin.0 as u16 + 1,
-        Some(_) => return false,
-        None => 0,
-    };
     let p = position(task, slot);
     crate::cpu::assert_interrupts_off(b"cap put");
+    {
+        let mut d = derivation();
+        // Is the capability `from` names still where it was?
+        let parent = match from {
+            Some(origin) if d.serials[origin.0] == origin.1 => origin.0 as u16 + 1,
+            Some(_) => return false,
+            None => 0,
+        };
+        let serial = d.last_serial.wrapping_add(1).max(1);
+        d.last_serial = serial;
+        d.serials[p] = serial;
+        d.parents[p] = parent;
+        d.mappings[p] = 0;
+        d.heaps[p] = 0;
+    }
     crate::sched::task(task).caps[slot] = cap;
-    retain(cap);
-    // SAFETY: [static] interrupts off (checked above) on the one CPU, and
-    // this is the only reference to NEXT_SERIAL anywhere.
-    let next = unsafe { &mut *(&raw mut NEXT_SERIAL) };
-    serials()[p] = *next;
-    *next = next.wrapping_add(1).max(1);
-    parents()[p] = parent;
-    mappings()[p] = 0;
-    heaps()[p] = 0;
+    retain(cap); // ipc's lock, and none of these
     true
 }
 
@@ -360,19 +350,25 @@ pub fn remove(task: TaskId, slot: usize, unmap: bool) -> Cap {
     if cap == Cap::None {
         return Cap::None;
     }
-    let up = parents()[p];
-    for q in parents().iter_mut() {
-        if *q == p as u16 + 1 {
-            *q = up;
+    {
+        let mut d = derivation();
+        let up = d.parents[p];
+        for q in d.parents.iter_mut() {
+            if *q == p as u16 + 1 {
+                *q = up;
+            }
         }
     }
     if unmap {
         unmap_mapping(task, p, cap);
     }
-    serials()[p] = 0;
-    parents()[p] = 0;
-    mappings()[p] = 0;
-    heaps()[p] = 0;
+    {
+        let mut d = derivation();
+        d.serials[p] = 0;
+        d.parents[p] = 0;
+        d.mappings[p] = 0;
+        d.heaps[p] = 0;
+    }
     release(cap);
     cap
 }
@@ -396,7 +392,7 @@ fn unmap_mapping(task: TaskId, p: usize, cap: Cap) {
     let mut space = unsafe { crate::vmm::AddressSpace::from_root(root) };
     match cap {
         Cap::Memory { pages, .. } => {
-            let at = mappings()[p];
+            let at = derivation().mappings[p];
             if at == 0 {
                 return;
             }
@@ -412,7 +408,8 @@ fn unmap_mapping(task: TaskId, p: usize, cap: Cap) {
         Cap::Budget { .. } => {
             let base = crate::mem::heap_base((p % MAX_CAPS) as u64);
             let owner = space.owner();
-            for i in 0..heaps()[p] as u64 {
+            let pages = derivation().heaps[p] as u64;
+            for i in 0..pages {
                 let page = base + i * crate::pmm::PAGE_SIZE;
                 // SAFETY: [paging] the heap's pages, which only the process
                 // uses (the kernel keeps no reference into a heap), taken
@@ -421,7 +418,7 @@ fn unmap_mapping(task: TaskId, p: usize, cap: Cap) {
                     frame.free();
                 }
             }
-            heaps()[p] = 0;
+            derivation().heaps[p] = 0;
         }
         _ => {}
     }
@@ -446,8 +443,12 @@ pub fn heap_state(slot: u64) -> Result<(u32, u64), i64> {
         return Err(crate::syscall::ERR_NO_CAPABILITY);
     }
     let p = position(me, slot as usize);
-    match crate::sched::task(me).caps[slot as usize] {
-        Cap::Budget { .. } => Ok((serials()[p], heaps()[p] as u64)),
+    let cap = crate::sched::task(me).caps[slot as usize];
+    match cap {
+        Cap::Budget { .. } => {
+            let d = derivation();
+            Ok((d.serials[p], d.heaps[p] as u64))
+        }
         Cap::None => Err(crate::syscall::ERR_NO_CAPABILITY),
         _ => Err(crate::syscall::ERR_WRONG_CAPABILITY),
     }
@@ -457,14 +458,14 @@ pub fn heap_state(slot: u64) -> Result<(u32, u64), i64> {
 /// `pages` long. Interrupts off.
 pub fn set_heap(slot: u64, pages: u64) {
     let p = position(crate::sched::current(), slot as usize);
-    heaps()[p] = pages as u32;
+    derivation().heaps[p] = pages as u32;
 }
 
 /// How many heap pages position `p` and everything copied from it have.
-fn in_use(p: usize) -> u64 {
+fn in_use(d: &Derivation, p: usize) -> u64 {
     (0..POSITIONS)
-        .filter(|&q| heaps()[q] != 0 && (q == p || derived_from(q, p)))
-        .map(|q| heaps()[q] as u64)
+        .filter(|&q| d.heaps[q] != 0 && (q == p || derived_from(d, q, p)))
+        .map(|q| d.heaps[q] as u64)
         .sum()
 }
 
@@ -473,15 +474,17 @@ fn in_use(p: usize) -> u64 {
 /// within its limit. Interrupts off.
 pub fn budget_allows(slot: u64, more: u64) -> bool {
     let mut p = position(crate::sched::current(), slot as usize);
+    let d = derivation();
     // Up the tree: a parent always exists while its children do, and is
     // older, so this ends; the bound is only a guard.
     for _ in 0..POSITIONS {
-        if let Cap::Budget { pages: limit } = crate::sched::task(p / MAX_CAPS).caps[p % MAX_CAPS] {
-            if in_use(p) + more > limit as u64 {
+        let cap = crate::sched::task(p / MAX_CAPS).caps[p % MAX_CAPS];
+        if let Cap::Budget { pages: limit } = cap {
+            if in_use(&d, p) + more > limit as u64 {
                 return false;
             }
         }
-        match parents()[p] {
+        match d.parents[p] {
             0 => return true,
             up => p = up as usize - 1,
         }
@@ -493,12 +496,13 @@ pub fn budget_allows(slot: u64, more: u64) -> bool {
 /// from it) and its own heap's.
 pub fn budget_numbers(task: TaskId, slot: usize) -> (u64, u64) {
     let p = position(task, slot);
-    (in_use(p), heaps()[p] as u64)
+    let d = derivation();
+    (in_use(&d, p), d.heaps[p] as u64)
 }
 
 /// True if position `q` was copied, directly or not, from position `p`.
-fn derived_from(q: usize, p: usize) -> bool {
-    let mut up = parents()[q];
+fn derived_from(d: &Derivation, q: usize, p: usize) -> bool {
+    let mut up = d.parents[q];
     // A parent always exists and is older than its children, so there is
     // no cycle; the bound is only a guard.
     for _ in 0..POSITIONS {
@@ -508,7 +512,7 @@ fn derived_from(q: usize, p: usize) -> bool {
         if up as usize - 1 == p {
             return true;
         }
-        up = parents()[up as usize - 1];
+        up = d.parents[up as usize - 1];
     }
     false
 }
@@ -521,9 +525,12 @@ pub fn revoke_in(task: TaskId, slot: usize) -> Result<usize, i64> {
     }
     let p = position(task, slot);
     let mut doomed = [0u64; POSITIONS / 64];
-    for q in 0..POSITIONS {
-        if q != p && serials()[q] != 0 && derived_from(q, p) {
-            doomed[q / 64] |= 1 << (q % 64);
+    {
+        let d = derivation();
+        for q in 0..POSITIONS {
+            if q != p && d.serials[q] != 0 && derived_from(&d, q, p) {
+                doomed[q / 64] |= 1 << (q % 64);
+            }
         }
     }
     let mut removed = 0;
@@ -542,30 +549,30 @@ pub fn derived_count(task: TaskId, slot: usize) -> usize {
         return 0;
     }
     let p = position(task, slot);
-    (0..POSITIONS).filter(|&q| q != p && serials()[q] != 0 && derived_from(q, p)).count()
+    let d = derivation();
+    let n = (0..POSITIONS).filter(|&q| q != p && d.serials[q] != 0 && derived_from(&d, q, p)).count();
+    n
 }
 
 /// Where the current task's capability in `slot` is mapped (0: nowhere),
 /// and its serial number, to record a new mapping against.
 pub fn mapping(slot: usize) -> (u64, u32) {
-    without_interrupts(|| {
-        let p = position(crate::sched::current(), slot.min(MAX_CAPS - 1));
-        (mappings()[p], serials()[p])
-    })
+    let p = position(crate::sched::current(), slot.min(MAX_CAPS - 1));
+    let d = derivation();
+    (d.mappings[p], d.serials[p])
 }
 
 /// Record that the current task mapped its capability in `slot` at `at`,
 /// if it is still the one with `serial`; false if it was removed while it
 /// was being mapped (the caller then undoes the mapping).
 pub fn record_mapping(slot: usize, serial: u32, at: u64) -> bool {
-    without_interrupts(|| {
-        let p = position(crate::sched::current(), slot.min(MAX_CAPS - 1));
-        if serial == 0 || serials()[p] != serial {
-            return false;
-        }
-        mappings()[p] = at;
-        true
-    })
+    let p = position(crate::sched::current(), slot.min(MAX_CAPS - 1));
+    let mut d = derivation();
+    if serial == 0 || d.serials[p] != serial {
+        return false;
+    }
+    d.mappings[p] = at;
+    true
 }
 
 /// copy(slot) (system call 25): a copy of the capability in the caller's

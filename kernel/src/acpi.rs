@@ -62,13 +62,10 @@ pub struct Info {
     pub reset: Option<(u16, u8)>,
 }
 
-static mut INFO: Option<Info> = None;
+static INFO: crate::lock::BootCell<Info> = crate::lock::BootCell::new();
 
 pub fn info() -> Option<&'static Info> {
-    // SAFETY: [static] INFO is written once, by init(), whose only caller is
-    // main at boot, before any task exists; after that it is only read, so
-    // the 'static shared reference never sees it change.
-    unsafe { (*(&raw const INFO)).as_ref() }
+    INFO.get()
 }
 
 // ===========================================================================
@@ -177,10 +174,7 @@ fn find_rsdp() -> Option<u64> {
 pub fn init() -> Result<&'static Info, &'static [u8]> {
     let rsdp_phys = find_rsdp().ok_or(&b"no ACPI tables (RSDP not found)"[..])?;
     let info = parse(rsdp_phys)?;
-    // SAFETY: [static] main calls init once, at boot, before anything calls
-    // info(): no reference to INFO exists yet.
-    unsafe { *(&raw mut INFO) = Some(info) };
-    self::info().ok_or(&b"unreachable"[..])
+    Ok(INFO.set(info))
 }
 
 /// Everything from the tables an RSDP at `rsdp_phys` leads to.
@@ -349,7 +343,7 @@ use crate::{serial_write_hex as hex, serial_write_str as s, serial_write_u64 as 
 /// address is also its physical address.
 #[repr(C, align(4096))]
 struct Synthetic([u8; 1024]);
-static mut SYNTHETIC: Synthetic = Synthetic([0; 1024]);
+static SYNTHETIC: crate::lock::IrqLock<Synthetic> = crate::lock::IrqLock::new(Synthetic([0; 1024]));
 
 fn parse_synthetic() -> Option<Info> {
     const RSDP: usize = 0;
@@ -357,10 +351,9 @@ fn parse_synthetic() -> Option<Info> {
     const FADT: usize = 128;
     const MADT: usize = 400;
     const DSDT: usize = 500;
-    // SAFETY: [static] only this function touches SYNTHETIC, and only
-    // selftest calls it, once, at boot.
-    let t = unsafe { &mut (*(&raw mut SYNTHETIC)).0 };
-    let base = t.as_ptr() as u64;
+    let base = SYNTHETIC.addr();
+    let mut guard = SYNTHETIC.lock();
+    let t = &mut guard.0;
     let put = |t: &mut [u8; 1024], at: usize, bytes: &[u8]| {
         for (i, &b) in bytes.iter().enumerate() {
             if let Some(slot) = t.get_mut(at + i) {
@@ -421,6 +414,8 @@ fn parse_synthetic() -> Option<Info> {
     put(t, DSDT + 36, &aml);
     checksum(t, DSDT, 36 + aml.len(), DSDT + 9);
 
+    // Let go before parse reads the tables back by physical address.
+    drop(guard);
     parse(base + RSDP as u64).ok()
 }
 

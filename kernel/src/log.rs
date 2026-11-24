@@ -36,25 +36,25 @@ const _: () = assert!(core::mem::size_of::<Log>() == LOG_PAGES as usize * PAGE);
 
 // In .bss: page-aligned and a whole number of pages, so lending these
 // pages to the console lends nothing else of the kernel's.
-static mut LOG: Log = Log { written: AtomicU64::new(0), _rest_of_header: [0; PAGE - 8], data: [0; LOG_DATA_BYTES] };
+// The lock puts the log first, so its address is the log's (lock.rs).
+static LOG: crate::lock::IrqLock<Log> =
+    crate::lock::IrqLock::new(Log { written: AtomicU64::new(0), _rest_of_header: [0; PAGE - 8], data: [0; LOG_DATA_BYTES] });
 
-/// Append one byte. The caller has interrupts off (serial_write_str does),
-/// so appends never interleave.
+/// Append one byte. The console driver reads the same pages through its
+/// own mapping, in another program: `written` is atomic and stored last
+/// (Release), so it never counts a byte not yet written. With the log's
+/// lock held already (output from a fatal inside push itself), the byte
+/// goes only to the other sinks.
 pub fn push(b: u8) {
-    crate::cpu::assert_interrupts_off(b"log::push");
-    // SAFETY: [static] push is the only code that makes a reference to LOG,
-    // and runs with interrupts off on the one CPU (checked just above), so
-    // this is the only one. The console driver reads the same pages through
-    // its own mapping, in another program: `written` is atomic and stored
-    // last (Release), so it never counts a byte not yet written.
-    let log = unsafe { &mut *(&raw mut LOG) };
-    let n = log.written.load(Ordering::Relaxed);
-    log.data[n as usize % LOG_DATA_BYTES] = b;
-    log.written.store(n + 1, Ordering::Release);
+    if let Some(mut log) = LOG.try_lock() {
+        let n = log.written.load(Ordering::Relaxed);
+        log.data[n as usize % LOG_DATA_BYTES] = b;
+        log.written.store(n + 1, Ordering::Release);
+    }
 }
 
 /// The log's physical address. The kernel image sits in the identity map
 /// (paging.rs), so a static's address is its physical address.
 pub fn phys() -> u64 {
-    (&raw const LOG) as u64
+    LOG.addr()
 }
