@@ -1,0 +1,19 @@
+# The compiler FreyaOS is built and tested with (Entry 30). rustup reads this
+# file here and in every directory below, so `cargo` and `rustc` in the tree
+# are this nightly whatever `rustup default` says, and `rustup update` doesn't
+# change it. Two builds of the same source with it give the same image
+# (build/reproduce.sh); with any other compiler they won't.
+#
+# Install it once:
+#   rustup toolchain install nightly-2026-04-03 --profile minimal --component rust-src
+#
+# What `rustc -vV` reports for it (build/test.sh checks this line):
+# rustc commit-hash: 55e86c996809902e8bbad512cfb4d2c18be446d9
+# (rustc 1.96.0-nightly (55e86c996 2026-04-02), LLVM 22.1.2; merged 2026-04-02 20:14 UTC)
+#
+# Moving to a newer compiler is a change like any other: edit the date and
+# the hash here, run make test and make reproduce, and say so in the journal.
+[toolchain]
+channel = "nightly-2026-04-03"
+components = ["rust-src"]
+profile = "minimal"

@@ -29,7 +29,7 @@ STAGE2    := $(OUTDIR)/stage2.bin
 KERNELELF := $(OUTDIR)/kernel.elf
 KERNELBIN := $(OUTDIR)/kernel.bin
 
-.PHONY: all build clean run trace debug test rehearse usb usb-clear
+.PHONY: all build clean run trace debug test rehearse usb usb-clear unsafe reproduce
 
 all: $(IMG)
 
@@ -38,6 +38,41 @@ build: all
 
 $(OUTDIR):
 	mkdir -p $(OUTDIR)
+
+# -------------------------
+# The compiler (Entry 30)
+# -------------------------
+# ../rust-toolchain.toml pins it: rustup reads that file in this directory
+# and the ones below it, so plain `cargo` here is the pinned nightly. (An
+# explicit `cargo +nightly`, as before Entry 30, would override the file.)
+#
+# The standard library is compiled from the toolchain's rust-src for every
+# build (-Z build-std), and its panic messages carry its source paths. Left
+# alone, those paths hold the builder's home directory and the toolchain's
+# name (/home/<you>/.rustup/toolchains/nightly-.../library/alloc/...), and
+# two machines' images differ even with the same compiler. They are
+# rewritten to /rust-src/library/..., so the image depends only on the
+# source and the compiler. `make reproduce` checks it.
+RUST_SRC   := $(shell rustc --print sysroot)/lib/rustlib/src/rust
+RUST_REMAP := --remap-path-prefix=$(RUST_SRC)=/rust-src
+# A different compiler, or different flags here, must rebuild everything,
+# even with no source changed: both are inputs to every Rust build.
+RUST_INPUTS := ../rust-toolchain.toml Makefile
+
+# -------------------------
+# Every unsafe, and why (Entry 30)
+# -------------------------
+# unsafe_check.rs reads kernel/src and fails if any unsafe lacks the comment
+# saying why it is sound; otherwise it writes the list. The kernel depends on
+# the list, so it isn't compiled until every unsafe has its reason.
+UNSAFE_CHECK := $(OUTDIR)/unsafe_check
+UNSAFE_LIST  := $(OUTDIR)/unsafe.txt
+
+$(UNSAFE_CHECK): unsafe_check.rs | $(OUTDIR)
+	rustc --edition 2021 -O unsafe_check.rs -o $@
+
+$(UNSAFE_LIST): $(UNSAFE_CHECK) $(shell find $(KERNDIR)/src -name '*.rs')
+	$(UNSAFE_CHECK) $(KERNDIR)/src $@
 
 # -------------------------
 # Kernel build
@@ -61,12 +96,12 @@ USER_RS_SRCS    := $(shell find $(USERRS)/src -name '*.rs') $(USERRS)/Cargo.toml
 USER_RS_PROGRAMS := console init captest ps2 mouse shell spin crash ticker relay hog
 USER_RS_STAMP   := $(OUTDIR)/user/.built
 
-$(USER_RS_STAMP): $(USER_RS_SRCS) | $(OUTDIR)
+$(USER_RS_STAMP): $(USER_RS_SRCS) $(RUST_INPUTS) | $(OUTDIR)
 	mkdir -p $(OUTDIR)/user
 	cd $(USERRS) && \
 	  RUST_TARGET_PATH=$(abspath $(USERRS)) \
-	  RUSTFLAGS="-C link-arg=--script=user.ld" \
-	  cargo +nightly build \
+	  RUSTFLAGS="-C link-arg=--script=user.ld $(RUST_REMAP)" \
+	  cargo build \
 	    --target x86_64-freya-user.json \
 	    --release \
 	    -Z build-std=core,compiler_builtins,alloc \
@@ -87,13 +122,13 @@ $(DEMO_STAMP): | $(OUTDIR)
 	rm -f $(OUTDIR)/.demo-*
 	touch $@
 
-$(KERNELELF): $(KERNEL_SRCS) $(DEMO_STAMP) $(USER_RS_STAMP) | $(OUTDIR)
+$(KERNELELF): $(KERNEL_SRCS) $(RUST_INPUTS) $(DEMO_STAMP) $(USER_RS_STAMP) $(UNSAFE_LIST) | $(OUTDIR)
 	cd $(KERNDIR) && \
 	  RUST_TARGET_PATH=$(abspath $(KERNDIR)) \
-	  RUSTFLAGS="-C link-arg=--script=kernel.ld" \
+	  RUSTFLAGS="-C link-arg=--script=kernel.ld $(RUST_REMAP)" \
 	  FREYA_DEMO="$(FREYA_DEMO)" \
 	  FREYA_USER_BINS=$(abspath $(OUTDIR)/user) \
-	  cargo +nightly build \
+	  cargo build \
 	    --target x86_64-freya.json \
 	    --release \
 	    -Z build-std=core,compiler_builtins,alloc \
@@ -255,6 +290,16 @@ usb-clear:
 # print a summary. Non-zero exit if anything failed. See test.sh.
 test:
 	./test.sh
+
+# Every unsafe in the kernel and why it is sound (Entry 30): the list
+# unsafe_check.rs makes from the SAFETY comments.
+unsafe: $(UNSAFE_LIST)
+	@cat $(UNSAFE_LIST)
+
+# Build a second copy of the tree in another directory and compare the two
+# images: they must be identical (Entry 30). See reproduce.sh.
+reproduce:
+	./reproduce.sh
 
 clean:
 	rm -rf $(OUTDIR)

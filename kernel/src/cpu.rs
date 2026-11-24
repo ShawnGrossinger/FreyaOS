@@ -12,6 +12,8 @@ use core::arch::asm;
 /// True if RFLAGS.IF is set (maskable interrupts enabled).
 pub fn interrupts_enabled() -> bool {
     let rflags: u64;
+    // SAFETY: [cpu] pushfq/pop only reads RFLAGS into a register, through
+    // the stack it is already on; nothing else changes.
     unsafe { asm!("pushfq", "pop {}", out(reg) rflags, options(nomem, preserves_flags)) };
     rflags & (1 << 9) != 0
 }
@@ -35,10 +37,14 @@ pub fn assert_interrupts_off(who: &[u8]) {
 pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
     let were_enabled = interrupts_enabled();
     if were_enabled {
+        // SAFETY: [cpu] cli only masks interrupts; they were on, and are
+        // turned on again below once f returns.
         unsafe { asm!("cli", options(nomem, nostack)) };
     }
     let result = f();
     if were_enabled {
+        // SAFETY: [cpu] sti restores the state found on entry (interrupts
+        // were on), so no caller sees them turned on where it had them off.
         unsafe { asm!("sti", options(nomem, nostack)) };
     }
     result
@@ -50,7 +56,9 @@ pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
 /// `msr` must exist on this CPU (otherwise #GP).
 pub unsafe fn rdmsr(msr: u32) -> u64 {
     let (lo, hi): (u32, u32);
-    asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
+    // SAFETY: [cpu] reading an MSR changes nothing; the caller promises it
+    // exists, so it doesn't fault (# Safety above).
+    unsafe { asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags)) };
     (hi as u64) << 32 | lo as u64
 }
 
@@ -59,8 +67,12 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
 /// # Safety
 /// `msr` must exist, and the value must be one the kernel can live with.
 pub unsafe fn wrmsr(msr: u32, value: u64) {
-    asm!("wrmsr", in("ecx") msr, in("eax") value as u32, in("edx") (value >> 32) as u32,
-         options(nostack, preserves_flags));
+    // SAFETY: [cpu] the caller promises the MSR exists and that the value
+    // is one the kernel keeps working with (# Safety above).
+    unsafe {
+        asm!("wrmsr", in("ecx") msr, in("eax") value as u32, in("edx") (value >> 32) as u32,
+             options(nostack, preserves_flags));
+    }
 }
 
 /// CPUID leaf `leaf`, subleaf 0: (eax, ebx, ecx, edx). RBX is reserved by
@@ -68,6 +80,8 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
 pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
     let (eax, ecx, edx): (u32, u32, u32);
     let ebx: u64;
+    // SAFETY: [cpu] cpuid only reads the CPU's description into registers;
+    // RBX, which LLVM reserves, is saved and restored around it.
     unsafe {
         asm!(
             "mov {tmp}, rbx",
@@ -96,6 +110,10 @@ pub fn enable_smep_smap() -> (bool, bool) {
     let features = cpuid(7).1;
     let smep = features & (1 << 7) != 0;
     let smap = features & (1 << 20) != 0;
+    // SAFETY: [cpu] sets only CR4.SMEP and CR4.SMAP, and only where CPUID
+    // says the CPU has them (otherwise the write would #GP). Neither
+    // changes what the kernel itself does: it never runs or touches user
+    // pages directly (the physical map is how it reaches process memory).
     unsafe {
         let mut cr4: u64;
         asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
@@ -113,6 +131,7 @@ pub fn enable_smep_smap() -> (bool, bool) {
 /// (SMEP, SMAP) as CR4 has them now.
 pub fn smep_smap_enabled() -> (bool, bool) {
     let cr4: u64;
+    // SAFETY: [cpu] reading CR4 changes nothing.
     unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
     (cr4 & (1 << 20) != 0, cr4 & (1 << 21) != 0)
 }
@@ -128,6 +147,7 @@ const KERNEL_MXCSR: u32 = 0x1F80;
 /// swap is otherwise invisible in QEMU, which doesn't raise #XM.
 pub fn assert_kernel_mxcsr(who: &[u8]) {
     let mut mxcsr: u32 = 0;
+    // SAFETY: [cpu] stmxcsr writes 4 bytes, MXCSR, to `mxcsr`, a local u32.
     unsafe { asm!("stmxcsr [{}]", in(reg) &raw mut mxcsr, options(nostack, preserves_flags)) };
     if mxcsr & !0x3F != KERNEL_MXCSR {
         crate::serial_write_str(b"[cpu] FATAL: ");

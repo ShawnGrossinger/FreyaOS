@@ -79,13 +79,22 @@ pub fn map(slot: u64, address: u64) -> i64 {
         flags & MEM_WRITE_COMBINING != 0,
         flags & MEM_UNCACHED != 0,
     );
+    // SAFETY: [paging] the running task's own address space, live while it
+    // runs.
     let mut space = unsafe { AddressSpace::from_root(sched::current_space()) };
     for i in 0..pages as u64 {
+        // SAFETY: [paging] the memory the capability names, which only the
+        // kernel creates, for memory it means to lend (the screen, the log,
+        // the console's description, a self-test's frame); mapped in the
+        // caller's user half (checked: [MAP_BASE, MAP_END)), as borrowed
+        // pages, which tearing the space down never frees.
         let result = unsafe { space.map(address + i * PAGE_SIZE, base + i * PAGE_SIZE, page_flags) };
         if let Err(e) = result {
             // Undo what was mapped; the frames were only borrowed, so
             // nothing is freed.
             for j in 0..i {
+                // SAFETY: [paging] pages this call just mapped; the process
+                // hasn't been told they exist, and the kernel never used them.
                 let _ = unsafe { space.unmap(address + j * PAGE_SIZE) };
             }
             return if e == MapError::OutOfMemory { ERR_NO_MEMORY } else { ERR_BAD_ADDRESS };
@@ -96,6 +105,7 @@ pub fn map(slot: u64, address: u64) -> i64 {
     // mapping goes now.
     if !crate::cap::record_mapping(slot as usize, serial, address) {
         for i in 0..pages as u64 {
+            // SAFETY: [paging] as above: only just mapped, and not reported.
             let _ = unsafe { space.unmap(address + i * PAGE_SIZE) };
         }
         return ERR_NO_CAPABILITY;
@@ -142,6 +152,7 @@ fn resize(slot: u64, serial: u32, target: u64) -> Result<(), i64> {
             if now != serial {
                 return Err(ERR_NO_CAPABILITY); // revoked, and the slot reused
             }
+            // SAFETY: [paging] the running task's own address space.
             let mut space = unsafe { AddressSpace::from_root(sched::current_space()) };
             if have < target {
                 let n = (target - have).min(HEAP_BATCH);
@@ -152,6 +163,9 @@ fn resize(slot: u64, serial: u32, target: u64) -> Result<(), i64> {
                 let owner = space.owner();
                 for i in have..have + n {
                     let frame = pmm::alloc(Kind::ProcessHeap, owner).ok_or(ERR_NO_MEMORY)?; // zeroed
+                    // SAFETY: [paging] a frame just allocated for this
+                    // process, zeroed, at the next page of its heap, which
+                    // nothing maps yet (the heap is `have` pages long).
                     if let Err((_, frame)) = unsafe { space.map_frame(base + i * PAGE_SIZE, frame, PageFlags::USER_DATA) } {
                         frame.free();
                         return Err(ERR_NO_MEMORY); // no frame for a page table
@@ -162,6 +176,8 @@ fn resize(slot: u64, serial: u32, target: u64) -> Result<(), i64> {
                 let n = (have - target).min(HEAP_BATCH);
                 let owner = space.owner();
                 for i in (have - n..have).rev() {
+                    // SAFETY: [paging] the heap's last page, which only the
+                    // process uses; shrinking was its own request.
                     if let Ok(frame) = unsafe { space.unmap_frame(base + i * PAGE_SIZE, Kind::ProcessHeap.bit(), owner) } {
                         frame.free();
                     }

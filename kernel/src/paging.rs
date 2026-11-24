@@ -111,6 +111,14 @@ pub(crate) fn is_boot_table(phys: u64) -> bool {
 
 /// Build the tables and switch CR3. Returns the new CR3 value.
 pub fn init() -> u64 {
+    // SAFETY: [paging] main calls this once, early at boot, with interrupts
+    // off and nothing else running. The four tables are statics in the
+    // kernel image, which is in the identity map stage 2 built, so their
+    // addresses are physical and nothing else refers to them yet. The new
+    // tables map the first 8 MiB exactly as stage 2's did (but for the stack
+    // guard page, which nothing uses), so the code, the stack and the tables
+    // themselves stay where they are across the switch. CR0.WP only makes
+    // the kernel's own writes obey read-only pages.
     unsafe {
         let pml4 = &raw mut PML4;
         let pdpt = &raw mut PDPT;
@@ -242,7 +250,10 @@ pub unsafe fn map_physical_memory(e820: &[E820Entry], early: &mut EarlyFrames) -
     let pml4 = &raw mut PML4;
     let pdpt_phys = alloc_table(early, &mut stats);
     let pml4_index = ((PHYS_MAP_BASE >> 39) & 0x1FF) as usize;
-    (*pml4).0[pml4_index] = pdpt_phys | PRESENT | WRITABLE;
+    // SAFETY: [paging] the kernel's PML4 (a static, identity-mapped); slot
+    // 256 was empty (# Safety: the first call), so no address the kernel
+    // uses changes meaning. Boot is single-threaded, interrupts off.
+    unsafe { (*pml4).0[pml4_index] = pdpt_phys | PRESENT | WRITABLE };
     let pdpt = pdpt_phys as *mut u64; // identity view: table frames are < 8 MiB
 
     for entry in e820.iter() {
@@ -260,17 +271,27 @@ pub unsafe fn map_physical_memory(e820: &[E820Entry], early: &mut EarlyFrames) -
         while phys < end {
             // One PD per GiB of physical address space, created on demand.
             let pdpt_index = ((phys >> 30) & 0x1FF) as usize;
-            let pd = if *pdpt.add(pdpt_index) & PRESENT == 0 {
-                let pd_phys = alloc_table(early, &mut stats);
-                *pdpt.add(pdpt_index) = pd_phys | PRESENT | WRITABLE;
-                pd_phys as *mut u64
-            } else {
-                (*pdpt.add(pdpt_index) & ADDR_MASK) as *mut u64
-            };
-
             let pd_index = ((phys >> 21) & 0x1FF) as usize;
-            if *pd.add(pd_index) & PRESENT == 0 {
-                *pd.add(pd_index) = phys | leaf_flags;
+            // SAFETY: [paging] pdpt and every pd are early frames (zeroed,
+            // below 8 MiB, so reached through the identity map), owned by
+            // this function until it returns; both indexes are < 512. The
+            // entries written map the physical map's half of the address
+            // space, which nothing uses until PHYS_MAP_READY is set below.
+            let fresh = unsafe {
+                let pd = if *pdpt.add(pdpt_index) & PRESENT == 0 {
+                    let pd_phys = alloc_table(early, &mut stats);
+                    *pdpt.add(pdpt_index) = pd_phys | PRESENT | WRITABLE;
+                    pd_phys as *mut u64
+                } else {
+                    (*pdpt.add(pdpt_index) & ADDR_MASK) as *mut u64
+                };
+                let fresh = *pd.add(pd_index) & PRESENT == 0;
+                if fresh {
+                    *pd.add(pd_index) = phys | leaf_flags;
+                }
+                fresh
+            };
+            if fresh {
                 stats.huge_pages += 1;
                 stats.bytes_mapped += HUGE_PAGE_SIZE;
             }
@@ -285,8 +306,12 @@ pub unsafe fn map_physical_memory(e820: &[E820Entry], early: &mut EarlyFrames) -
     // non-present entries changed, which the TLB doesn't cache, but this is
     // cheap and removes the question.
     let cr3: u64;
-    asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
-    asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+    // SAFETY: [paging] reloads CR3 with the value it has: the same tables,
+    // only the TLB flushed.
+    unsafe {
+        asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+        asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+    }
 
     PHYS_MAP_READY.store(true, Ordering::Release);
     stats
@@ -330,43 +355,18 @@ fn enable_no_execute() -> bool {
     const IA32_EFER: u32 = 0xC000_0080;
     const EFER_NXE: u64 = 1 << 11;
 
-    let (max_ext, _) = cpuid(0x8000_0000);
-    if max_ext < 0x8000_0001 {
+    if crate::cpu::cpuid(0x8000_0000).0 < 0x8000_0001 {
         return false;
     }
-    let (_, edx) = cpuid(0x8000_0001);
-    if edx & (1 << 20) == 0 {
+    if crate::cpu::cpuid(0x8000_0001).3 & (1 << 20) == 0 {
         return false;
     }
 
-    unsafe {
-        let (lo, hi): (u32, u32);
-        asm!("rdmsr", in("ecx") IA32_EFER, out("eax") lo, out("edx") hi,
-             options(nomem, nostack, preserves_flags));
-        let efer = ((hi as u64) << 32 | lo as u64) | EFER_NXE;
-        asm!("wrmsr", in("ecx") IA32_EFER, in("eax") efer as u32, in("edx") (efer >> 32) as u32,
-             options(nostack, preserves_flags));
-    }
+    // SAFETY: [cpu] EFER exists on every CPU in long mode; only NXE is
+    // added, which CPUID says this CPU has. No entry sets bit 63 yet, so
+    // nothing changes meaning.
+    unsafe { crate::cpu::wrmsr(IA32_EFER, crate::cpu::rdmsr(IA32_EFER) | EFER_NXE) };
     true
-}
-
-/// CPUID leaf -> (eax, edx). rbx is reserved by LLVM, so it is saved and
-/// restored around the instruction by hand.
-fn cpuid(leaf: u32) -> (u32, u32) {
-    let (eax, edx): (u32, u32);
-    unsafe {
-        asm!(
-            "mov {tmp}, rbx",
-            "cpuid",
-            "mov rbx, {tmp}",
-            tmp = out(reg) _,
-            inout("eax") leaf => eax,
-            inout("ecx") 0u32 => _,
-            out("edx") edx,
-            options(nostack, preserves_flags),
-        );
-    }
-    (eax, edx)
 }
 
 // ===========================================================================
@@ -386,84 +386,93 @@ fn cpuid(leaf: u32) -> (u32, u32) {
 /// Call after map_physical_memory() and pmm::init(). Temporarily
 /// allocates every free frame below 8 MiB (about 7 MiB).
 pub unsafe fn selftest(e820: &[E820Entry]) -> bool {
-    use crate::pmm::{self, Kind, Owner};
-    use crate::{serial_write_hex as hex, serial_write_str as s, serial_write_u64 as dec};
+    // SAFETY: [phys] boot, single-threaded, interrupts off (# Safety: after
+    // map_physical_memory and pmm::init). Every frame touched in tests 1 and 2
+    // is one this test holds (alloc, or into_phys and reclaim for the chain),
+    // reached through the physical map; the alias read in test 1 uses the
+    // identity map, which holds the first 8 MiB, where the first free frame is.
+    // Test 3 writes the last usable frame, whoever has it, and puts back what
+    // was there before anything else runs.
+    unsafe {
+        use crate::pmm::{self, Kind, Owner};
+        use crate::{serial_write_hex as hex, serial_write_str as s, serial_write_u64 as dec};
 
-    let mut ok = true;
+        let mut ok = true;
 
-    // --- 1. alias ---
-    let alias_ok = match pmm::alloc(Kind::Test, Owner::Kernel) {
-        Some(held) => {
-            let frame = held.phys();
-            phys_to_virt(frame).write_volatile(0x5A);
-            let seen = (frame as *const u8).read_volatile(); // identity view
-            held.free();
-            seen == 0x5A
-        }
-        None => false,
-    };
-    s(b"[paging] self-test alias (physmap write, identity read)");
-    ok &= crate::selftest::verdict(alias_ok);
+        // --- 1. alias ---
+        let alias_ok = match pmm::alloc(Kind::Test, Owner::Kernel) {
+            Some(held) => {
+                let frame = held.phys();
+                phys_to_virt(frame).write_volatile(0x5A);
+                let seen = (frame as *const u8).read_volatile(); // identity view
+                held.free();
+                seen == 0x5A
+            }
+            None => false,
+        };
+        s(b"[paging] self-test alias (physmap write, identity read)");
+        ok &= crate::selftest::verdict(alias_ok);
 
-    // --- 2. allocate past the old 8 MiB limit ---
-    let mut chain: u64 = 0; // physical address of the last frame, 0 = end
-    let mut count: u64 = 0;
-    let mut all_zeroed = true;
-    let mut high_frame: u64 = 0;
-    // Each frame is stored by address in the one before (into_phys), and
-    // taken back by address at the end (reclaim).
-    while let Some(held) = pmm::alloc(Kind::Test, Owner::Kernel) {
-        let frame = held.into_phys();
-        let words = phys_to_virt(frame) as *mut u64;
-        for i in 0..(PAGE_SIZE as usize / 8) {
-            if words.add(i).read_volatile() != 0 {
-                all_zeroed = false;
+        // --- 2. allocate past the old 8 MiB limit ---
+        let mut chain: u64 = 0; // physical address of the last frame, 0 = end
+        let mut count: u64 = 0;
+        let mut all_zeroed = true;
+        let mut high_frame: u64 = 0;
+        // Each frame is stored by address in the one before (into_phys), and
+        // taken back by address at the end (reclaim).
+        while let Some(held) = pmm::alloc(Kind::Test, Owner::Kernel) {
+            let frame = held.into_phys();
+            let words = phys_to_virt(frame) as *mut u64;
+            for i in 0..(PAGE_SIZE as usize / 8) {
+                if words.add(i).read_volatile() != 0 {
+                    all_zeroed = false;
+                }
+            }
+            words.write_volatile(chain); // link to the previous frame
+            chain = frame;
+            count += 1;
+            if frame >= IDENTITY_MAP_BYTES {
+                high_frame = frame;
+                break;
             }
         }
-        words.write_volatile(chain); // link to the previous frame
-        chain = frame;
-        count += 1;
-        if frame >= IDENTITY_MAP_BYTES {
-            high_frame = frame;
-            break;
+        while chain != 0 {
+            let next = (phys_to_virt(chain) as *const u64).read_volatile();
+            pmm::Frame::reclaim(chain, Kind::Test.bit(), Owner::Kernel).free();
+            chain = next;
         }
-    }
-    while chain != 0 {
-        let next = (phys_to_virt(chain) as *const u64).read_volatile();
-        pmm::Frame::reclaim(chain, Kind::Test.bit(), Owner::Kernel).free();
-        chain = next;
-    }
-    let alloc_ok = high_frame != 0 && all_zeroed;
-    s(b"[paging] self-test allocator: ");
-    dec(count);
-    s(b" frames, first above 8 MiB at ");
-    hex(high_frame);
-    s(if all_zeroed { b", all zeroed" } else { b", NOT ZEROED" });
-    ok &= crate::selftest::verdict(alloc_ok);
+        let alloc_ok = high_frame != 0 && all_zeroed;
+        s(b"[paging] self-test allocator: ");
+        dec(count);
+        s(b" frames, first above 8 MiB at ");
+        hex(high_frame);
+        s(if all_zeroed { b", all zeroed" } else { b", NOT ZEROED" });
+        ok &= crate::selftest::verdict(alloc_ok);
 
-    // --- 3. last usable frame ---
-    let mut top: u64 = 0;
-    for entry in e820.iter() {
-        let (base, length, kind) = (entry.base, entry.length, entry.region_type);
-        if kind == 1 && length >= PAGE_SIZE {
-            top = top.max((base + length) & !(PAGE_SIZE - 1));
+        // --- 3. last usable frame ---
+        let mut top: u64 = 0;
+        for entry in e820.iter() {
+            let (base, length, kind) = (entry.base, entry.length, entry.region_type);
+            if kind == 1 && length >= PAGE_SIZE {
+                top = top.max((base + length) & !(PAGE_SIZE - 1));
+            }
         }
-    }
-    let top_ok = if top >= PAGE_SIZE && top <= PHYS_MAP_MAX {
-        let last = top - PAGE_SIZE;
-        let p = phys_to_virt(last) as *mut u64;
-        let saved = p.read_volatile();
-        p.write_volatile(0xF4E7_A05F_4E7A_05F4);
-        let seen = p.read_volatile();
-        p.write_volatile(saved);
-        s(b"[paging] self-test top of RAM: frame ");
-        hex(last);
-        seen == 0xF4E7_A05F_4E7A_05F4
-    } else {
-        s(b"[paging] self-test top of RAM: no usable region found");
-        false
-    };
-    ok &= crate::selftest::verdict(top_ok);
+        let top_ok = if top >= PAGE_SIZE && top <= PHYS_MAP_MAX {
+            let last = top - PAGE_SIZE;
+            let p = phys_to_virt(last) as *mut u64;
+            let saved = p.read_volatile();
+            p.write_volatile(0xF4E7_A05F_4E7A_05F4);
+            let seen = p.read_volatile();
+            p.write_volatile(saved);
+            s(b"[paging] self-test top of RAM: frame ");
+            hex(last);
+            seen == 0xF4E7_A05F_4E7A_05F4
+        } else {
+            s(b"[paging] self-test top of RAM: no usable region found");
+            false
+        };
+        ok &= crate::selftest::verdict(top_ok);
 
-    ok
+        ok
+    }
 }

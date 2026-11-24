@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 extern crate alloc; // Box, Vec, String, BTreeMap, backed by heap.rs
 
@@ -42,27 +43,40 @@ use boot::read_e820_map;
 // Very small serial logger (COM1). QEMU: -serial stdio
 const COM1: u16 = 0x3F8;
 
+/// Write a byte to an I/O port.
+///
+/// # Safety
+/// The port must belong to a device the caller drives (here, COM1), and the
+/// byte must be one that device expects: a port write can reset the machine
+/// or reprogram any device.
 #[inline(always)]
 unsafe fn outb(port: u16, val: u8) {
-
-    core::arch::asm!(
-        "out dx, al", 
-        in("dx") port, in("al") val, 
-        options(nomem, nostack, preserves_flags)
-    );
+    // SAFETY: [port] the caller chose the port and the value (# Safety).
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") port, in("al") val,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 }
 
+/// Read a byte from an I/O port.
+///
+/// # Safety
+/// The port must belong to a device the caller drives: some devices act on
+/// a read (a status register cleared by reading it, say).
 #[inline(always)]
 unsafe fn inb(port: u16) -> u8 {
-
     let mut val: u8;
-
-    core::arch::asm!(
-        "in al, dx", 
-        in("dx") port, out("al") val, 
-        options(nomem, nostack, preserves_flags)
-    );
-
+    // SAFETY: [port] the caller chose the port (# Safety).
+    unsafe {
+        core::arch::asm!(
+            "in al, dx",
+            in("dx") port, out("al") val,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
     val
 }
 
@@ -71,9 +85,11 @@ unsafe fn inb(port: u16) -> u8 {
 static SERIAL_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn serial_init() {
-
+    // SAFETY: [port] COM1's eight ports (0x3F8-0x3FF) belong to the kernel's
+    // serial log and nothing else; the PC's I/O map reserves them for it. On
+    // a machine with no UART there (the T430) the probe's writes go nowhere
+    // and its reads return 0xFF, so nothing else is written.
     unsafe {
-
         // A UART's scratch register (base + 7) keeps what is written to
         // it; an empty port reads back 0xFF or 0x00.
         outb(COM1 + 7, 0xA5);
@@ -97,14 +113,17 @@ fn serial_init() {
 
 /// Every byte of output goes to the system log (log.rs, which the console
 /// driver shows), to the kernel's own screen log, and, if there is one, to
-/// COM1.
+/// COM1. With interrupts off: log::push needs them off (Entry 30: its new
+/// check found serial_write_hex calling here with them on).
 fn serial_write_byte(b: u8) {
-    if b != b'\r' {
-        log::push(b);
-        console::notify(console::SIGNAL_LOG);
-    }
-    screen_log_byte(b);
-    uart_byte(b);
+    cpu::without_interrupts(|| {
+        if b != b'\r' {
+            log::push(b);
+            console::notify(console::SIGNAL_LOG);
+        }
+        screen_log_byte(b);
+        uart_byte(b);
+    })
 }
 
 /// One byte to the UART, if there is one; nothing else.
@@ -112,6 +131,8 @@ fn uart_byte(b: u8) {
     if !SERIAL_PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    // SAFETY: [port] COM1, found by serial_init: its line status register
+    // (base + 5) and its transmit register (base + 0).
     unsafe {
         // Wait for the transmitter holding register to empty, but not
         // forever: a UART that stops answering mustn't hang the kernel.
@@ -174,6 +195,9 @@ fn log_rows() -> usize {
 
 fn screen_log_byte(b: u8) {
     cpu::without_interrupts(|| {
+        // SAFETY: [static] interrupts are off and there is one CPU, so
+        // nothing else reaches SCREEN_LOG until this closure returns; it is
+        // reached only from these three functions, each the same way.
         let log = unsafe { &mut *(&raw mut SCREEN_LOG) };
         match b {
             b'\r' => {}
@@ -227,6 +251,8 @@ fn screen_log_draw(log: &ScreenLog) {
 /// scrolled off by the report itself.
 fn screen_log_snapshot() -> Snapshot {
     cpu::without_interrupts(|| {
+        // SAFETY: [static] a shared reference with interrupts off on one
+        // CPU: screen_log_byte, the only writer, can't run until it's gone.
         let log = unsafe { &*(&raw const SCREEN_LOG) };
         let mut out = [[b' '; SNAPSHOT_COLS]; SNAPSHOT_ROWS];
         let kept = log.total.min(HISTORY);
@@ -266,6 +292,8 @@ fn crash_screen(lines: &[&[u8]], before: &Snapshot) {
 /// The line printed so far (up to LINE_MAX bytes), for selftest.rs.
 fn current_line(out: &mut [u8; LINE_MAX]) -> usize {
     cpu::without_interrupts(|| {
+        // SAFETY: [static] as in screen_log_snapshot: read with interrupts
+        // off, so the only writer can't run meanwhile.
         let log = unsafe { &*(&raw const SCREEN_LOG) };
         *out = log.line;
         log.line_len
@@ -340,14 +368,13 @@ fn serial_write_u64(mut n: u64) {
 /// Write a u64 as hex (0xXXXXXXXXXXXXXXXX) to serial
 #[inline(never)]
 fn serial_write_hex(n: u64) {
-    serial_write_str(b"0x");
-
-    for shift in (0..16).rev() {
-
+    // One write, so an interrupt's own output can't land inside the number.
+    let mut buf = *b"0x0000000000000000";
+    for (i, shift) in (0..16).rev().enumerate() {
         let nibble = ((n >> (shift * 4)) & 0xF) as u8;
-        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-        serial_write_byte(ch);
+        buf[2 + i] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
     }
+    serial_write_str(&buf);
 }
 
 
@@ -417,6 +444,9 @@ pub extern "C" fn rust_start() -> ! {
     let int3_ok = selftest::check(b"idt", b"int3 handler returns with registers intact", int3_ok);
 
     // --- Read E820 memory map left by stage2 ---
+    // SAFETY: [phys] the one call, early at boot as read_e820_map asks:
+    // stage 2's map is still where it left it, in the low 1 MiB, which
+    // nothing writes and the frame allocator never hands out.
     let e820 = unsafe { read_e820_map() };
 
     if e820.is_empty() {
@@ -447,6 +477,8 @@ pub extern "C" fn rust_start() -> ! {
     // kernel: the real allocator can't exist yet, because its bitmap is
     // reached through this map.
     let mut early = pmm::EarlyFrames::after_kernel(e820, paging::physmap_table_bound(e820));
+    // SAFETY: [paging] the one call, before pmm::init, with stage 2's map
+    // and `early` sized by physmap_table_bound for that same map.
     let pm = unsafe { paging::map_physical_memory(e820, &mut early) };
     serial_write_str(b"[paging] physical map at ");
     serial_write_hex(paging::PHYS_MAP_BASE);
@@ -462,6 +494,8 @@ pub extern "C" fn rust_start() -> ! {
 
     // --- Frame allocator: bitmap sized from E820, placed in RAM ---
     let (kernel_start, kernel_end) = pmm::kernel_image();
+    // SAFETY: [phys] the one call, right after map_physical_memory, with
+    // the frames the early page tables took, so it marks them in use.
     let ps = unsafe { pmm::init(e820, early.used()) };
     serial_write_str(b"[pmm] bitmap: ");
     serial_write_u64(ps.bitmap_bytes / 1024);
@@ -487,6 +521,8 @@ pub extern "C" fn rust_start() -> ! {
 
     // --- The screen: map the framebuffer, if stage 2 set a graphics mode ---
     // As early as it can be: it needs the frame allocator for page tables.
+    // SAFETY: [mmio] the one call, with the frame allocator and the
+    // kernel's page tables (vmm) working, as attach requires.
     let attached = unsafe { display::attach() };
     display::describe();
     let mut display_ok = match attached {
@@ -494,10 +530,15 @@ pub extern "C" fn rust_start() -> ! {
         Err(why) => selftest::check(b"display", why, false),
     };
 
+    // SAFETY: [phys] after pmm::init, and before anything else is running
+    // that could want the frames the tests borrow.
     let pmm_ok = unsafe { pmm::selftest(e820) };
+    // SAFETY: [phys] after map_physical_memory and pmm::init, as it needs.
     let physmap_ok = unsafe { paging::selftest(e820) };
 
     // --- Page mapping API: map/unmap/translate 4 KiB pages ---
+    // SAFETY: [paging] the kernel's page tables and the frame allocator are
+    // up, and no task exists yet to be using the addresses it maps.
     let vmm_ok = unsafe { vmm::selftest() };
     display_ok &= display::selftest();
 
@@ -512,6 +553,9 @@ pub extern "C" fn rust_start() -> ! {
             serial_write_str(b"\n");
 
             // Verify zeroed (Sanitized invariant check).
+            // SAFETY: [phys] the frame is this code's (`frame` holds it) and
+            // the physical map covers all RAM; the slice is dropped before
+            // the frame is freed.
             let slice = unsafe { core::slice::from_raw_parts(paging::phys_to_virt(frame.phys()), pmm::PAGE_SIZE as usize) };
             let all_zero = slice.iter().all(|&b| b == 0);
             frame.free();
@@ -712,6 +756,8 @@ pub extern "C" fn rust_start() -> ! {
         sched::exit();
     }
     loop {
+        // SAFETY: [cpu] with no scheduler there is nothing left to run but
+        // interrupt handlers: let them in, and wait for the next one.
         unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
     }
 }
@@ -868,77 +914,91 @@ fn run_requested_demo() {
     serial_write_str(demo.as_bytes());
     serial_write_str(b"\n");
 
-    unsafe {
-        match demo {
-            // #UD, vector 6
-            "ud2" => core::arch::asm!("ud2"),
-            // #PF, not present: above everything that is mapped
-            "page_fault" => {
-                core::ptr::read_volatile(0x1000_0000 as *const u8);
-            }
-            // #DF on IST1 after the stack hits its guard page
-            "stack_overflow" => {
-                demo_stack_overflow(0);
-            }
-            // The same, on a task's 16 KiB stack instead of the boot stack
-            "task_stack_overflow" => sched::demo_task_stack_overflow(),
-            // #PF: the kernel reads (SMAP) or runs (SMEP) a process's page.
-            // Needs a CPU that has them: QEMU -cpu max, or SMEP on the T430.
-            "smap" => process::demo_kernel_touches_user(false),
-            "smep" => process::demo_kernel_touches_user(true),
-            // #PF, instruction fetch: kernel code through its no-execute
-            // physical-map alias
-            "nx" => {
-                let f: extern "C" fn() = core::mem::transmute(paging::phys_to_virt(0x10_0000));
-                f();
-            }
-            // #PF, not present: used, unmapped, used again
-            "use_after_unmap" => vmm::demo_use_after_unmap(),
-            // #PF, protection violation on a write
-            "write_read_only" => vmm::demo_write_read_only(),
-            // [heap] FATAL: double free
-            "heap_double_free" => heap::demo_double_free(),
-            // [pmm] FATAL (Entry 29): a frame dropped while held, and the
-            // kernel image's first frame given back as if it were heap
-            "lost_frame" => pmm::demo_lost_frame(),
-            "free_kernel_image" => pmm::demo_free_kernel_image(),
-            // [kernel] PANIC with file and line
-            "panic" => panic!("FREYA_DEMO=panic"),
-            // Not faults (Entries 20, 21 and 23): the console driver killed, so
-            // init must start it again; init and then the console driver
-            // killed, or the console driver killed more often than init
-            // starts it again, so the kernel must take the screen back and
-            // the keyboard driver must carry on without it; and the log
-            // flooded past the console's 400 rows, then a line every
-            // quarter second.
-            "kill_console" => {
-                demo_kill_console();
+    match demo {
+        // #UD, vector 6
+        // SAFETY: [fault] an invalid instruction on purpose: the #UD
+        // handler reports it and halts.
+        "ud2" => unsafe { core::arch::asm!("ud2") },
+        // #PF, not present: above everything that is mapped
+        "page_fault" => {
+            // SAFETY: [fault] nothing is mapped at 256 MiB in the
+            // kernel's space, so this faults (and halts) before reading.
+            unsafe { core::ptr::read_volatile(0x1000_0000 as *const u8) };
+        }
+        // #DF on IST1 after the stack hits its guard page
+        "stack_overflow" => {
+            demo_stack_overflow(0);
+        }
+        // The same, on a task's 16 KiB stack instead of the boot stack
+        "task_stack_overflow" => sched::demo_task_stack_overflow(),
+        // #PF: the kernel reads (SMAP) or runs (SMEP) a process's page.
+        // Needs a CPU that has them: QEMU -cpu max, or SMEP on the T430.
+        "smap" => process::demo_kernel_touches_user(false),
+        "smep" => process::demo_kernel_touches_user(true),
+        // #PF, instruction fetch: kernel code through its no-execute
+        // physical-map alias
+        "nx" => {
+            // Without NX the alias is executable, and the call would run
+            // the kernel's entry code again instead of faulting.
+            if !paging::nx_enabled() {
+                serial_write_str(b"[demo] this CPU has no NX: nothing to show\n");
                 return;
             }
-            "kill_init" => {
-                demo_kill_init();
-                return;
-            }
-            "kill_console_often" => {
-                demo_kill_console_often();
-                return;
-            }
-            "log_flood" => {
-                demo_log_flood();
-                return;
-            }
-            // The shell killed (Entry 23): init starts it again, and
-            // typing reaches the new one.
-            "kill_shell" => {
-                demo_kill_shell();
-                return;
-            }
-            _ => {
-                serial_write_str(b"[demo] unknown; known: ud2 page_fault stack_overflow \
-                                   task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free panic \
-                                   kill_console kill_init kill_console_often log_flood kill_shell\n");
-                return;
-            }
+            // SAFETY: [fault] the kernel's code seen through the physical
+            // map, whose pages are no-execute (checked just above):
+            // fetching from it faults before a single instruction runs.
+            let f: extern "C" fn() = unsafe { core::mem::transmute(paging::phys_to_virt(0x10_0000)) };
+            f();
+        }
+        // #PF, not present: used, unmapped, used again
+        // SAFETY: [fault] boot is done with the address it maps; it
+        // faults and halts.
+        "use_after_unmap" => unsafe { vmm::demo_use_after_unmap() },
+        // #PF, protection violation on a write
+        // SAFETY: [fault] as above: it faults and halts.
+        "write_read_only" => unsafe { vmm::demo_write_read_only() },
+        // [heap] FATAL: double free
+        "heap_double_free" => heap::demo_double_free(),
+        // [pmm] FATAL (Entry 29): a frame dropped while held, and the
+        // kernel image's first frame given back as if it were heap
+        "lost_frame" => pmm::demo_lost_frame(),
+        "free_kernel_image" => pmm::demo_free_kernel_image(),
+        // [kernel] PANIC with file and line
+        "panic" => panic!("FREYA_DEMO=panic"),
+        // Not faults (Entries 20, 21 and 23): the console driver killed, so
+        // init must start it again; init and then the console driver
+        // killed, or the console driver killed more often than init
+        // starts it again, so the kernel must take the screen back and
+        // the keyboard driver must carry on without it; and the log
+        // flooded past the console's 400 rows, then a line every
+        // quarter second.
+        "kill_console" => {
+            demo_kill_console();
+            return;
+        }
+        "kill_init" => {
+            demo_kill_init();
+            return;
+        }
+        "kill_console_often" => {
+            demo_kill_console_often();
+            return;
+        }
+        "log_flood" => {
+            demo_log_flood();
+            return;
+        }
+        // The shell killed (Entry 23): init starts it again, and
+        // typing reaches the new one.
+        "kill_shell" => {
+            demo_kill_shell();
+            return;
+        }
+        _ => {
+            serial_write_str(b"[demo] unknown; known: ud2 page_fault stack_overflow \
+                               task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free panic \
+                               kill_console kill_init kill_console_often log_flood kill_shell\n");
+            return;
         }
     }
     serial_write_str(b"[demo] returned without faulting\n");
@@ -1066,8 +1126,9 @@ fn demo_stack_overflow(depth: u64) -> u64 {
 }
 
 fn halt() -> ! {
-
     loop {
+        // SAFETY: [cpu] stops the CPU for good: interrupts off, then halt
+        // (and halt again should an NMI wake it).
         unsafe { core::arch::asm!("cli; hlt"); }
     }
 }

@@ -243,19 +243,32 @@ static mut MAPPINGS: [u64; POSITIONS] = [0; POSITIONS];
 static mut HEAPS: [u32; POSITIONS] = [0; POSITIONS];
 static mut NEXT_SERIAL: u32 = 1;
 
+// Each of these hands out the whole array, so the rule that keeps them
+// sound is the callers': interrupts off (checked here), one CPU, and each
+// result used at once, never kept while another is made or across a task
+// switch. Every caller indexes it in the same expression.
 fn serials() -> &'static mut [u32; POSITIONS] {
+    crate::cpu::assert_interrupts_off(b"cap serials");
+    // SAFETY: [static] interrupts off on the one CPU (just checked), and
+    // used at once by the caller, as the comment above says.
     unsafe { &mut *(&raw mut SERIALS) }
 }
 
 fn parents() -> &'static mut [u16; POSITIONS] {
+    crate::cpu::assert_interrupts_off(b"cap parents");
+    // SAFETY: [static] as serials().
     unsafe { &mut *(&raw mut PARENTS) }
 }
 
 fn mappings() -> &'static mut [u64; POSITIONS] {
+    crate::cpu::assert_interrupts_off(b"cap mappings");
+    // SAFETY: [static] as serials().
     unsafe { &mut *(&raw mut MAPPINGS) }
 }
 
 fn heaps() -> &'static mut [u32; POSITIONS] {
+    crate::cpu::assert_interrupts_off(b"cap heaps");
+    // SAFETY: [static] as serials().
     unsafe { &mut *(&raw mut HEAPS) }
 }
 
@@ -305,8 +318,11 @@ pub fn put(task: TaskId, slot: usize, cap: Cap, from: Origin) -> bool {
         None => 0,
     };
     let p = position(task, slot);
+    crate::cpu::assert_interrupts_off(b"cap put");
     crate::sched::task(task).caps[slot] = cap;
     retain(cap);
+    // SAFETY: [static] interrupts off (checked above) on the one CPU, and
+    // this is the only reference to NEXT_SERIAL anywhere.
     let next = unsafe { &mut *(&raw mut NEXT_SERIAL) };
     serials()[p] = *next;
     *next = next.wrapping_add(1).max(1);
@@ -374,6 +390,9 @@ fn unmap_mapping(task: TaskId, p: usize, cap: Cap) {
     if root == 0 {
         return;
     }
+    // SAFETY: [paging] space_of gives the root of the task's own address
+    // space, which lives until the task is reaped; it is still in the task
+    // table, so it hasn't been.
     let mut space = unsafe { crate::vmm::AddressSpace::from_root(root) };
     match cap {
         Cap::Memory { pages, .. } => {
@@ -382,6 +401,11 @@ fn unmap_mapping(task: TaskId, p: usize, cap: Cap) {
                 return;
             }
             for i in 0..pages as u64 {
+                // SAFETY: [paging] pages in the task's user half that
+                // mem::map put there for this capability (MAPPINGS says
+                // where). The kernel keeps no reference into them; if the
+                // process touches them again it faults, which is the
+                // capability's revocation taking effect.
                 let _ = unsafe { space.unmap(at + i * crate::pmm::PAGE_SIZE) };
             }
         }
@@ -390,6 +414,9 @@ fn unmap_mapping(task: TaskId, p: usize, cap: Cap) {
             let owner = space.owner();
             for i in 0..heaps()[p] as u64 {
                 let page = base + i * crate::pmm::PAGE_SIZE;
+                // SAFETY: [paging] the heap's pages, which only the process
+                // uses (the kernel keeps no reference into a heap), taken
+                // back as ProcessHeap frames of the space's owner.
                 if let Ok(frame) = unsafe { space.unmap_frame(page, crate::pmm::Kind::ProcessHeap.bit(), owner) } {
                     frame.free();
                 }
@@ -602,6 +629,9 @@ pub fn selftest() -> bool {
             crate::ipc::release_created(ep);
             let status = tester.ok().and_then(|id| sched::join_timeout(id, WAIT_TICKS));
             sched::reap(); // its mappings gone with it, before the page is freed
+            // SAFETY: [phys] the test's own frame (`page` still holds it),
+            // through the physical map; captest, which had it mapped, has
+            // been reaped.
             let word = unsafe { (crate::paging::phys_to_virt(frame) as *const u64).read_volatile() };
             page.free();
             (status == code(CAPTEST_REVOKE_ALL), word == WRITTEN)

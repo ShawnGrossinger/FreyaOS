@@ -74,11 +74,15 @@ const IF: u64 = 1 << 9;
 /// The BIOS returned from stage2's disk and memory-map calls with
 /// interrupts enabled.
 pub fn bios_left_interrupts_on() -> bool {
+    // SAFETY: [phys] stage 2 wrote these two bytes at 0x04F0, in the low
+    // 1 MiB, which is identity-mapped and never given to the frame allocator.
     unsafe { (BIOS_FLAGS_ADDR as *const u16).read_volatile() as u64 & IF != 0 }
 }
 
 /// Interrupts were enabled when the kernel was entered.
 pub fn entered_with_interrupts_on() -> bool {
+    // SAFETY: [switch] entry_rflags is a u64 in entry.asm's data, written
+    // once by _start before any Rust runs and never again.
     unsafe { core::ptr::read_volatile(&raw const entry_rflags) & IF != 0 }
 }
 
@@ -115,6 +119,9 @@ const DISPLAY_MAGIC: u32 = u32::from_le_bytes(*b"FDSP");
 
 /// The display hand-off, or None if stage 2 didn't write one.
 pub fn display_info() -> Option<DisplayInfo> {
+    // SAFETY: [phys] stage 2's display hand-off at 0x0900, in the low 1 MiB
+    // (identity-mapped, never given to the frame allocator); every offset
+    // read is inside the record stage2.asm's DI_* constants describe.
     let b = |off: usize| unsafe { ((DISPLAY_INFO_ADDR + off) as *const u8).read_volatile() };
     let w = |off: usize| b(off) as u32 | (b(off + 1) as u32) << 8;
     let d = |off: usize| w(off) | w(off + 2) << 16;
@@ -146,15 +153,20 @@ pub fn display_info() -> Option<DisplayInfo> {
 /// stage2 has run and before anything overwrites that region. Call this
 /// exactly once, early in '_start', before the frame allocator is initialised.
 pub unsafe fn read_e820_map() -> &'static [E820Entry] {
-
-    let count = *(E820_COUNT_ADDR as *const u16) as usize;
+    // SAFETY: [phys] stage 2 left the count at 0x0500 (# Safety: it has run
+    // and nothing has written there since); low memory is identity-mapped.
+    let count = unsafe { *(E820_COUNT_ADDR as *const u16) } as usize;
     let count = count.min(E820_MAX_ENTRIES); // clamp defensively
 
     if count == 0 {
         return &[];
     }
 
-    core::slice::from_raw_parts(E820_BUFFER_ADDR as *const E820Entry, count)
+    // SAFETY: [phys] up to 32 entries of 24 bytes from 0x0504, all below
+    // the display hand-off at 0x0900; E820Entry is packed, so any address
+    // is aligned for it. The frame allocator never hands out the low 1 MiB,
+    // so the slice stays as stage 2 left it for as long as the kernel runs.
+    unsafe { core::slice::from_raw_parts(E820_BUFFER_ADDR as *const E820Entry, count) }
 }
 /* 
 /// -----------------------------------------------------------------

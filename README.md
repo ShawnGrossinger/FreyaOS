@@ -32,11 +32,12 @@ been practical on ordinary hardware all along, is in the manifesto (see
 | Drivers | I/O-port, interrupt-line and memory capabilities, and interrupts delivered as signals; a console driver, a PS/2 driver (keyboard and controller) and a mouse driver, all in Rust, running as user processes, started by init |
 | Shell | A first shell in Rust: line editing with history, built-in commands (help, echo, ps with each task's memory, caps, uptime, mem by kind, restart, off), programs started and stopped (run, jobs, kill), and what it lent them taken back (revoke), holding nine capabilities and nothing else |
 | Power | Restart and switch-off through ACPI, behind a Power capability (Ctrl+Alt+Del, Ctrl+Alt+End, or the shell's restart and off) |
+| Trust | Every `unsafe` in the kernel carries the reason it is sound, and the kernel doesn't build without them; the compiler is pinned, and two builds of the same source give the same image, byte for byte |
 | Not yet | UEFI boot, disk, network, file system, memory that grows as a program runs, multiple CPUs |
 
 Every boot runs **101 self-tests** and shows the result on screen. `make test`
-checks the disk image and boots **41 configurations** headless, checking each
-one.
+checks the disk image and every `unsafe`'s reason, and boots **40
+configurations** headless, checking each one (42 cases in all).
 
 ## Design in brief
 
@@ -83,6 +84,14 @@ one.
   check against the table, so a double free, a free by the wrong owner or a
   free of the kernel's own image halts the kernel instead of corrupting
   memory. `ps` shows what each task owns; `mem` what all memory is doing.
+- **Unsafe code is where trust is required** (the manifesto's Section 6.4).
+  Every `unsafe` block in the kernel has a `// SAFETY: [category] why`
+  comment, and every `unsafe fn` a `# Safety` section; no unsafe operation
+  hides in an `unsafe fn`'s body without its own block
+  (`#![deny(unsafe_op_in_unsafe_fn)]`). `build/unsafe_check.rs` fails the
+  build if one is missing, and writes the list: `make unsafe` prints it,
+  counted by category (port I/O, device registers, physical memory, page
+  tables, `static mut` state, context switches, ...).
 - **Init decides, the kernel enforces.** At the end of boot the kernel starts
   one process, init, with every capability the drivers will need. Init mints
   narrower copies, starts the console, PS/2 and mouse drivers and the shell
@@ -137,28 +146,38 @@ bootloader/UEFI/   placeholder for a later UEFI loader
 kernel/            Rust kernel: entry.asm, kernel.ld, src/*.rs
 user/              user programs in NASM (test programs)
 user/rust/         user programs in Rust (init; the console, PS/2 and mouse drivers; the shell; spin, crash, ticker, relay and hog), and their library with its allocator
-build/             Makefile, test.sh, write-usb.sh
+build/             Makefile, test.sh, write-usb.sh, reproduce.sh, unsafe_check.rs
 docs/              the manifesto (the design) and the development journal
+rust-toolchain.toml the pinned compiler
 ```
 
 ## Building
 
-Needs NASM, `llvm-objcopy`, Rust **nightly** with `rust-src`, and QEMU. On
-Debian or Kali:
+Needs NASM, `llvm-objcopy`, QEMU, and the Rust nightly the project is
+pinned to (`rust-toolchain.toml`: nightly-2026-04-03, rustc commit
+55e86c99) with `rust-src`. On Debian or Kali:
 
 ```bash
 sudo apt install nasm llvm qemu-system-x86
-rustup toolchain install nightly --component rust-src
+rustup toolchain install nightly-2026-04-03 --profile minimal --component rust-src
 ```
 
-Then, from `build/`:
+rustup uses that compiler for everything in the tree, whatever your default
+is. Then, from `build/`:
 
 ```bash
 make            # builds out/freya-os.img (1 MiB disk image); "make build" too
 make run        # boots it in QEMU, serial output in the terminal
-make test       # every test case, headless; expect "39 passed, 0 failed"
+make test       # every test case, headless; expect "42 passed, 0 failed"
+make unsafe     # every unsafe in the kernel, with its category and reason
+make reproduce  # builds a second copy elsewhere; the two images must match
 TEXT_MODE=1 make   # an image that stays in 80x25 text mode
 ```
+
+Builds are reproducible: nothing of the builder (directory, home, toolchain
+location) gets into the image, so the same source and the same compiler give
+the same image, byte for byte. `make test`'s first lines print the compiler
+(and whether it is the pinned one) and the image's hash.
 
 `llvm-objcopy` can be swapped for GNU objcopy with `make OBJCOPY=objcopy`.
 
@@ -201,10 +220,10 @@ command runs. **Backspace** deletes, **Esc** clears the line, **Up** and
 |---|---|
 | `help` | lists the commands |
 | `echo TEXT` | prints TEXT |
-| `ps` | every task: what it is doing, and how many capabilities it holds |
+| `ps` | every task: what it is doing, how many capabilities it holds, and how much memory it owns |
 | `caps` | the shell's own capabilities: everything it may do, what it has lent and to whom, and how many copies are out |
 | `uptime` | time since the timer started, task switches, system calls |
-| `mem` | memory free |
+| `mem` | memory: free, and what the rest is doing (the kernel, programs, reserved) |
 | `run NAME` | start a program in the background: `hello`, `spin` (runs until stopped), `crash` (writes to the kernel's memory, and is stopped), `ticker` (a line a second while it holds the console), `relay` (lends the console on to a ticker of its own) or `hog` (takes memory until its 1 MiB budget says no, then reads it back every second) |
 | `jobs` | the programs started from the shell that are still running |
 | `kill ID`, `kill NAME` | stop one of them, or every one of that name |
@@ -250,6 +269,8 @@ every register, and the log lines from just before it.
 headless and checks its serial log:
 
 - `image`: the disk image's layout (not booted)
+- `unsafe`: every `unsafe` in the kernel has its reason (not booted; the
+  counts from `make unsafe`'s list)
 - `boot-128M`, `boot-4G`: normal boots
 - `dirty-ram`: RAM starts full of random bytes, as on a real machine
 - `bios-if-on`: the bootloader behaves like a BIOS that leaves interrupts on
@@ -344,7 +365,9 @@ why. `TEXT_MODE=1 make usb DEV=/dev/sdX` writes a stick that always does.
 
 ## Next
 
-Programs from the shell, revocation, memory budgets and the frame table on
-the T430. Then the rest of the manifesto's Phase A: every `unsafe` block in
-the kernel listed and justified, and a pinned toolchain so that two builds of
-the same source can be compared.
+The manifesto's Phase A is done: every frame has an identity, frames are
+held as typed handles, every `unsafe` is listed with its reason, and builds
+repeat byte for byte with the pinned compiler. Next is Phase B, the kernel's
+audit chain: a hash chain of capability changes, processes starting and
+ending, and faults, first in software, then anchored in a TPM (QEMU's
+emulated one first).

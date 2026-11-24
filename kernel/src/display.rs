@@ -99,7 +99,14 @@ struct Cells([[u16; MAX_COLS]; MAX_ROWS]);
 
 static mut CELLS: Cells = Cells([[0; MAX_COLS]; MAX_ROWS]);
 
+// cells() and screen() hand out the whole static. What keeps that sound:
+// interrupts are off whenever either is called (checked), there is one CPU,
+// and no caller keeps a result while it calls something that makes another
+// (put() makes its own; that's why callers outside the lock use mode()).
 fn cells() -> &'static mut [[u16; MAX_COLS]; MAX_ROWS] {
+    cpu::assert_interrupts_off(b"display cells");
+    // SAFETY: [static] interrupts off on the one CPU (just checked), and
+    // used by the caller without making another, as the comment above says.
     unsafe { &mut (*(&raw mut CELLS)).0 }
 }
 
@@ -107,7 +114,29 @@ fn cells() -> &'static mut [[u16; MAX_COLS]; MAX_ROWS] {
 static mut FONT: [u8; 256 * GLYPH_H] = [0; 256 * GLYPH_H];
 
 fn screen() -> &'static mut Screen {
+    cpu::assert_interrupts_off(b"display screen");
+    // SAFETY: [static] as cells().
     unsafe { &mut *(&raw mut SCREEN) }
+}
+
+/// What init() and attach() decided, which nothing changes after them: a
+/// copy, for code that runs with interrupts on (Entry 30: before, such code
+/// held screen()'s reference while put() made another).
+#[derive(Clone, Copy)]
+struct Mode {
+    cols: usize,
+    rows: usize,
+    graphics: bool,
+    info: Option<DisplayInfo>,
+    fb: Option<Framebuffer>,
+    write_combining: bool,
+}
+
+fn mode() -> Mode {
+    cpu::without_interrupts(|| {
+        let s = screen();
+        Mode { cols: s.cols, rows: s.rows, graphics: s.graphics, info: s.info, fb: s.fb, write_combining: s.write_combining }
+    })
 }
 
 /// First thing in rust_start: learn the mode, take the font, blank the
@@ -120,6 +149,11 @@ pub fn init() {
             s.graphics = true;
             s.cols = (info.width as usize / GLYPH_W).min(MAX_COLS);
             s.rows = (info.height as usize / GLYPH_H).min(MAX_ROWS);
+            // SAFETY: [phys] init runs once, first thing at boot, so this is
+            // the only reference to FONT there will ever be while it is
+            // written (font() and draw_cell only read it, later). The bytes
+            // come from the ROM font stage 2 copied to FONT_ADDR, in the
+            // identity-mapped low 1 MiB.
             unsafe {
                 let font = &mut *(&raw mut FONT);
                 for (i, byte) in font.iter_mut().enumerate() {
@@ -132,6 +166,8 @@ pub fn init() {
             s.cols = TEXT_COLS;
             s.rows = TEXT_ROWS;
             // CRTC register 0x0A (cursor start): bit 5 set = cursor off.
+            // SAFETY: [port] the VGA CRTC's index and data ports, which only
+            // this line touches: one register, the cursor's start line.
             unsafe {
                 crate::outb(0x3D4, 0x0A);
                 crate::outb(0x3D5, 0x20);
@@ -144,7 +180,7 @@ pub fn init() {
 /// Physical [start, end) of the framebuffer stage 2 set up, or (0, 0) in
 /// text mode.
 pub fn framebuffer_range() -> (u64, u64) {
-    let s = screen();
+    let s = mode();
     match (s.graphics, s.info) {
         (true, Some(info)) => (info.framebuffer, info.framebuffer + info.pitch as u64 * info.height as u64),
         _ => (0, 0),
@@ -152,11 +188,11 @@ pub fn framebuffer_range() -> (u64, u64) {
 }
 
 pub fn cols() -> usize {
-    screen().cols
+    mode().cols
 }
 
 pub fn rows() -> usize {
-    screen().rows
+    mode().rows
 }
 
 /// One character cell. Out-of-range cells are ignored.
@@ -177,9 +213,13 @@ pub fn put(row: usize, col: usize, ch: u8, attr: u8) {
         }
         if !s.graphics {
             let cell = (0xB8000 + (row * TEXT_COLS + col) * 2) as *mut u16;
+            // SAFETY: [mmio] VGA text memory (0xB8000, identity-mapped), and
+            // row and col are inside the 80x25 grid (checked above).
             unsafe { cell.write_volatile(value) };
         } else if let Some(fb) = s.fb {
             if s.drawn[row][col] != value {
+                // SAFETY: [mmio] attach mapped fb, and row and col are inside
+                // the grid (checked above), as draw_cell requires.
                 unsafe { draw_cell(&fb, row, col, value) };
                 s.drawn[row][col] = value;
             }
@@ -197,8 +237,15 @@ pub fn clear() {
     }
 }
 
+/// Draw one cell's glyph on the framebuffer.
+///
+/// # Safety
+/// `fb` must be the framebuffer attach() mapped, and the cell inside the
+/// grid (row < rows, col < cols), so every pixel is inside the mapping.
 unsafe fn draw_cell(fb: &Framebuffer, row: usize, col: usize, value: u16) {
-    let font = &*(&raw const FONT);
+    // SAFETY: [static] FONT is written once, by init at boot; from then on
+    // it is only read, so a shared reference is fine.
+    let font = unsafe { &*(&raw const FONT) };
     let ch = (value & 0xFF) as usize;
     let attr = (value >> 8) as usize;
     let fg = fb.colours[attr & 0x0F];
@@ -207,22 +254,37 @@ unsafe fn draw_cell(fb: &Framebuffer, row: usize, col: usize, value: u16) {
     let y0 = row * GLYPH_H;
     for gy in 0..GLYPH_H {
         let bits = font[ch * GLYPH_H + gy];
-        let line = (fb.va as *mut u8).add((y0 + gy) * fb.pitch + x0 * fb.bytes_per_pixel);
         for gx in 0..GLYPH_W {
             let colour = if bits & (0x80 >> gx) != 0 { fg } else { bg };
-            pixel(fb, line.add(gx * fb.bytes_per_pixel), colour);
+            // SAFETY: [mmio] the pixel's offset: the cell's glyph lies inside
+            // cols * 8 by rows * 16 pixels, which init sized to fit the
+            // mode, and the mapping covers pitch * height bytes (# Safety).
+            unsafe {
+                let line = (fb.va as *mut u8).add((y0 + gy) * fb.pitch + x0 * fb.bytes_per_pixel);
+                pixel(fb, line.add(gx * fb.bytes_per_pixel), colour);
+            }
         }
     }
 }
 
+/// Write one pixel.
+///
+/// # Safety
+/// `at` must point at a whole pixel (bytes_per_pixel bytes) inside the
+/// framebuffer's mapping.
 #[inline(always)]
 unsafe fn pixel(fb: &Framebuffer, at: *mut u8, colour: u32) {
-    if fb.bytes_per_pixel == 4 {
-        (at as *mut u32).write_volatile(colour);
-    } else {
-        at.write_volatile(colour as u8);
-        at.add(1).write_volatile((colour >> 8) as u8);
-        at.add(2).write_volatile((colour >> 16) as u8);
+    // SAFETY: [mmio] bytes_per_pixel (3 or 4, attach checked) bytes at `at`,
+    // inside the mapping (# Safety); a 4-byte pixel's address is a multiple
+    // of 4, as pitch and the mode's alignment make it.
+    unsafe {
+        if fb.bytes_per_pixel == 4 {
+            (at as *mut u32).write_volatile(colour);
+        } else {
+            at.write_volatile(colour as u8);
+            at.add(1).write_volatile((colour >> 8) as u8);
+            at.add(2).write_volatile((colour >> 16) as u8);
+        }
     }
 }
 
@@ -267,15 +329,24 @@ pub unsafe fn attach() -> Result<(), &'static [u8]> {
     // else sets) becomes write-combining. CPUID.1:EDX bit 16 = PAT.
     let (_, _, _, edx) = cpu::cpuid(1);
     let flags = if edx & (1 << 16) != 0 {
-        let pat = cpu::rdmsr(IA32_PAT);
-        cpu::wrmsr(IA32_PAT, (pat & !(0xFF << 32)) | PAT_WC << 32);
+        // SAFETY: [cpu] IA32_PAT exists (CPUID said PAT). Only entry 4
+        // changes, and only pages with the PAT bit select it: the
+        // framebuffer's, mapped below; no mapping before this one sets it.
+        unsafe {
+            let pat = cpu::rdmsr(IA32_PAT);
+            cpu::wrmsr(IA32_PAT, (pat & !(0xFF << 32)) | PAT_WC << 32);
+        }
         s.write_combining = true;
         crate::vmm::PageFlags::FRAMEBUFFER
     } else {
         crate::vmm::PageFlags::MMIO
     };
     let bytes = info.pitch as u64 * info.height as u64;
-    let va = crate::vmm::map_device(info.framebuffer, bytes, flags)
+    // SAFETY: [mmio] the framebuffer stage 2's VBE call reported, which is
+    // the display adapter's memory: pitch * height bytes from its base.
+    // display::selftest checks no frame of it is RAM the allocator can
+    // hand out.
+    let va = unsafe { crate::vmm::map_device(info.framebuffer, bytes, flags) }
         .map_err(|_| &b"couldn't map the framebuffer"[..])?;
 
     let mut colours = [0u32; 16];
@@ -295,16 +366,20 @@ pub unsafe fn attach() -> Result<(), &'static [u8]> {
     // Black first (the area right of and below the cell grid included),
     // then every cell.
     for y in 0..fb.height {
-        let line = (fb.va as *mut u8).add(y * fb.pitch);
         for x in 0..fb.width {
-            pixel(&fb, line.add(x * bytes_per_pixel), colours[0]);
+            // SAFETY: [mmio] pixel (x, y) of the mode, inside the pitch *
+            // height bytes just mapped (pitch >= width * bytes_per_pixel was
+            // checked above).
+            unsafe { pixel(&fb, (fb.va as *mut u8).add(y * fb.pitch + x * bytes_per_pixel), colours[0]) };
         }
     }
     cpu::without_interrupts(|| {
         for row in 0..s.rows {
             for col in 0..s.cols {
                 let value = cells()[row][col];
-                draw_cell(&fb, row, col, value);
+                // SAFETY: [mmio] fb is mapped, and row and col are inside
+                // the grid, as draw_cell requires.
+                unsafe { draw_cell(&fb, row, col, value) };
                 s.drawn[row][col] = value;
             }
         }
@@ -336,8 +411,11 @@ pub fn reclaim() {
                 let value = cells()[row][col];
                 if !s.graphics {
                     let cell = (0xB8000 + (row * TEXT_COLS + col) * 2) as *mut u16;
+                    // SAFETY: [mmio] VGA text memory, a cell inside the grid.
                     unsafe { cell.write_volatile(value) };
                 } else if let Some(fb) = s.fb {
+                    // SAFETY: [mmio] the mapped framebuffer, a cell inside
+                    // the grid, as draw_cell requires.
                     unsafe { draw_cell(&fb, row, col, value) };
                     s.drawn[row][col] = value;
                 }
@@ -351,7 +429,7 @@ pub fn reclaim() {
 /// None if graphics mode never got a framebuffer mapped.
 pub fn screen_memory() -> Option<crate::cap::Cap> {
     use crate::cap::{Cap, MEM_UNCACHED, MEM_WRITE, MEM_WRITE_COMBINING};
-    let s = screen();
+    let s = mode();
     if !s.graphics {
         return Some(Cap::Memory { base: 0xB8000, pages: 1, flags: MEM_WRITE | MEM_UNCACHED });
     }
@@ -381,7 +459,7 @@ pub struct Geometry {
 }
 
 pub fn geometry() -> Geometry {
-    let s = screen();
+    let s = mode();
     let fb = s.fb.filter(|_| s.graphics);
     Geometry {
         graphics: fb.is_some(),
@@ -397,13 +475,15 @@ pub fn geometry() -> Geometry {
 
 /// The ROM font the kernel draws with (256 glyphs of 16 bytes).
 pub fn font() -> &'static [u8; 256 * GLYPH_H] {
+    // SAFETY: [static] FONT is written once, by init at boot, before anyone
+    // can call this; after that it is only read.
     unsafe { &*(&raw const FONT) }
 }
 
 /// For the boot log: what stage 2 chose, and why.
 pub fn describe() {
     use crate::{serial_write_str as w, serial_write_u64 as dec};
-    let s = screen();
+    let s = mode();
     w(b"[display] ");
     match s.info {
         None => w(b"text mode, 80x25 (stage 2 left no display information)"),
@@ -463,7 +543,7 @@ pub fn describe() {
 /// A one-line summary for the right side of the status area (graphics
 /// mode only: in text mode there is no room). Returns its length in `out`.
 pub fn status_note(out: &mut [u8; 64]) -> usize {
-    let s = screen();
+    let s = mode();
     let info = match (s.graphics, s.info) {
         (true, Some(info)) => info,
         _ => return 0,
@@ -520,7 +600,7 @@ pub fn draw_swatch(row: usize, col: usize) {
 /// For vmm's MMIO self-test: (physical page, an existing view of it) to
 /// alias in graphics mode; None in text mode (the VGA buffer then).
 pub fn mmio_test_target() -> Option<(u64, u64)> {
-    screen().fb.map(|fb| (fb.phys & !0xFFF, fb.va & !0xFFF))
+    mode().fb.map(|fb| (fb.phys & !0xFFF, fb.va & !0xFFF))
 }
 
 /// Graphics mode: a glyph drawn into a cell reads back pixel for pixel
@@ -528,7 +608,7 @@ pub fn mmio_test_target() -> Option<(u64, u64)> {
 /// the write-combining one. Prints its own line. Text mode: nothing to do.
 pub fn selftest() -> bool {
     use crate::{serial_write_str as w, serial_write_u64 as dec};
-    let s = screen();
+    let s = mode();
     let fb = match (s.graphics, s.fb) {
         (false, _) => return selftest_text(),
         (true, Some(fb)) => fb,
@@ -536,17 +616,21 @@ pub fn selftest() -> bool {
         (true, None) => return true,
     };
     let (row, col) = (s.rows - 1, s.cols - 1);
-    let saved = cells()[row][col];
+    let saved = cpu::without_interrupts(|| cells()[row][col]);
     put(row, col, b'F', 0x1E); // yellow on blue
+    // SAFETY: [cpu] sfence only orders this CPU's stores: the glyph's
+    // write-combined pixels reach the framebuffer before they are read back.
     unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
 
-    let font = unsafe { &*(&raw const FONT) };
+    let font = font();
     let mut wrong = 0;
     let mut lit = 0;
     for gy in 0..GLYPH_H {
         let bits = font[b'F' as usize * GLYPH_H + gy];
         for gx in 0..GLYPH_W {
             let at = fb.va as usize + (row * GLYPH_H + gy) * fb.pitch + (col * GLYPH_W + gx) * fb.bytes_per_pixel;
+            // SAFETY: [mmio] a pixel of the last cell, inside the mapped
+            // framebuffer (the same arithmetic as draw_cell).
             let seen = unsafe {
                 if fb.bytes_per_pixel == 4 {
                     (at as *const u32).read_volatile()
@@ -569,6 +653,7 @@ pub fn selftest() -> bool {
     let leaf = crate::vmm::kernel_leaf_entry(fb.va & !0xFFF).unwrap_or(0);
     let (pat, pcd, pwt) = crate::vmm::cache_bits(leaf);
     let wc_ok = if s.write_combining {
+        // SAFETY: [cpu] reading IA32_PAT, which attach found and wrote.
         let pat_msr = unsafe { cpu::rdmsr(IA32_PAT) };
         pat && !pcd && !pwt && (pat_msr >> 32) & 0x07 == PAT_WC
     } else {
@@ -607,13 +692,15 @@ pub fn selftest() -> bool {
 /// display adapter reads it (0xB8000 + 2 bytes a cell, row by row).
 fn selftest_text() -> bool {
     use crate::serial_write_str as w;
-    let s = screen();
+    let s = mode();
     let (row, col) = (s.rows - 1, s.cols - 1);
-    let saved = cells()[row][col];
+    let saved = cpu::without_interrupts(|| cells()[row][col]);
     let at = 0xB8000 + (row * TEXT_COLS + col) * 2;
     put(row, col, b'F', 0x1E);
+    // SAFETY: [mmio] the last cell of VGA text memory (identity-mapped).
     let seen = unsafe { (at as *const u16).read_volatile() };
     put(row, col, (saved & 0xFF) as u8, (saved >> 8) as u8);
+    // SAFETY: [mmio] the same cell.
     let restored = unsafe { (at as *const u16).read_volatile() };
     w(b"[display] self-test a character put in the last cell of text mode is in VGA memory (0x");
     hex16(seen);

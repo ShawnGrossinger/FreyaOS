@@ -74,35 +74,28 @@ pub const LVT_NAMES: [&[u8]; 5] = [b"LINT0", b"LINT1", b"error", b"perf", b"ther
 const LVT_REGS: [usize; 5] = [REG_LVT_LINT0, REG_LVT_LINT1, REG_LVT_ERROR, REG_LVT_PERF, REG_LVT_THERMAL];
 static FIRMWARE_LVT: [AtomicU32; 6] = [const { AtomicU32::new(LVT_MASKED) }; 6]; // last: CMCI
 static MAX_LVT: AtomicU32 = AtomicU32::new(0);
-fn read(reg: usize) -> u32 {
+/// The register page, which init() maps; halts if it hasn't (Entry 30:
+/// with BASE still 0, an access would land in low memory instead).
+fn base() -> usize {
     let base = BASE.load(Ordering::Relaxed) as usize;
+    if base == 0 {
+        crate::serial_write_str(b"[apic] FATAL: a register used before init mapped them\n");
+        crate::halt();
+    }
+    base
+}
+
+fn read(reg: usize) -> u32 {
+    let base = base();
+    // SAFETY: [mmio] init mapped the APIC's 4 KiB register page at base
+    // (uncached), and every reg is one of the REG_ offsets inside it.
     unsafe { core::ptr::read_volatile((base + reg) as *const u32) }
 }
 
 fn write(reg: usize, value: u32) {
-    let base = BASE.load(Ordering::Relaxed) as usize;
+    let base = base();
+    // SAFETY: [mmio] as in read: a register in the page init mapped.
     unsafe { core::ptr::write_volatile((base + reg) as *mut u32, value) }
-}
-
-fn cpuid_edx(leaf: u32) -> u32 {
-    let edx: u32;
-    unsafe {
-        asm!("mov {tmp}, rbx", "cpuid", "mov rbx, {tmp}",
-             tmp = out(reg) _, inout("eax") leaf => _, inout("ecx") 0u32 => _, out("edx") edx,
-             options(nostack, preserves_flags));
-    }
-    edx
-}
-
-unsafe fn rdmsr(msr: u32) -> u64 {
-    let (lo, hi): (u32, u32);
-    asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
-    (hi as u64) << 32 | lo as u64
-}
-
-unsafe fn wrmsr(msr: u32, value: u64) {
-    asm!("wrmsr", in("ecx") msr, in("eax") value as u32, in("edx") (value >> 32) as u32,
-         options(nostack, preserves_flags));
 }
 
 /// Busy-wait `ms` milliseconds (at most 54) on PIT channel 2, by polling.
@@ -110,6 +103,11 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 /// it can be timed without taking a single interrupt.
 pub(crate) fn pit_wait_ms(ms: u64) {
     let count = (PIT_HZ * ms / 1000) as u16;
+    // SAFETY: [port] the PIT's channel 2 (0x42, programmed through 0x43)
+    // and its gate in port 0x61 are used by nothing else in the kernel;
+    // only 0x61's two low bits change (the speaker stays off). The callers
+    // are boot (before the scheduler starts) and power's last steps; two
+    // waits interleaving could only spoil the timing.
     unsafe {
         // Gate on (bit 0), speaker data off (bit 1).
         outb(0x61, (inb(0x61) & !0x02) | 0x01);
@@ -138,16 +136,23 @@ const CALIBRATIONS: usize = 5;
 /// Enable the local APIC, calibrate its timer and start it at TIMER_HZ.
 /// Interrupts stay disabled; the caller decides when to `sti`.
 pub fn init() -> Result<ApicInfo, &'static [u8]> {
-    if cpuid_edx(1) & (1 << 9) == 0 {
+    if crate::cpu::cpuid(1).3 & (1 << 9) == 0 {
         return Err(b"CPU reports no local APIC (CPUID.1:EDX bit 9)");
     }
 
     // --- Find and enable it ---
-    let msr = unsafe { rdmsr(IA32_APIC_BASE) };
+    // SAFETY: [cpu] IA32_APIC_BASE exists on every CPU with a local APIC,
+    // which CPUID said this one has.
+    let msr = unsafe { crate::cpu::rdmsr(IA32_APIC_BASE) };
     let phys_base = msr & 0x000F_FFFF_FFFF_F000;
-    unsafe { wrmsr(IA32_APIC_BASE, msr | APIC_BASE_ENABLE) };
+    // SAFETY: [cpu] sets only the enable bit, keeping the base address the
+    // firmware chose; interrupts are off, so nothing arrives before init
+    // has masked every source but the timer.
+    unsafe { crate::cpu::wrmsr(IA32_APIC_BASE, msr | APIC_BASE_ENABLE) };
 
     // --- Map its registers: uncached, no-execute ---
+    // SAFETY: [mmio] the APIC's register page, at the address its MSR
+    // gives, which no RAM shares; mapped once, here.
     let va = match unsafe { crate::vmm::map_mmio(phys_base, 4096) } {
         Ok(va) => va,
         Err(_) => return Err(b"could not map the APIC register page"),
@@ -352,11 +357,17 @@ pub fn ticking() -> bool {
     ticks() > 0
 }
 
-pub fn enable_interrupts() {
+/// For selftest below: the boot thread turns interrupts on for good there.
+fn enable_interrupts() {
+    // SAFETY: [cpu] only selftest calls this, from the boot thread, holding
+    // no lock (it isn't inside without_interrupts): from here boot runs with
+    // interrupts on.
     unsafe { asm!("sti", options(nomem, nostack)) };
 }
 
 fn disable_interrupts() {
+    // SAFETY: [cpu] only selftest calls this, around work it wants
+    // uninterrupted, and turns them on again right after.
     unsafe { asm!("cli", options(nomem, nostack)) };
 }
 
@@ -384,7 +395,8 @@ pub fn selftest(info: &ApicInfo) -> bool {
     ok &= check(b"pic", b"legacy PICs remapped to 0x20-0x2F and every line masked",
                 crate::pic::masks() == (0xFF, 0xFF));
 
-    let enabled = unsafe { rdmsr(IA32_APIC_BASE) } & APIC_BASE_ENABLE != 0
+    // SAFETY: [cpu] reading IA32_APIC_BASE, which init already read.
+    let enabled = unsafe { crate::cpu::rdmsr(IA32_APIC_BASE) } & APIC_BASE_ENABLE != 0
         && read(REG_SVR) & SVR_ENABLE != 0;
     ok &= check(b"apic", b"local APIC enabled (IA32_APIC_BASE and SVR)", enabled);
 

@@ -103,15 +103,26 @@ static mut RECEIVERS: [u32; MAX_ENDPOINTS] = [0; MAX_ENDPOINTS];
 /// Signal bits waiting on each endpoint for its next receiver.
 static mut SIGNALS: [u64; MAX_ENDPOINTS] = [0; MAX_ENDPOINTS];
 
+// Each of these hands out the whole array, so the rule that keeps them
+// sound is the callers': interrupts off (checked here), one CPU, and each
+// result used at once, never kept while another is made or across a task
+// switch. Every caller indexes it in the same expression.
 fn refs() -> &'static mut [u32; MAX_ENDPOINTS] {
+    crate::cpu::assert_interrupts_off(b"ipc refs");
+    // SAFETY: [static] interrupts off on the one CPU (just checked), and
+    // used at once by the caller, as the comment above says.
     unsafe { &mut *(&raw mut REFS) }
 }
 
 fn receivers() -> &'static mut [u32; MAX_ENDPOINTS] {
+    crate::cpu::assert_interrupts_off(b"ipc receivers");
+    // SAFETY: [static] as refs().
     unsafe { &mut *(&raw mut RECEIVERS) }
 }
 
 fn signals() -> &'static mut [u64; MAX_ENDPOINTS] {
+    crate::cpu::assert_interrupts_off(b"ipc signals");
+    // SAFETY: [static] as refs().
     unsafe { &mut *(&raw mut SIGNALS) }
 }
 
@@ -265,6 +276,10 @@ pub fn send(slot: u64, words: [u64; 4], xfer: u64, call: bool) -> (i64, Message)
     };
     let msg = Message::with(badge, words, cap);
 
+    // SAFETY: [switch] sched::block with interrupts off (inside
+    // without_interrupts), in a state something ends: AwaitingReply by the
+    // receiver's reply, Sending(ep) by a receiver taking the message; either
+    // by kill or by the endpoint's last receiver going (ERR_PEER_GONE).
     without_interrupts(|| unsafe {
         if receivers()[ep as usize % MAX_ENDPOINTS] == 0 {
             return (ERR_PEER_GONE, EMPTY_MESSAGE); // nobody can ever receive it
@@ -301,6 +316,8 @@ pub fn recv(slot: u64) -> (i64, Message) {
         Ok(e) => e,
         Err(e) => return (e, EMPTY_MESSAGE),
     };
+    // SAFETY: [switch] sched::block with interrupts off, in Receiving(ep):
+    // a sender, a signal, or kill ends it.
     without_interrupts(|| unsafe {
         let me = sched::current();
         let pending = core::mem::take(&mut signals()[ep as usize % MAX_ENDPOINTS]);

@@ -46,6 +46,7 @@ ROOT=out/test
 #        "echo hi", and the shell answers "hi".
 CASES=(
   "image||||"   # not booted: checks the disk image's layout (see check_image)
+  "unsafe||||"  # not booted: every unsafe in the kernel has its reason (check_unsafe)
   "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;\\[user 3 'init'\\] started the console driver \\(process 4\\), the PS/2 driver \\(process 5\\), the mouse driver \\(process 6\\) and the shell \\(process 7\\);;\\[user 7 'shell'\\] shell ready: type help;;\\[console\\] process [0-9]+ \\('console'\\) draws the screen from here on;;\\[display\\] VESA graphics [0-9]+x[0-9]+, 32-bit;;reads back pixel for pixel \\(128 pixels, [0-9]+ lit, 0 wrong\\); framebuffer mapped write-combining \\(PAT entry 4\\): PASS;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!;;'probe' killed by vector 14 #PF;;\\[user [0-9]+ 'ipc'\\] printed for me by the log server;;driver handled 10"
   "bios-if-on|bios-if-on|128M|BIOS had left them ON after its disk calls; stage 2 turned them off\\): PASS;;self-tests: [0-9]+ passed, 0 failed"
   "dirty-ram||128M-dirty|self-tests: [0-9]+ passed, 0 failed;;init complete"
@@ -623,6 +624,19 @@ check_image() { # check_image <image>: the layout a real PC's BIOS relies on
   echo "$((size / 1048576)) MiB, MBR signature FREY, one active partition: sectors 1-$((sectors - 1)); kernel ${kernel:-?} sectors; sha256 $hash"
 }
 
+check_unsafe() { # check_unsafe <list>: unsafe_check.rs passed (Entry 30)
+  # The build fails if any unsafe lacks its SAFETY comment, so a list at
+  # all means every one has one; this says how many, and how much of the
+  # kernel is inside unsafe blocks.
+  local list=$1
+  [ -s "$list" ] || { echo "no list at $list"; return 1; }
+  local counts lines
+  counts=$(sed -n 's/^\([0-9]*\) unsafe blocks, \([0-9]*\) unsafe functions, \([0-9]*\) unsafe impls.* in \([0-9]*\) files\.$/\1 blocks, \2 functions, \3 impls in \4 files/p' "$list")
+  lines=$(sed -n 's/^\([0-9]*\) of the kernel.s \([0-9]*\) lines are inside unsafe blocks\.$/\1 of \2 lines/p' "$list")
+  [ -n "$counts" ] && [ -n "$lines" ] || { echo "the list's summary lines aren't as expected"; return 1; }
+  echo "$counts, each with its reason; $lines inside unsafe blocks (make unsafe lists them)"
+}
+
 selected() { # is case $1 selected on the command line (or nothing selected)?
   [ "${#ARGS[@]}" -eq 0 ] && return 0
   local a; for a in "${ARGS[@]}"; do [ "$a" = "$1" ] && return 0; done
@@ -633,9 +647,18 @@ ARGS=("$@")
 pass=0; fail=0; results=()
 echo "FreyaOS test suite ($QEMU, timeout ${TIMEOUT}s per boot)"
 # The tools that built it (Entry 27): builds with different ones differ.
-# cargo +nightly is what the Makefile runs, so its rustc is the one that counts.
-rustc_v=$(rustc +nightly --version 2>/dev/null || echo "$(rustc --version 2>/dev/null) (no nightly)")
-echo "  tools: ${rustc_v:-rustc not found}; $(nasm -v 2>/dev/null | head -1); $($QEMU --version 2>/dev/null | head -1)"
+# The compiler is pinned (Entry 30): ../rust-toolchain.toml names it and the
+# commit it must report. With any other, the image's hash below can't be
+# compared with the journal's, though every test still means what it says.
+pin=$(sed -n 's/^channel = "\(.*\)"/\1/p' ../rust-toolchain.toml)
+want=$(sed -n 's/^# rustc commit-hash: //p' ../rust-toolchain.toml)
+have=$(rustc -vV 2>/dev/null | sed -n 's/^commit-hash: //p')
+if [ -n "$want" ] && [ "$have" = "$want" ]; then
+  pinned="the pinned $pin"
+else
+  pinned="NOT the pinned $pin (commit ${want:0:9}): image hashes won't match the journal's"
+fi
+echo "  tools: $(rustc --version 2>/dev/null || echo rustc not found), $pinned; $(nasm -v 2>/dev/null | head -1); $($QEMU --version 2>/dev/null | head -1)"
 
 for entry in "${CASES[@]}"; do
   IFS='|' read -r name demo mem patterns extra keys <<< "$entry"
@@ -655,6 +678,15 @@ for entry in "${CASES[@]}"; do
     printf '\r  FAIL  %-19s build failed (see %s)\n' "$name" "$dir/build.log"
     tail -5 "$dir/build.log" | sed 's/^/          /'
     fail=$((fail + 1)); continue
+  fi
+
+  if [ "$name" = unsafe ]; then
+    if why=$(check_unsafe "$dir/unsafe.txt"); then
+      printf '\r  PASS  %-19s %s\n' "$name" "$why"; pass=$((pass + 1))
+    else
+      printf '\r  FAIL  %-19s %s\n' "$name" "$why"; fail=$((fail + 1))
+    fi
+    continue
   fi
 
   if [ "$name" = image ]; then

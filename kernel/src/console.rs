@@ -144,8 +144,13 @@ pub fn prepare() -> Option<ConsoleCaps> {
         log_data_bytes: log::LOG_DATA_BYTES as u32,
         _reserved: 0,
     };
+    // SAFETY: [static] prepare is the only code that writes DESCRIPTION,
+    // and main calls it once, at boot, before the pages are lent to anyone.
     let block = unsafe { &mut (*(&raw mut DESCRIPTION)).0 };
     let size = core::mem::size_of::<StartInfo>();
+    // SAFETY: [static] copies StartInfo's 108 bytes (repr(C): eight bytes,
+    // then only u32s, so no padding to copy uninitialised) into the start
+    // of the 8 KiB block, well clear of the font at FONT_OFFSET.
     unsafe {
         core::ptr::copy_nonoverlapping(&info as *const StartInfo as *const u8, block.as_mut_ptr(), size);
     }

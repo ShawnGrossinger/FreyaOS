@@ -36,14 +36,24 @@ const SLP_EN: u16 = 1 << 13;
 const SLP_TYP_SHIFT: u16 = 10;
 const SLP_TYP_MASK: u16 = 7 << SLP_TYP_SHIFT;
 
+/// Read 16 bits from an I/O port.
+///
+/// # Safety
+/// The port must be one of the power-management registers the FADT names.
 unsafe fn inw(port: u16) -> u16 {
     let v: u16;
-    asm!("in ax, dx", in("dx") port, out("ax") v, options(nomem, nostack, preserves_flags));
+    // SAFETY: [port] a port the caller took from the FADT (# Safety).
+    unsafe { asm!("in ax, dx", in("dx") port, out("ax") v, options(nomem, nostack, preserves_flags)) };
     v
 }
 
+/// Write 16 bits to an I/O port.
+///
+/// # Safety
+/// As for inw, and the value must be the one ACPI says to write there.
 unsafe fn outw(port: u16, v: u16) {
-    asm!("out dx, ax", in("dx") port, in("ax") v, options(nomem, nostack, preserves_flags));
+    // SAFETY: [port] a port and value the caller took from ACPI (# Safety).
+    unsafe { asm!("out dx, ax", in("dx") port, in("ax") v, options(nomem, nostack, preserves_flags)) };
 }
 
 fn wait_ms(ms: u64) {
@@ -67,9 +77,15 @@ fn announce(what: &[u8]) {
 
 pub fn restart() -> ! {
     announce(b"Restarting...");
+    // SAFETY: [cpu] nothing is to run after this: interrupts off for good.
+    unsafe { asm!("cli", options(nomem, nostack)) };
+    // SAFETY: [port] restarting the machine is the point (whoever holds the
+    // Power capability asked). Each port is a way to reset it: the FADT's
+    // reset register, with the value the firmware gives; the keyboard
+    // controller's command port (0x64; 0xFE pulses the reset line); the
+    // chipset's reset control (0xCF9). FreyaOS writes to no disk, so a reset
+    // at any point loses nothing.
     unsafe {
-        asm!("cli", options(nomem, nostack));
-
         if let Some((port, value)) = crate::acpi::info().and_then(|i| i.reset) {
             crate::serial_write_str(b"[power] restart through the ACPI reset register\n");
             outb(port, value);
@@ -89,17 +105,24 @@ pub fn restart() -> ! {
         outb(0xCF9, 0x02);
         outb(0xCF9, 0x06);
         wait_ms(100);
-
-        crate::serial_write_str(b"[power] restart by triple fault\n");
-        let empty: [u8; 10] = [0; 10];
-        asm!("lidt [{}]", "int3", in(reg) &empty, options(noreturn));
     }
+
+    crate::serial_write_str(b"[power] restart by triple fault\n");
+    let empty: [u8; 10] = [0; 10];
+    // SAFETY: [cpu] the last way left: an empty IDT, then an exception the
+    // CPU can't deliver, which it turns into a reset (a triple fault).
+    unsafe { asm!("lidt [{}]", "int3", in(reg) &empty, options(noreturn)) };
 }
 
 pub fn shut_down() -> ! {
     announce(b"Shutting down...");
+    // SAFETY: [cpu] nothing is to run after this: interrupts off for good.
+    unsafe { asm!("cli", options(nomem, nostack)) };
+    // SAFETY: [port] switching off is the point (whoever holds the Power
+    // capability asked). The ports are the FADT's: its SMI command port,
+    // written only with the FADT's own ACPI_ENABLE value, and PM1a/PM1b
+    // control, where only SLP_TYP (from \_S5) and SLP_EN change.
     unsafe {
-        asm!("cli", options(nomem, nostack));
         match crate::acpi::info() {
             Some(info) if info.s5.is_some() && info.pm1a_control != 0 => {
                 let (typ_a, typ_b) = info.s5.unwrap_or((0, 0));

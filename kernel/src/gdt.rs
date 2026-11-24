@@ -136,6 +136,11 @@ static mut DOUBLE_FAULT_STACK: Stack = Stack([0; DOUBLE_FAULT_STACK_SIZE]);
 /// Must run before idt::init(): the IDT reads CS to fill its gates, and a
 /// gate with an IST index is only usable once TR points at a valid TSS.
 pub fn init() {
+    // SAFETY: [cpu] main calls this once, among the first things at boot,
+    // with interrupts off. GDT, TSS and DOUBLE_FAULT_STACK are statics in
+    // the kernel image, so the addresses loaded stay valid for good; nothing
+    // else holds a reference to them yet. Every selector loaded is one of
+    // this GDT's own entries: kernel code, kernel data, and the TSS.
     unsafe {
         // --- TSS: point IST1 at the top of the double fault stack ---
         // Stacks grow down, so the TSS holds the address one past the end.
@@ -217,7 +222,18 @@ fn tss_descriptor(base: u64) -> (u64, u64) {
 /// The stack the CPU loads when an interrupt or exception arrives from ring
 /// 3, and the one syscall_entry switches to: the top of the running task's
 /// kernel stack. Called by the scheduler on every switch.
-pub fn set_kernel_stack(top: u64) {
+///
+/// # Safety
+/// `top` must be the top of the kernel stack of the task about to run,
+/// mapped and writable for as long as that task runs: the CPU pushes onto
+/// it, unchecked, at its next interrupt or system call from ring 3.
+/// Interrupts must be off.
+pub unsafe fn set_kernel_stack(top: u64) {
+    // SAFETY: [switch] a u64 store into the TSS (unaligned: rsp[0] is at
+    // offset 4 of the packed struct) and one into entry.asm's
+    // syscall_kernel_rsp. Interrupts are off (# Safety), and the CPU reads
+    // either only when an interrupt or system call arrives, so no read sees
+    // half a write.
     unsafe {
         // rsp[0] is at offset 4 in the packed TSS: write it unaligned.
         (&raw mut (*(&raw mut TSS)).rsp[0]).write_unaligned(top);
@@ -234,6 +250,7 @@ extern "C" {
 pub fn current_selectors() -> (u16, u16) {
     let cs: u16;
     let tr: u16;
+    // SAFETY: [cpu] reading CS and TR into registers changes nothing.
     unsafe {
         asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags));
         asm!("str {0:x}", out(reg) tr, options(nomem, nostack, preserves_flags));

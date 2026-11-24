@@ -176,10 +176,18 @@ extern "C" {
 /// The task table. Only touched with interrupts disabled (or, for a task's
 /// own fields, by that task), and never held across a switch.
 fn table() -> &'static mut [Task; MAX_TASKS] {
+    // SAFETY: [static] the rule above, which callers keep and the compiler
+    // doesn't check: one CPU; interrupts off (or a task's own fields, which
+    // nobody else writes); the result used and dropped before another is
+    // made, and never kept across a task switch. (Entry 30 found exit_with
+    // keeping one across calls that make their own, and fixed it.)
     unsafe { &mut *(&raw mut TASKS) }
 }
 
 fn current_id() -> TaskId {
+    // SAFETY: [static] a plain read of a word only schedule() and init()
+    // write, both with interrupts off; on one CPU no read can see half a
+    // write.
     unsafe { *(&raw const CURRENT) }
 }
 
@@ -204,7 +212,9 @@ pub(crate) unsafe fn block(state: State) {
     let t = &mut table()[me];
     t.state = state;
     t.wait_seq = WAIT_SEQ.fetch_add(1, Ordering::Relaxed);
-    schedule();
+    // SAFETY: [switch] interrupts are off (# Safety), and t is dead: no
+    // reference to the table is kept across the switch.
+    unsafe { schedule() };
 }
 
 fn slot_base(id: TaskId) -> u64 {
@@ -233,6 +243,8 @@ fn kernel_stack_top(id: TaskId) -> u64 {
 pub fn init() -> Result<(), SpawnError> {
     without_interrupts(|| {
         table()[0] = Task { state: State::Running, name: Some("boot"), slices: 1, ..EMPTY };
+        // SAFETY: [static] interrupts off, and the scheduler isn't running
+        // yet (ENABLED is false), so nothing else reads or writes CURRENT.
         unsafe { *(&raw mut CURRENT) = 0 };
     });
     let idle = spawn("idle", idle_task, 0)?;
@@ -251,6 +263,9 @@ fn idle_task(_: u64) {
         reap();
         // `sti; hlt` as a pair can't miss a wakeup: an interrupt is only
         // taken after the instruction following sti, which is the hlt.
+        // SAFETY: [cpu] the idle task holds no lock here (reap() has
+        // returned), so letting interrupts in is safe, and it has nothing to
+        // do until one arrives.
         unsafe { asm!("sti", "hlt", options(nomem, nostack)) };
     }
 }
@@ -283,10 +298,15 @@ static mut GENERATIONS: [u32; MAX_TASKS] = [0; MAX_TASKS];
 static mut ENDINGS: [Option<ExitStatus>; MAX_TASKS] = [None; MAX_TASKS];
 
 fn generations() -> &'static mut [u32; MAX_TASKS] {
+    crate::cpu::assert_interrupts_off(b"sched generations");
+    // SAFETY: [static] interrupts off on the one CPU (just checked), and each
+    // caller indexes the result at once and keeps nothing.
     unsafe { &mut *(&raw mut GENERATIONS) }
 }
 
 fn endings() -> &'static mut [Option<ExitStatus>; MAX_TASKS] {
+    crate::cpu::assert_interrupts_off(b"sched endings");
+    // SAFETY: [static] as generations().
     unsafe { &mut *(&raw mut ENDINGS) }
 }
 
@@ -319,6 +339,8 @@ pub fn spawn_in_signalling(
     // A process's address space was built before it had a task: its
     // frames become the task's now (Entry 29).
     if space != 0 {
+        // SAFETY: [paging] the space process.rs built for this task, which
+        // nothing runs in yet; from here the task owns it.
         unsafe { AddressSpace::from_root(space).adopt(owner) };
     }
 
@@ -328,6 +350,9 @@ pub fn spawn_in_signalling(
     for page in 0..STACK_PAGES {
         let va = stack_bottom(id) + page * PAGE_SIZE;
         let mapped = match pmm::alloc(Kind::KernelStack, owner) {
+            // SAFETY: [paging] the task's own stack slot, which no other
+            // task's stack shares (each slot is 64 KiB apart); the slot was
+            // emptied when its last task was reaped.
             Some(frame) => match unsafe { kernel.map_frame(va, frame, PageFlags::KERNEL_DATA) } {
                 Ok(()) => true,
                 Err((_, frame)) => {
@@ -338,7 +363,9 @@ pub fn spawn_in_signalling(
             None => false,
         };
         if !mapped {
-            unsafe { free_stack_pages(id, page) };
+            // SAFETY: [paging] the `page` stack pages mapped just above, of
+            // a task that never ran; with interrupts off, as it requires.
+            without_interrupts(|| unsafe { free_stack_pages(id, page) });
             without_interrupts(|| table()[id] = EMPTY);
             return Err(SpawnError::OutOfMemory);
         }
@@ -351,6 +378,9 @@ pub fn spawn_in_signalling(
     //   top - 24 .. 64  0 x 6       rbp rbx r12 r13 r14 r15
     // task_entry is entered with RSP = top - 8, as if it had been called.
     let top = stack_bottom(id) + STACK_SIZE;
+    // SAFETY: [switch] the top 64 bytes of the stack just mapped, which only
+    // this new task will use, and it hasn't run. They are laid out as
+    // switch_context expects to find a suspended task's stack.
     unsafe {
         let words = top as *mut u64;
         words.sub(1).write(0);
@@ -386,11 +416,18 @@ pub fn spawn_in_signalling(
 
 /// Unmap and free the first `pages` stack pages of task `id`: each must be
 /// a kernel stack of the task in that slot now (Entry 29).
+///
+/// # Safety
+/// Interrupts off, and task `id` must not run again: it has finished (and
+/// isn't the running task), or never started.
 unsafe fn free_stack_pages(id: TaskId, pages: u64) {
     let mut kernel = AddressSpace::kernel();
     let owner = Owner::Task { id: id as u8, generation: generations()[id] };
     for page in 0..pages {
-        if let Ok(frame) = kernel.unmap_frame(stack_bottom(id) + page * PAGE_SIZE, Kind::KernelStack.bit(), owner) {
+        // SAFETY: [paging] task id's stack pages, which nothing uses any
+        // more (# Safety); unmap_frame halts unless each is a KernelStack
+        // frame of that task.
+        if let Ok(frame) = unsafe { kernel.unmap_frame(stack_bottom(id) + page * PAGE_SIZE, Kind::KernelStack.bit(), owner) } {
             frame.free();
         }
     }
@@ -404,6 +441,8 @@ extern "C" fn task_entry() -> ! {
     });
     // We came from inside schedule(), which runs with interrupts off.
     // Tasks run with them on.
+    // SAFETY: [cpu] a new task holds nothing yet: no lock, no reference to
+    // the table (the closure above has returned).
     unsafe { asm!("sti", options(nomem, nostack)) };
     if let Some(f) = entry {
         f(arg);
@@ -420,6 +459,8 @@ pub fn exit() -> ! {
 
 /// exit(), recording how the task ended for join() to report.
 pub fn exit_with(status: ExitStatus) -> ! {
+    // SAFETY: [cpu] interrupts off from here until the switch below, which
+    // never comes back: they stay off for the rest of this task's life.
     unsafe { asm!("cli", options(nomem, nostack)) };
     let me = current_id();
     let t = table();
@@ -440,9 +481,13 @@ pub fn exit_with(status: ExitStatus) -> ! {
     for slot in 0..cap::MAX_CAPS {
         cap::remove(me, slot, false);
     }
-    if let Some(ep) = t[me].exit_signal {
+    // A fresh look at the table: ipc, console and cap have each made their
+    // own reference to it since `t` (Entry 30).
+    if let Some(ep) = table()[me].exit_signal {
         crate::ipc::signal(ep, 1 << me);
     }
+    // SAFETY: [switch] interrupts are off (since the cli above), and no
+    // reference to the table is kept.
     unsafe { schedule() };
     // schedule() never picks a finished task, so this is unreachable.
     crate::halt();
@@ -468,6 +513,10 @@ pub fn reap() -> usize {
             for slot in 0..cap::MAX_CAPS {
                 cap::remove(id, slot, false);
             }
+            // SAFETY: [paging] interrupts off; the task has finished and
+            // isn't the running one, so it never runs again: its stack and
+            // its address space are nobody's. The space isn't the active
+            // one (this task runs in its own, or the kernel's).
             unsafe {
                 free_stack_pages(id, STACK_PAGES);
                 if task.space != 0 {
@@ -503,6 +552,10 @@ pub fn reap() -> usize {
 /// the current one again if it is still Running and nobody else is ready.
 /// The idle task is never picked by the scan, only when nothing else can
 /// run.
+///
+/// # Safety
+/// Interrupts off (checked), and the caller keeps no reference to the task
+/// table, or anything else another task may change, across the call.
 unsafe fn schedule() {
     crate::cpu::assert_interrupts_off(b"sched schedule");
     let cur = current_id();
@@ -536,16 +589,30 @@ unsafe fn schedule() {
         // Its address space, and the stack its ring-3 code lands on.
         let space = if t[next].space == 0 { crate::paging::kernel_root() } else { t[next].space };
         if crate::vmm::active_root() != space {
-            crate::vmm::switch_to(space);
+            // SAFETY: [paging] the kernel's root, or the root of task next's
+            // own space, which lives until next is reaped; every space maps
+            // the kernel half (where this code and its stack are) the same.
+            unsafe { crate::vmm::switch_to(space) };
         }
-        crate::gdt::set_kernel_stack(kernel_stack_top(next));
+        // SAFETY: [switch] the top of task next's kernel stack, mapped for
+        // as long as the task exists (spawn mapped it; reap frees it only
+        // once it has finished), with interrupts off.
+        unsafe { crate::gdt::set_kernel_stack(kernel_stack_top(next)) };
         next
     };
 
     SWITCHES.fetch_add(1, Ordering::Relaxed);
-    *(&raw mut CURRENT) = next;
-    let tasks = &raw mut TASKS;
-    switch_context(&raw mut (*tasks)[cur].rsp, (*tasks)[next].rsp);
+    // SAFETY: [switch] interrupts off (# Safety) and `t` is gone, so these
+    // raw accesses are the only ones to TASKS and CURRENT. switch_context
+    // (entry.asm) saves this task's callee-saved registers and stack pointer
+    // in its own entry, then resumes next from the stack pointer saved in
+    // next's: spawn laid out a new task's, and a suspended task's is what
+    // its own switch_context left.
+    unsafe {
+        *(&raw mut CURRENT) = next;
+        let tasks = &raw mut TASKS;
+        switch_context(&raw mut (*tasks)[cur].rsp, (*tasks)[next].rsp);
+    }
     // Back: a later schedule() has picked this task again.
 }
 
@@ -562,11 +629,14 @@ pub fn on_tick() {
             }
         }
     }
+    // SAFETY: [switch] the timer handler runs with interrupts off, and the
+    // loop's reference to the table is gone.
     unsafe { schedule() };
 }
 
 /// Give up the rest of this time slice.
 pub fn yield_now() {
+    // SAFETY: [switch] inside without_interrupts, holding nothing.
     without_interrupts(|| unsafe { schedule() });
 }
 
@@ -578,6 +648,8 @@ pub fn sleep_ticks(ticks: u64) {
         if cur != idle_id() {
             table()[cur].state = State::Sleeping(crate::apic::ticks() + ticks);
         }
+        // SAFETY: [switch] inside without_interrupts, holding nothing (the
+        // table was indexed and let go).
         unsafe { schedule() };
     });
 }
@@ -607,6 +679,7 @@ pub fn join_timeout(id: TaskId, ticks: u64) -> Option<ExitStatus> {
                 _ => {}
             }
             table()[cur].state = State::Joining(id, deadline);
+            // SAFETY: [switch] inside without_interrupts, holding nothing.
             unsafe { schedule() };
         }
     })
@@ -696,6 +769,8 @@ pub fn free_cap_slots() -> usize {
 /// or wait in line for it. Ownership is handed straight to the oldest
 /// waiter on release, so nobody can barge in and nobody waits forever.
 pub(crate) fn mutex_acquire(key: usize, owner: &AtomicU64, contended: &AtomicU64) {
+    // SAFETY: [switch] block with interrupts off, in MutexWait(key):
+    // mutex_release hands the mutex to the oldest waiter and wakes it.
     without_interrupts(|| unsafe {
         if crate::idt::irq_depth() > 0 {
             crate::cpu::fatal(b"mutex locked inside a hardware interrupt handler, key ", key as u64);
@@ -886,6 +961,7 @@ use crate::{serial_write_str as s, serial_write_u64 as dec};
 
 fn read_rsp() -> u64 {
     let rsp: u64;
+    // SAFETY: [cpu] copying RSP into a register changes nothing.
     unsafe { asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
     rsp
 }
@@ -975,6 +1051,12 @@ fn alloc_task(index: u64) {
         let stamp = ((index + 1) << 56) | rounds;
         let size = 64 + (rounds % 8) as usize * 64;
         let layout = Layout::from_size_align(size, 16).unwrap_or(Layout::new::<u64>());
+        // SAFETY: [paging] each test task maps its own frame at its own page
+        // (ALLOC_TEST_VA + index pages: no two tasks share one, and nothing
+        // else uses that range), and touches only that page, the frame
+        // through the physical map, and a heap block it allocated, freed
+        // once with the same layout. All three are its alone until it gives
+        // them back, which is what being preempted in the middle tests.
         unsafe {
             let Some(held) = pmm::alloc(Kind::Test, Owner::Kernel) else {
                 errors += 1;

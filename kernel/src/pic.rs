@@ -29,11 +29,17 @@ const ICW4_8086: u8 = 0x01; // 8086 mode (not the 8080 call-instruction mode)
 /// A write to an unused port: gives an old PIC time to settle between
 /// initialisation words.
 fn io_wait() {
+    // SAFETY: [port] 0x80 is the POST diagnostic port, which no device acts
+    // on; writing it only takes time, which is the point.
     unsafe { outb(0x80, 0) };
 }
 
 /// Re-initialise both PICs onto vectors 0x20-0x2F and mask all 16 lines.
 pub fn remap_and_mask() {
+    // SAFETY: [port] the two 8259 PICs' command and data ports, which only
+    // this file drives, written in the order the 8259's initialisation
+    // sequence requires. The result masks every line: the PICs are then
+    // silent and the APICs deliver interrupts instead.
     unsafe {
         // ICW1: begin initialisation, ICW4 will follow.
         outb(PIC1_COMMAND, ICW1_INIT | ICW1_ICW4);
@@ -63,5 +69,7 @@ pub fn remap_and_mask() {
 
 /// The two interrupt mask registers (0xFF = every line masked).
 pub fn masks() -> (u8, u8) {
+    // SAFETY: [port] reading a PIC's data port outside an initialisation
+    // sequence returns its mask register and changes nothing.
     unsafe { (inb(PIC1_DATA), inb(PIC2_DATA)) }
 }

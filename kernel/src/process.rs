@@ -200,11 +200,17 @@ pub fn spawn_signalling(
         return Err(SpawnError::OutOfMemory);
     }
     let mut space = AddressSpace::new_user().map_err(|_| SpawnError::OutOfMemory)?;
+    // SAFETY: [paging] a space new_user just made, with nothing in its user
+    // half and no task using it.
     if unsafe { load(&mut space, program.image, data_pages) }.is_err() {
+        // SAFETY: [paging] that same space: no task has it, and it isn't the
+        // active one (this task runs in its own).
         unsafe { space.destroy() };
         return Err(SpawnError::OutOfMemory);
     }
     // The task owns the address space from here; reap() destroys it.
+    // SAFETY: [paging] on failure no task was given the space, so nothing
+    // will use it: it is destroyed as above.
     sched::spawn_in_signalling(program.name, start, arg, space.root(), caps, origins, exit_signal).inspect_err(|_| unsafe {
         AddressSpace::from_root(space.root()).destroy();
     })
@@ -213,13 +219,22 @@ pub fn spawn_signalling(
 /// Map code (copied in), data (zeroed) and a stack. Every frame mapped
 /// belongs to the address space: if this fails part-way, destroy() frees
 /// what was mapped.
+///
+/// # Safety
+/// `space` must be a user address space that nothing runs in yet, with
+/// nothing mapped at the code, data and stack addresses.
 unsafe fn load(space: &mut AddressSpace, image: &[u8], data_pages: u64) -> Result<(), ()> {
     // Each page belongs to the process being built until its task has an
     // id (Owner::Unassigned; sched::spawn hands them over: Entry 29).
     let mut map_new = |va: u64, kind: Kind, flags: PageFlags, src: &[u8]| -> Result<(), ()> {
         let frame = pmm::alloc(kind, Owner::Unassigned).ok_or(())?; // arrives zeroed
-        core::ptr::copy_nonoverlapping(src.as_ptr(), crate::paging::phys_to_virt(frame.phys()), src.len());
-        space.map_frame(va, frame, flags).map_err(|(_, frame)| frame.free())
+        // SAFETY: [phys] into the frame just allocated (`frame` holds it),
+        // through the physical map; src is at most one page (a chunk of
+        // PAGE_SIZE, or empty), and can't overlap a frame nobody had.
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), crate::paging::phys_to_virt(frame.phys()), src.len()) };
+        // SAFETY: [paging] the new frame at a user address nothing maps yet
+        // (# Safety: the space is empty there, and each va is used once).
+        unsafe { space.map_frame(va, frame, flags) }.map_err(|(_, frame)| frame.free())
     };
     for (i, chunk) in image.chunks(PAGE_SIZE as usize).enumerate() {
         map_new(USER_CODE_BASE + i as u64 * PAGE_SIZE, Kind::ProcessCode, PageFlags::USER_CODE, chunk)?;
@@ -241,6 +256,11 @@ unsafe fn load(space: &mut AddressSpace, image: &[u8], data_pages: u64) -> Resul
 /// fails) rather than a value that happened to be zero anyway. Clobbering
 /// rbx and rbp is fine: this never returns.
 fn start(arg: u64) {
+    // SAFETY: [switch] the scheduler has loaded this process's address space,
+    // where load() mapped the code at USER_CODE_BASE and the stack below
+    // USER_STACK_TOP. enter_user (entry.asm) leaves for ring 3 by iretq with
+    // user selectors, so the code runs with ring 3's limits; this never
+    // returns, so the registers it fills with ones belong to nobody.
     unsafe {
         core::arch::asm!(
             "pcmpeqd xmm0, xmm0",
@@ -293,7 +313,9 @@ pub fn demo_kernel_touches_user(execute: bool) {
         return;
     }
     let Ok(mut space) = AddressSpace::new_user() else { return };
+    // SAFETY: [paging] a space new_user just made, as in spawn_signalling.
     if unsafe { load(&mut space, HELLO.image, USER_DATA_PAGES) }.is_err() {
+        // SAFETY: [paging] that space, which no task has.
         unsafe { space.destroy() };
         return;
     }
@@ -305,11 +327,15 @@ pub fn demo_kernel_touches_user(execute: bool) {
 
 /// Kernel code, running in a process's address space, reads its code page.
 fn touch_by_reading(_: u64) {
+    // SAFETY: [fault] a process's code page, read from ring 0 with SMAP on
+    // (the demo checked): it faults, and the kernel halts with the report.
     unsafe { core::ptr::read_volatile(USER_CODE_BASE as *const u64) };
 }
 
 /// Kernel code, running in a process's address space, calls its code.
 fn touch_by_calling(_: u64) {
+    // SAFETY: [fault] a process's code page, called from ring 0 with SMEP on
+    // (the demo checked): fetching it faults before an instruction runs.
     let f: extern "C" fn() = unsafe { core::mem::transmute(USER_CODE_BASE as *const ()) };
     f();
 }
@@ -375,6 +401,10 @@ fn selftest_memory() -> bool {
     };
     let page = frame.phys();
     let word = crate::paging::phys_to_virt(page) as *mut u64;
+    // SAFETY: [phys] the test's own frame (`frame` holds it until the end),
+    // through the physical map. The probes reach it through their own
+    // mappings, in other programs; the kernel keeps no reference to it, only
+    // this pointer, used for single volatile accesses.
     unsafe { word.write_volatile(PATTERN) };
     let ro = Cap::Memory { base: page, pages: 1, flags: 0 };
     let rw = Cap::Memory { base: page, pages: 1, flags: MEM_WRITE };
@@ -383,6 +413,7 @@ fn selftest_memory() -> bool {
     let read = run(&PROBE, MAP_READ | at << 8, table(&[ro]));
     let write_ro = run(&PROBE, MAP_WRITE | at << 8, table(&[ro]));
     let write_rw = run(&PROBE, MAP_WRITE | at << 8, table(&[rw]));
+    // SAFETY: [phys] as above; the probe that wrote it has ended.
     let written = unsafe { word.read_volatile() } == WRITTEN;
     let print = run(&PROBE, MAP_THEN_PRINT | at << 8, table(&[ro, Cap::Console]));
     let mut ok = crate::selftest::check(
@@ -401,6 +432,7 @@ fn selftest_memory() -> bool {
     // (since Entry 25 one capability maps once; cap.rs tests that).
     let twice = run(&PROBE, MAP_TWICE | at << 8, table(&[ro, ro])) == code(ERR_BAD_ADDRESS);
     sched::reap();
+    // SAFETY: [phys] as above: `frame` still holds the page.
     let kept = !pmm::is_frame_free(page) && unsafe { word.read_volatile() } == WRITTEN;
     ok &= crate::selftest::check(
         b"user",

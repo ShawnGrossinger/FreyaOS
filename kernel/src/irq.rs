@@ -80,20 +80,42 @@ static IOAPIC: AtomicU64 = AtomicU64::new(0);
 static INPUT: [AtomicU32; ISA_LINES] = [const { AtomicU32::new(NOT_ROUTED) }; ISA_LINES];
 static LEVEL: [AtomicBool; ISA_LINES] = [const { AtomicBool::new(false) }; ISA_LINES];
 
-fn ioapic_read(reg: u32) -> u32 {
+/// The registers' address, which init_ioapic maps; halts if it hasn't
+/// (Entry 30: with IOAPIC still 0, the writes would land in low memory).
+fn ioapic_base() -> u64 {
     let base = IOAPIC.load(Ordering::Relaxed);
-    unsafe {
-        ((base) as *mut u32).write_volatile(reg); // IOREGSEL
-        ((base + 0x10) as *const u32).read_volatile() // IOWIN
+    if base == 0 {
+        crate::serial_write_str(b"[irq] FATAL: the I/O APIC used before it was mapped\n");
+        crate::halt();
     }
+    base
+}
+
+/// A register is two accesses (select it, then read or write the window),
+/// so each pair runs with interrupts off: a handler's own pair can't come
+/// in between and leave the wrong register selected.
+fn ioapic_read(reg: u32) -> u32 {
+    let base = ioapic_base();
+    without_interrupts(|| {
+        // SAFETY: [mmio] IOREGSEL (base) and IOWIN (base + 0x10), both in
+        // the 0x20 bytes init_ioapic mapped, uncached, at base.
+        unsafe {
+            (base as *mut u32).write_volatile(reg); // IOREGSEL
+            ((base + 0x10) as *const u32).read_volatile() // IOWIN
+        }
+    })
 }
 
 fn ioapic_write(reg: u32, value: u32) {
-    let base = IOAPIC.load(Ordering::Relaxed);
-    unsafe {
-        (base as *mut u32).write_volatile(reg);
-        ((base + 0x10) as *mut u32).write_volatile(value);
-    }
+    let base = ioapic_base();
+    without_interrupts(|| {
+        // SAFETY: [mmio] as in ioapic_read: the two registers init_ioapic
+        // mapped.
+        unsafe {
+            (base as *mut u32).write_volatile(reg);
+            ((base + 0x10) as *mut u32).write_volatile(value);
+        }
+    })
 }
 
 /// I/O APIC inputs the firmware had left unmasked, for the boot summary.
@@ -117,6 +139,8 @@ pub struct IoApicSetup {
 /// with the polarity and trigger the MADT gives. Interrupts go to this CPU.
 pub fn init_ioapic(info: &crate::acpi::Info) -> Result<IoApicSetup, &'static [u8]> {
     let io = info.ioapic.ok_or(&b"no I/O APIC in the ACPI MADT"[..])?;
+    // SAFETY: [mmio] the I/O APIC's registers, at the address the MADT
+    // gives, which no RAM shares; main calls init_ioapic once.
     let va = unsafe { crate::vmm::map_mmio(io.phys, 0x20) }.map_err(|_| &b"could not map the I/O APIC"[..])?;
     IOAPIC.store(va, Ordering::Relaxed);
     let version_reg = ioapic_read(1);
@@ -263,6 +287,9 @@ pub fn wait(slot: u64) -> i64 {
         return ERR_BAD_ARGUMENT; // no such line here, or it signals instead
     }
     set_masked(line, false); // a driver is waiting: let it through
+    // SAFETY: [switch] sched::block with interrupts off (inside
+    // without_interrupts), in IrqWait(line): on_interrupt for that line, or
+    // kill, makes the task Ready again.
     without_interrupts(|| unsafe {
         loop {
             let pending = &PENDING[line as usize];
@@ -340,6 +367,13 @@ pub fn port_io(slot: u64, port: u64, width: u64, value: u64, write: bool) -> i64
         return ERR_WRONG_CAPABILITY;
     }
     let port = port as u16;
+    // SAFETY: [port] every byte of [port, port + width) is inside the range
+    // of the IoPorts capability the caller holds (checked above): whoever
+    // granted it decided this process may drive those ports. The only
+    // ranges the kernel makes are the PS/2 controller's (0x60 and 0x64, for
+    // the PS/2 driver) and, for a self-test, the CMOS clock's (0x70-0x71);
+    // capabilities copied from them can only be narrower. Neither device
+    // can reach memory, and the kernel keeps no state of its own in either.
     unsafe {
         use core::arch::asm;
         match (width, write) {

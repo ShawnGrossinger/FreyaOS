@@ -65,6 +65,9 @@ pub struct Info {
 static mut INFO: Option<Info> = None;
 
 pub fn info() -> Option<&'static Info> {
+    // SAFETY: [static] INFO is written once, by init(), whose only caller is
+    // main at boot, before any task exists; after that it is only read, so
+    // the 'static shared reference never sees it change.
     unsafe { (*(&raw const INFO)).as_ref() }
 }
 
@@ -86,6 +89,9 @@ fn view(phys: u64, len: u64) -> Option<*const u8> {
     if covered {
         return Some(paging::phys_to_virt(phys) as *const u8);
     }
+    // SAFETY: [mmio] firmware tables the physical map doesn't cover (they
+    // sit in memory the E820 map calls reserved), mapped uncached for
+    // reading; no RAM the frame allocator hands out is among them.
     unsafe { vmm::map_mmio(phys, len).ok().map(|va| va as *const u8) }
 }
 
@@ -99,6 +105,8 @@ struct Bytes {
 impl Bytes {
     fn u8(&self, at: usize) -> u8 {
         if at < self.len {
+            // SAFETY: [mmio] ptr is view()'s, valid for len bytes, and at
+            // is below len.
             unsafe { self.ptr.add(at).read_volatile() }
         } else {
             0
@@ -169,6 +177,8 @@ fn find_rsdp() -> Option<u64> {
 pub fn init() -> Result<&'static Info, &'static [u8]> {
     let rsdp_phys = find_rsdp().ok_or(&b"no ACPI tables (RSDP not found)"[..])?;
     let info = parse(rsdp_phys)?;
+    // SAFETY: [static] main calls init once, at boot, before anything calls
+    // info(): no reference to INFO exists yet.
     unsafe { *(&raw mut INFO) = Some(info) };
     self::info().ok_or(&b"unreachable"[..])
 }
@@ -347,6 +357,8 @@ fn parse_synthetic() -> Option<Info> {
     const FADT: usize = 128;
     const MADT: usize = 400;
     const DSDT: usize = 500;
+    // SAFETY: [static] only this function touches SYNTHETIC, and only
+    // selftest calls it, once, at boot.
     let t = unsafe { &mut (*(&raw mut SYNTHETIC)).0 };
     let base = t.as_ptr() as u64;
     let put = |t: &mut [u8; 1024], at: usize, bytes: &[u8]| {

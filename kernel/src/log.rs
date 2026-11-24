@@ -38,14 +38,16 @@ const _: () = assert!(core::mem::size_of::<Log>() == LOG_PAGES as usize * PAGE);
 // pages to the console lends nothing else of the kernel's.
 static mut LOG: Log = Log { written: AtomicU64::new(0), _rest_of_header: [0; PAGE - 8], data: [0; LOG_DATA_BYTES] };
 
-fn log() -> &'static mut Log {
-    unsafe { &mut *(&raw mut LOG) }
-}
-
 /// Append one byte. The caller has interrupts off (serial_write_str does),
 /// so appends never interleave.
 pub fn push(b: u8) {
-    let log = log();
+    crate::cpu::assert_interrupts_off(b"log::push");
+    // SAFETY: [static] push is the only code that makes a reference to LOG,
+    // and runs with interrupts off on the one CPU (checked just above), so
+    // this is the only one. The console driver reads the same pages through
+    // its own mapping, in another program: `written` is atomic and stored
+    // last (Release), so it never counts a byte not yet written.
+    let log = unsafe { &mut *(&raw mut LOG) };
     let n = log.written.load(Ordering::Relaxed);
     log.data[n as usize % LOG_DATA_BYTES] = b;
     log.written.store(n + 1, Ordering::Release);

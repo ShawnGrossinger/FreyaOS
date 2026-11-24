@@ -212,6 +212,12 @@ pub fn init() -> Result<u64, &'static [u8]> {
     let kernel = crate::gdt::KERNEL_CODE_SEL as u64;
     let user_base = (crate::gdt::USER_DATA_SEL as u64 & !3) - 8;
     let entry = syscall_entry as *const () as u64;
+    // SAFETY: [cpu] the four MSRs exist on any CPU with SYSCALL (checked
+    // above). STAR's selectors are gdt.rs's, in the order SYSCALL and
+    // SYSRET need; LSTAR is syscall_entry (entry.asm), which switches to the
+    // task's kernel stack before touching memory; FMASK clears IF among
+    // others, so the kernel is entered with interrupts off; EFER gains only
+    // SCE. Called once at boot, before any process exists to use it.
     unsafe {
         crate::cpu::wrmsr(IA32_STAR, user_base << 48 | kernel << 32);
         crate::cpu::wrmsr(IA32_LSTAR, entry);
@@ -394,22 +400,31 @@ pub fn copy_from_user(ptr: u64, buf: &mut [u8]) -> Result<(), i64> {
     if !vmm::is_user_range(ptr, len) {
         return Err(ERR_BAD_ADDRESS);
     }
+    // SAFETY: [paging] the running task's own address space, live while it
+    // runs (a space is destroyed only once its task has ended).
     let space = unsafe { AddressSpace::from_root(sched::current_space()) };
     let mut done = 0;
     while done < len {
         let va = ptr + done;
-        let Some(frame) = space.user_page(va & !0xFFF, false) else {
-            return Err(ERR_BAD_ADDRESS);
-        };
         let offset = va & 0xFFF;
         let n = (0x1000 - offset).min(len - done);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                crate::paging::phys_to_virt(frame + offset),
-                buf.as_mut_ptr().add(done as usize),
-                n as usize,
-            );
-        }
+        // Each page checked and copied with interrupts off (system calls
+        // are preemptible): nothing can unmap it in between (Entry 30).
+        crate::cpu::without_interrupts(|| -> Result<(), i64> {
+            let frame = space.user_page(va & !0xFFF, false).ok_or(ERR_BAD_ADDRESS)?;
+            // SAFETY: [user] user_page says the page at va is the caller's
+            // own frame; n bytes from offset stay inside it and inside buf.
+            // With interrupts off nothing can unmap or free it before the
+            // copy, and the physical map reaches every frame.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    crate::paging::phys_to_virt(frame + offset),
+                    buf.as_mut_ptr().add(done as usize),
+                    n as usize,
+                );
+            }
+            Ok(())
+        })?;
         done += n;
     }
     Ok(())
@@ -428,22 +443,28 @@ pub fn copy_to_user(ptr: u64, buf: &[u8]) -> Result<(), i64> {
     if !vmm::is_user_range(ptr, len) {
         return Err(ERR_BAD_ADDRESS);
     }
+    // SAFETY: [paging] as in copy_from_user: the running task's own space.
     let space = unsafe { AddressSpace::from_root(sched::current_space()) };
     let mut done = 0;
     while done < len {
         let va = ptr + done;
-        let Some(frame) = space.user_page(va & !0xFFF, true) else {
-            return Err(ERR_BAD_ADDRESS);
-        };
         let offset = va & 0xFFF;
         let n = (0x1000 - offset).min(len - done);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                buf.as_ptr().add(done as usize),
-                crate::paging::phys_to_virt(frame + offset),
-                n as usize,
-            );
-        }
+        // As in copy_from_user: check and copy with interrupts off.
+        crate::cpu::without_interrupts(|| -> Result<(), i64> {
+            let frame = space.user_page(va & !0xFFF, true).ok_or(ERR_BAD_ADDRESS)?;
+            // SAFETY: [user] user_page says the page at va is the caller's
+            // own, writable (never a page it only borrows); n bytes stay
+            // inside it, and nothing can free it before the copy.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buf.as_ptr().add(done as usize),
+                    crate::paging::phys_to_virt(frame + offset),
+                    n as usize,
+                );
+            }
+            Ok(())
+        })?;
         done += n;
     }
     Ok(())

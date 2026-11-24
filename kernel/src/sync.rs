@@ -24,7 +24,10 @@ pub struct Mutex<T> {
     data: UnsafeCell<T>,
 }
 
-// The mutex hands out access to `data` to one task at a time.
+// SAFETY: [static] the mutex hands out access to `data` to one task at a
+// time: a MutexGuard exists only between mutex_acquire, which returns once
+// `owner` is this task, and mutex_release in its Drop, which passes it on.
+// T: Send because the value is reached from whichever task holds it.
 unsafe impl<T: Send> Sync for Mutex<T> {}
 
 impl<T> Mutex<T> {
@@ -55,12 +58,16 @@ pub struct MutexGuard<'a, T> {
 impl<T> Deref for MutexGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
+        // SAFETY: [static] this guard's task holds the mutex until the guard
+        // drops, and the reference can't outlive the guard.
         unsafe { &*self.mutex.data.get() }
     }
 }
 
 impl<T> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: [static] as deref; &mut self means no other reference made
+        // through this guard is alive, and no other guard exists.
         unsafe { &mut *self.mutex.data.get() }
     }
 }

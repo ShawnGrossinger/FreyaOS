@@ -189,6 +189,11 @@ pub fn set_irq_depth(depth: u64) {
 pub fn init() -> u16 {
     let cs = read_cs();
 
+    // SAFETY: [cpu] main calls this once at boot, after gdt::init, with
+    // interrupts off. IDT is a static in the kernel image, so the address
+    // lidt loads stays valid for good, and nothing else refers to it yet.
+    // Every gate points at a stub in entry.asm's isr_stub_table (256
+    // entries, one per vector, as IDT_ENTRIES), with the kernel's CS.
     unsafe {
         let idt = &raw mut IDT;
 
@@ -235,6 +240,10 @@ pub fn selftest_breakpoint() -> bool {
     let r11_out: u64;
     let xmm0_out: f64;
 
+    // SAFETY: [switch] int3 enters the breakpoint handler through
+    // isr_common, which saves and restores every general register and the
+    // SSE state; that is what this test checks, and the registers named here
+    // are the ones it compares.
     unsafe {
         asm!(
             "int3",
@@ -768,6 +777,7 @@ impl Line {
 
 fn read_cs() -> u16 {
     let cs: u16;
+    // SAFETY: [cpu] reading CS changes nothing.
     unsafe {
         asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags));
     }
@@ -776,6 +786,8 @@ fn read_cs() -> u16 {
 
 fn read_cr2() -> u64 {
     let value: u64;
+    // SAFETY: [cpu] reading CR2 (the address of the last page fault)
+    // changes nothing.
     unsafe {
         asm!("mov {}, cr2", out(reg) value, options(nomem, nostack, preserves_flags));
     }

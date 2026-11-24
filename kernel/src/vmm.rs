@@ -234,17 +234,26 @@ fn table(phys: u64) -> *mut u64 {
     paging::phys_to_virt(phys) as *mut u64
 }
 
+/// Every entry of the table at `table_phys` is zero.
+///
+/// # Safety
+/// `table_phys` is a page table of a live hierarchy, and the page-table
+/// lock (interrupts off) is held.
 unsafe fn is_empty(table_phys: u64) -> bool {
     let t = table(table_phys);
-    (0..ENTRIES).all(|i| *t.add(i) == 0)
+    // SAFETY: [paging] its 512 entries, through the physical map (# Safety).
+    (0..ENTRIES).all(|i| unsafe { *t.add(i) } == 0)
 }
 
 fn invlpg(virt: u64) {
+    // SAFETY: [cpu] invlpg only drops cached translations for one page; the
+    // CPU walks the tables again on its next use.
     unsafe { asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)) };
 }
 
 fn read_cr3() -> u64 {
     let cr3: u64;
+    // SAFETY: [cpu] reading CR3 changes nothing.
     unsafe { asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)) };
     cr3
 }
@@ -260,7 +269,9 @@ pub fn active_root() -> u64 {
 /// `root` must be a complete hierarchy that maps the running code, its
 /// stack and the kernel half: one from AddressSpace::kernel() or new_user().
 pub unsafe fn switch_to(root: u64) {
-    asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+    // SAFETY: [paging] the caller's promise (# Safety): the running code and
+    // its stack stay mapped where they are across the load.
+    unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
 }
 
 fn fatal(msg: &[u8], value: u64) -> ! {
@@ -287,6 +298,10 @@ impl AddressSpace {
 
     /// The address space whose PML4 is at `root`.
     ///
+    /// Every safe method below walks the hierarchy from `root` through the
+    /// physical map, trusting that it is one: kernel() and new_user() make
+    /// only those, and this is the one other way to get an AddressSpace.
+    ///
     /// # Safety
     /// `root` must have come from root() of a live address space.
     pub unsafe fn from_root(root: u64) -> AddressSpace {
@@ -305,6 +320,11 @@ impl AddressSpace {
     /// shared with the kernel's (see the top of this file), nothing in user
     /// space yet. Costs two frames (its PML4 and its lower-half PDPT).
     pub fn new_user() -> Result<AddressSpace, MapError> {
+        // SAFETY: [paging] the page-table lock (interrupts off) is held. The
+        // two new frames are this call's (zeroed by alloc), reached through
+        // the physical map; the kernel's PML4 and its first PDPT are read
+        // only. Copying the kernel half makes the new space map the kernel
+        // exactly as the kernel's own does.
         crate::cpu::without_interrupts(|| unsafe {
             // A process being built owns them until its task has an id
             // (adopt(); Entry 29).
@@ -344,9 +364,18 @@ impl AddressSpace {
             fatal(b"destroy of the kernel's or the active address space, root ", self.root);
         }
         let owner = self.owner();
-        let give_back = |phys: u64, kinds: u32| Frame::reclaim(phys, kinds, owner).free();
+        // SAFETY: [paging] each frame given back is one the walk below found
+        // in this space's user half, which no task will use again
+        // (# Safety): its tables and its own pages (borrowed ones are
+        // skipped). reclaim halts unless each is this owner's, of the kind
+        // expected.
+        let give_back = |phys: u64, kinds: u32| unsafe { Frame::reclaim(phys, kinds, owner) }.free();
         let table_kind = Kind::PageTable.bit();
-        crate::cpu::without_interrupts(|| {
+        // SAFETY: [paging] the page-table lock is held; every table read is
+        // one this hierarchy links to, through the physical map, and each is
+        // read before it is given back. The low 1 GiB's PDPT entry is shared
+        // with the kernel and skipped.
+        crate::cpu::without_interrupts(|| unsafe {
             let pml4 = table(self.root);
             for i in 0..256 {
                 let e4 = *pml4.add(i);
@@ -400,7 +429,9 @@ impl AddressSpace {
     /// # Safety
     /// As map().
     pub unsafe fn map_frame(&mut self, virt: u64, frame: Frame<Typed>, flags: PageFlags) -> Result<(), (MapError, Frame<Typed>)> {
-        match self.map(virt, frame.phys(), flags) {
+        // SAFETY: [paging] the caller's promise for map() (# Safety); the
+        // frame is one the caller holds, so it is nobody else's.
+        match unsafe { self.map(virt, frame.phys(), flags) } {
             Ok(()) => {
                 let _stored = frame.into_phys();
                 Ok(())
@@ -416,8 +447,11 @@ impl AddressSpace {
     /// # Safety
     /// As unmap().
     pub unsafe fn unmap_frame(&mut self, virt: u64, kinds: u32, owner: Owner) -> Result<Frame<Typed>, UnmapError> {
-        let phys = self.unmap(virt)?;
-        Ok(Frame::reclaim(phys, kinds, owner))
+        // SAFETY: [paging] the caller's promise for unmap() (# Safety).
+        let phys = unsafe { self.unmap(virt) }?;
+        // SAFETY: [paging] the mapping just removed was this frame's only
+        // holder; reclaim halts unless it is of `kinds` and `owner`'s.
+        Ok(unsafe { Frame::reclaim(phys, kinds, owner) })
     }
 
     /// Hand every frame of a process being built to `owner`, the task now
@@ -427,7 +461,11 @@ impl AddressSpace {
     /// # Safety
     /// A user address space whose frames still belong to Owner::Unassigned.
     pub unsafe fn adopt(&self, owner: Owner) {
-        crate::cpu::without_interrupts(|| {
+        // SAFETY: [paging] as destroy's walk: the lock is held, and only
+        // tables this hierarchy links to are read. pmm::adopt is given the
+        // space's own tables and pages (# Safety; borrowed pages skipped),
+        // and halts on any frame that isn't Unassigned.
+        crate::cpu::without_interrupts(|| unsafe {
             let pml4 = table(self.root);
             for i in 0..256 {
                 let e4 = *pml4.add(i);
@@ -475,7 +513,10 @@ impl AddressSpace {
         if !is_user_range(virt, 1) {
             return None;
         }
-        unsafe {
+        // SAFETY: [paging] walks this space's own hierarchy (from_root's
+        // promise), with the lock held so no table is freed mid-walk; stops
+        // at the first entry that isn't a present, user, non-huge table.
+        crate::cpu::without_interrupts(|| unsafe {
             let mut table_phys = self.root;
             for level in [4u32, 3, 2, 1] {
                 let entry = *table(table_phys).add(index(virt, level));
@@ -491,7 +532,7 @@ impl AddressSpace {
                 table_phys = entry & ADDR_MASK;
             }
             Some(table_phys)
-        }
+        })
     }
 
     /// True if the CPU is using this hierarchy right now. TLB entries only
@@ -508,65 +549,79 @@ impl AddressSpace {
     pub unsafe fn map(&mut self, virt: u64, phys: u64, flags: PageFlags) -> Result<(), MapError> {
         // Interrupts off: a task switch mid-walk could let another task
         // build a conflicting table under the same entry.
-        crate::cpu::without_interrupts(|| self.map_locked(virt, phys, flags))
+        // SAFETY: [paging] the caller's promise (# Safety), and the lock is
+        // taken here.
+        crate::cpu::without_interrupts(|| unsafe { self.map_locked(virt, phys, flags) })
     }
 
+    /// map(), with the page-table lock held.
+    ///
+    /// # Safety
+    /// As map(), and interrupts off (checked).
     unsafe fn map_locked(&mut self, virt: u64, phys: u64, flags: PageFlags) -> Result<(), MapError> {
-        crate::cpu::assert_interrupts_off(b"vmm map");
-        if virt % PAGE_SIZE != 0 || phys % PAGE_SIZE != 0 {
-            return Err(MapError::Misaligned);
-        }
-        if !is_canonical(virt) {
-            return Err(MapError::NonCanonical);
-        }
-        // User pages only in user space of a user address space; nothing
-        // else in user space; nothing outside it through a user address
-        // space (the kernel half is shared: change it via the kernel's).
-        let in_user_space = is_user_range(virt, PAGE_SIZE);
-        if flags.is_user() != in_user_space || (flags.is_user() && self.is_kernel())
-            || (!self.is_kernel() && !in_user_space)
-        {
-            return Err(MapError::WrongRegion);
-        }
-
-        // Walk PML4 -> PDPT -> PD, creating any missing table on the way.
-        // Intermediate entries are permissive; the leaf decides. For a user
-        // page they also need U/S, or ring 3 can't get past them.
-        let table_bits = PRESENT | WRITABLE | if flags.is_user() { USER } else { 0 };
-        let mut table_phys = self.root;
-        for level in [4u32, 3, 2] {
-            let entry = table(table_phys).add(index(virt, level));
-
-            if *entry & PRESENT == 0 {
-                if level == 4 && index(virt, 4) >= 256 && user_spaces() > 0 {
-                    // User address spaces copied the kernel's PML4 entries
-                    // when they were made, and would never see this one.
-                    fatal(b"new kernel-half PML4 entry after user address spaces copied the kernel half, address ", virt);
-                }
-                // A table belongs to whoever the address space does.
-                let new = match pmm::alloc(Kind::PageTable, self.owner()) {
-                    Some(frame) => frame.into_phys(), // already zeroed
-                    None => return Err(MapError::OutOfMemory),
-                };
-                *entry = new | table_bits;
-            } else if level < 4 && *entry & HUGE != 0 {
-                return Err(MapError::HugePageInTheWay);
-            } else {
-                *entry |= table_bits & USER;
+        // SAFETY: [paging] the lock is held (checked first thing). The walk follows
+        // this space's own hierarchy through the physical map; a missing table
+        // is a fresh zeroed frame of the space's owner. Kernel-half PML4 entries
+        // can't be added once user spaces have copied the kernel half (that
+        // halts). The leaf is written only if it was empty; what it maps is the
+        // caller's choice (# Safety). Not-present to present needs no flush.
+        unsafe {
+            crate::cpu::assert_interrupts_off(b"vmm map");
+            if virt % PAGE_SIZE != 0 || phys % PAGE_SIZE != 0 {
+                return Err(MapError::Misaligned);
+            }
+            if !is_canonical(virt) {
+                return Err(MapError::NonCanonical);
+            }
+            // User pages only in user space of a user address space; nothing
+            // else in user space; nothing outside it through a user address
+            // space (the kernel half is shared: change it via the kernel's).
+            let in_user_space = is_user_range(virt, PAGE_SIZE);
+            if flags.is_user() != in_user_space || (flags.is_user() && self.is_kernel())
+                || (!self.is_kernel() && !in_user_space)
+            {
+                return Err(MapError::WrongRegion);
             }
 
-            table_phys = *entry & ADDR_MASK;
-        }
+            // Walk PML4 -> PDPT -> PD, creating any missing table on the way.
+            // Intermediate entries are permissive; the leaf decides. For a user
+            // page they also need U/S, or ring 3 can't get past them.
+            let table_bits = PRESENT | WRITABLE | if flags.is_user() { USER } else { 0 };
+            let mut table_phys = self.root;
+            for level in [4u32, 3, 2] {
+                let entry = table(table_phys).add(index(virt, level));
 
-        let leaf = table(table_phys).add(index(virt, 1));
-        if *leaf & PRESENT != 0 {
-            return Err(MapError::AlreadyMapped);
-        }
-        *leaf = phys | flags.entry_bits();
+                if *entry & PRESENT == 0 {
+                    if level == 4 && index(virt, 4) >= 256 && user_spaces() > 0 {
+                        // User address spaces copied the kernel's PML4 entries
+                        // when they were made, and would never see this one.
+                        fatal(b"new kernel-half PML4 entry after user address spaces copied the kernel half, address ", virt);
+                    }
+                    // A table belongs to whoever the address space does.
+                    let new = match pmm::alloc(Kind::PageTable, self.owner()) {
+                        Some(frame) => frame.into_phys(), // already zeroed
+                        None => return Err(MapError::OutOfMemory),
+                    };
+                    *entry = new | table_bits;
+                } else if level < 4 && *entry & HUGE != 0 {
+                    return Err(MapError::HugePageInTheWay);
+                } else {
+                    *entry |= table_bits & USER;
+                }
 
-        // Not-present -> present needs no TLB flush: the CPU never caches a
-        // translation for a page that wasn't present.
-        Ok(())
+                table_phys = *entry & ADDR_MASK;
+            }
+
+            let leaf = table(table_phys).add(index(virt, 1));
+            if *leaf & PRESENT != 0 {
+                return Err(MapError::AlreadyMapped);
+            }
+            *leaf = phys | flags.entry_bits();
+
+            // Not-present -> present needs no TLB flush: the CPU never caches a
+            // translation for a page that wasn't present.
+            Ok(())
+        }
     }
 
     /// Remove the 4 KiB mapping at `virt` and return the frame it pointed
@@ -581,64 +636,77 @@ impl AddressSpace {
     /// # Safety
     /// Nothing may still be using the page through `virt`.
     pub unsafe fn unmap(&mut self, virt: u64) -> Result<u64, UnmapError> {
-        crate::cpu::without_interrupts(|| self.unmap_locked(virt))
+        // SAFETY: [paging] the caller's promise (# Safety), with the lock.
+        crate::cpu::without_interrupts(|| unsafe { self.unmap_locked(virt) })
     }
 
+    /// unmap(), with the page-table lock held.
+    ///
+    /// # Safety
+    /// As unmap(), and interrupts off (checked).
     unsafe fn unmap_locked(&mut self, virt: u64) -> Result<u64, UnmapError> {
-        crate::cpu::assert_interrupts_off(b"vmm unmap");
-        if virt % PAGE_SIZE != 0 {
-            return Err(UnmapError::Misaligned);
-        }
-        if !is_canonical(virt) {
-            return Err(UnmapError::NonCanonical);
-        }
-        if !self.is_kernel() && !is_user_range(virt, PAGE_SIZE) {
-            return Err(UnmapError::WrongRegion);
-        }
+        // SAFETY: [paging] the lock is held (checked first thing). The walk follows
+        // this space's own hierarchy; `parents` keeps pointers to entries in
+        // tables that stay mapped until the end (only emptied children are
+        // freed, after their entry is cleared). Boot tables are never freed. The
+        // page itself is the caller's to stop using (# Safety); invlpg drops the
+        // stale translation where the CPU could have one.
+        unsafe {
+            crate::cpu::assert_interrupts_off(b"vmm unmap");
+            if virt % PAGE_SIZE != 0 {
+                return Err(UnmapError::Misaligned);
+            }
+            if !is_canonical(virt) {
+                return Err(UnmapError::NonCanonical);
+            }
+            if !self.is_kernel() && !is_user_range(virt, PAGE_SIZE) {
+                return Err(UnmapError::WrongRegion);
+            }
 
-        // Walk down, remembering the entry that points at each table so an
-        // empty table can be unlinked on the way back up.
-        let mut parents: [*mut u64; 4] = [core::ptr::null_mut(); 4];
-        let mut table_phys = self.root;
-        for level in [4u32, 3, 2] {
-            let entry = table(table_phys).add(index(virt, level));
-            if *entry & PRESENT == 0 {
+            // Walk down, remembering the entry that points at each table so an
+            // empty table can be unlinked on the way back up.
+            let mut parents: [*mut u64; 4] = [core::ptr::null_mut(); 4];
+            let mut table_phys = self.root;
+            for level in [4u32, 3, 2] {
+                let entry = table(table_phys).add(index(virt, level));
+                if *entry & PRESENT == 0 {
+                    return Err(UnmapError::NotMapped);
+                }
+                if level < 4 && *entry & HUGE != 0 {
+                    return Err(UnmapError::HugePage);
+                }
+                parents[(level - 1) as usize] = entry; // entry pointing at the level-(n-1) table
+                table_phys = *entry & ADDR_MASK;
+            }
+
+            let leaf = table(table_phys).add(index(virt, 1));
+            if *leaf & PRESENT == 0 {
                 return Err(UnmapError::NotMapped);
             }
-            if level < 4 && *entry & HUGE != 0 {
-                return Err(UnmapError::HugePage);
+            let phys = *leaf & ADDR_MASK;
+            *leaf = 0;
+
+            // Reclaim the PT, then the PD, if this left them empty. Stop at the
+            // PDPT (see above) and never touch a boot-time static table.
+            let mut child = table_phys;
+            for level in [1u32, 2] {
+                let parent = parents[level as usize]; // entry in the level+1 table
+                if paging::is_boot_table(child) || !is_empty(child) {
+                    break;
+                }
+                *parent = 0;
+                Frame::reclaim(child, Kind::PageTable.bit(), self.owner()).free();
+                child = *parents[(level + 1) as usize] & ADDR_MASK;
             }
-            parents[(level - 1) as usize] = entry; // entry pointing at the level-(n-1) table
-            table_phys = *entry & ADDR_MASK;
-        }
 
-        let leaf = table(table_phys).add(index(virt, 1));
-        if *leaf & PRESENT == 0 {
-            return Err(UnmapError::NotMapped);
-        }
-        let phys = *leaf & ADDR_MASK;
-        *leaf = 0;
-
-        // Reclaim the PT, then the PD, if this left them empty. Stop at the
-        // PDPT (see above) and never touch a boot-time static table.
-        let mut child = table_phys;
-        for level in [1u32, 2] {
-            let parent = parents[level as usize]; // entry in the level+1 table
-            if paging::is_boot_table(child) || !is_empty(child) {
-                break;
+            // One invlpg drops both the TLB entry for `virt` and any cached
+            // paging-structure entries on its path, including ones pointing at
+            // tables just freed.
+            if self.is_active() {
+                invlpg(virt);
             }
-            *parent = 0;
-            Frame::reclaim(child, Kind::PageTable.bit(), self.owner()).free();
-            child = *parents[(level + 1) as usize] & ADDR_MASK;
+            Ok(phys)
         }
-
-        // One invlpg drops both the TLB entry for `virt` and any cached
-        // paging-structure entries on its path, including ones pointing at
-        // tables just freed.
-        if self.is_active() {
-            invlpg(virt);
-        }
-        Ok(phys)
     }
 
     /// The physical address `virt` maps to, for any page size, or None.
@@ -646,7 +714,9 @@ impl AddressSpace {
         if !is_canonical(virt) {
             return None;
         }
-        unsafe {
+        // SAFETY: [paging] as user_page: this space's own hierarchy, walked
+        // with the lock held, following only present table entries.
+        crate::cpu::without_interrupts(|| unsafe {
             let mut table_phys = self.root;
             for level in [4u32, 3, 2, 1] {
                 let entry = *table(table_phys).add(index(virt, level));
@@ -663,21 +733,25 @@ impl AddressSpace {
                 table_phys = entry & ADDR_MASK;
             }
             None
-        }
+        })
     }
 
     /// Raw leaf entry for a 4 KiB mapping (for the self-test's flag checks).
-    unsafe fn leaf_entry(&self, virt: u64) -> Option<u64> {
-        let mut table_phys = self.root;
-        for level in [4u32, 3, 2] {
-            let entry = *table(table_phys).add(index(virt, level));
-            if entry & PRESENT == 0 || (level < 4 && entry & HUGE != 0) {
-                return None;
+    fn leaf_entry(&self, virt: u64) -> Option<u64> {
+        // SAFETY: [paging] as translate: this space's own hierarchy, read
+        // only, with the lock held so no table is freed mid-walk.
+        crate::cpu::without_interrupts(|| unsafe {
+            let mut table_phys = self.root;
+            for level in [4u32, 3, 2] {
+                let entry = *table(table_phys).add(index(virt, level));
+                if entry & PRESENT == 0 || (level < 4 && entry & HUGE != 0) {
+                    return None;
+                }
+                table_phys = entry & ADDR_MASK;
             }
-            table_phys = entry & ADDR_MASK;
-        }
-        let leaf = *table(table_phys).add(index(virt, 1));
-        (leaf & PRESENT != 0).then_some(leaf)
+            let leaf = *table(table_phys).add(index(virt, 1));
+            (leaf & PRESENT != 0).then_some(leaf)
+        })
     }
 }
 
@@ -698,7 +772,8 @@ static NEXT_DEVICE_VA: AtomicU64 = AtomicU64::new(DEVICE_WINDOW_BASE);
 /// # Safety
 /// `phys` must be device memory the caller is entitled to drive.
 pub unsafe fn map_mmio(phys: u64, bytes: u64) -> Result<u64, MapError> {
-    map_device(phys, bytes, PageFlags::MMIO)
+    // SAFETY: [mmio] the caller's promise is map_device's (# Safety).
+    unsafe { map_device(phys, bytes, PageFlags::MMIO) }
 }
 
 /// map_mmio with other flags (PageFlags::FRAMEBUFFER).
@@ -713,7 +788,10 @@ pub unsafe fn map_device(phys: u64, bytes: u64, flags: PageFlags) -> Result<u64,
 
     let mut ks = AddressSpace::kernel();
     for i in 0..pages {
-        ks.map(va + i * PAGE_SIZE, first + i * PAGE_SIZE, flags)?;
+        // SAFETY: [mmio] device memory the caller may drive (# Safety), at
+        // fresh addresses in the device window: NEXT_DEVICE_VA only grows, so
+        // no two calls get the same pages.
+        unsafe { ks.map(va + i * PAGE_SIZE, first + i * PAGE_SIZE, flags) }?;
     }
     Ok(va + (phys - first))
 }
@@ -721,7 +799,7 @@ pub unsafe fn map_device(phys: u64, bytes: u64, flags: PageFlags) -> Result<u64,
 /// The raw leaf entry of a 4 KiB kernel mapping, for self-tests that check
 /// its flags.
 pub fn kernel_leaf_entry(virt: u64) -> Option<u64> {
-    unsafe { AddressSpace::kernel().leaf_entry(virt) }
+    AddressSpace::kernel().leaf_entry(virt)
 }
 
 /// PAT bit and the two cache bits of a leaf entry: (PAT, PCD, PWT).
@@ -740,197 +818,206 @@ pub fn cache_bits(entry: u64) -> (bool, bool, bool) {
 /// Call after pmm::init(). Uses (and leaves clean) the first pages of the
 /// dynamic region.
 pub unsafe fn selftest() -> bool {
-    use crate::{serial_write_hex as hex, serial_write_str as s};
+    // SAFETY: [paging] boot, nothing else running (# Safety: after pmm::init).
+    // Every address mapped is in the first pages of the dynamic region (or the
+    // user half of a space made here), which nothing else uses, and each is
+    // unmapped again before the test ends; the frames mapped are frames this
+    // test holds, or the screen's (device memory, written and put back). The
+    // code page holds six bytes written here (mov eax, 42; ret) and is called
+    // only once it reads back read-only and executable.
+    unsafe {
+        use crate::{serial_write_hex as hex, serial_write_str as s};
 
-    let mut ks = AddressSpace::kernel();
-    let va = KERNEL_DYNAMIC_BASE;
-    let mut ok = true;
+        let mut ks = AddressSpace::kernel();
+        let va = KERNEL_DYNAMIC_BASE;
+        let mut ok = true;
 
-    fn check(ok: &mut bool, name: &[u8], pass: bool) {
-        *ok &= crate::selftest::check(b"vmm", name, pass);
-    }
-
-    // --- 1. map, translate, alias ---
-    let Some(test_frame) = pmm::alloc(Kind::Test, Owner::Kernel) else {
-        check(&mut ok, b"(no frame to test with)", false);
-        return false;
-    };
-    let frame = test_frame.phys();
-    let mapped = ks.map(va, frame, PageFlags::KERNEL_DATA).is_ok();
-    let translated = ks.translate(va) == Some(frame) && ks.translate(va + 0x123) == Some(frame + 0x123);
-    (va as *mut u64).write_volatile(0xF4E7_A0C0_DE00_0001);
-    let alias = (paging::phys_to_virt(frame) as *const u64).read_volatile() == 0xF4E7_A0C0_DE00_0001;
-    check(&mut ok, b"map + translate + write via new address, read via physical map", mapped && translated && alias);
-
-    // --- 2. leaf permissions are what the preset says ---
-    let leaf = ks.leaf_entry(va).unwrap_or(0);
-    let nx_ok = !paging::nx_enabled() || leaf & NO_EXECUTE != 0;
-    check(&mut ok, b"KERNEL_DATA leaf is present, writable, no-execute", leaf & PRESENT != 0 && leaf & WRITABLE != 0 && nx_ok);
-
-    // --- 2b. ring 0 actually honours read-only pages ---
-    let cr0: u64;
-    asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
-    check(&mut ok, b"CR0.WP is on (kernel writes to read-only pages fault)", cr0 & paging::CR0_WRITE_PROTECT != 0);
-
-    // --- 3. every refusal, by name ---
-    let map_result = |r: Result<(), MapError>| -> &'static [u8] {
-        match r {
-            Ok(()) => b"mapped",
-            Err(e) => e.name(),
+        fn check(ok: &mut bool, name: &[u8], pass: bool) {
+            *ok &= crate::selftest::check(b"vmm", name, pass);
         }
-    };
-    let refusals: [(&[u8], Result<(), MapError>, MapError); 4] = [
-        (b"second mapping at the same address -> ",
-         ks.map(va, frame, PageFlags::KERNEL_DATA), MapError::AlreadyMapped),
-        (b"unaligned address -> ",
-         ks.map(va + 8, frame, PageFlags::KERNEL_DATA), MapError::Misaligned),
-        (b"non-canonical 0x0000800000000000 -> ",
-         ks.map(0x0000_8000_0000_0000, frame, PageFlags::KERNEL_DATA), MapError::NonCanonical),
-        (b"4 KiB at 0x400000, inside a 2 MiB page -> ",
-         ks.map(0x0040_0000, frame, PageFlags::KERNEL_DATA), MapError::HugePageInTheWay),
-    ];
-    for (what, got, want) in refusals {
-        s(b"[vmm] self-test ");
-        s(what);
-        s(map_result(got));
-        ok &= crate::selftest::verdict(got == Err(want));
-    }
-    let got = ks.unmap(va + PAGE_SIZE);
-    s(b"[vmm] self-test unmap of a page never mapped -> ");
-    s(match got {
-        Ok(_) => b"unmapped",
-        Err(e) => e.name(),
-    });
-    ok &= crate::selftest::verdict(got == Err(UnmapError::NotMapped));
 
-    // --- 4. unmap hands back the frame and the address goes away ---
-    let returned = ks.unmap(va);
-    check(&mut ok, b"unmap returns the frame, translate then finds nothing",
-          returned == Ok(frame) && ks.translate(va).is_none());
-    test_frame.free();
-
-    // --- 5. a full cycle leaves nothing behind ---
-    // The first cycle created the PDPT for the dynamic region, which stays
-    // by design. From here on, map + unmap must return every page-table
-    // frame it took.
-    let before = pmm::free_frames();
-    let residue_ok = match pmm::alloc(Kind::Test, Owner::Kernel) {
-        Some(frame) => {
-            let f = frame.phys();
-            let far = va + 0x4000_0000; // different GiB: needs a new PD and PT
-            let cycle = ks.map(far, f, PageFlags::KERNEL_DATA).is_ok() && ks.unmap(far) == Ok(f);
-            frame.free();
-            cycle && pmm::free_frames() == before
-        }
-        None => false,
-    };
-    check(&mut ok, b"map + unmap in a fresh GiB returns every page-table frame", residue_ok);
-
-    // --- 6. executable mapping: run code through a KERNEL_CODE page ---
-    // Two views of one frame: write the bytes through the physical map
-    // (writable, no-execute), run them through a KERNEL_CODE mapping
-    // (read-only, executable). Neither view is both writable and executable.
-    let code_ok = match pmm::alloc(Kind::Test, Owner::Kernel) {
-        Some(frame) => {
-            let f = frame.phys();
-            let code: [u8; 6] = [0xB8, 42, 0, 0, 0, 0xC3]; // mov eax, 42 ; ret
-            for (i, byte) in code.iter().enumerate() {
-                paging::phys_to_virt(f).add(i).write_volatile(*byte);
-            }
-            let code_va = va + 0x3000;
-            let mapped = ks.map(code_va, f, PageFlags::KERNEL_CODE).is_ok();
-            let entry = ks.leaf_entry(code_va).unwrap_or(0);
-            let shape_ok = entry & WRITABLE == 0 && entry & NO_EXECUTE == 0;
-            let result = if mapped && shape_ok {
-                let func: extern "C" fn() -> u32 = core::mem::transmute(code_va);
-                func()
-            } else {
-                0
-            };
-            let unmapped = ks.unmap(code_va) == Ok(f);
-            frame.free();
-            mapped && shape_ok && result == 42 && unmapped
-        }
-        None => false,
-    };
-    check(&mut ok, b"KERNEL_CODE page is read-only and runs (mov eax, 42; ret -> 42)", code_ok);
-
-    // --- 7. device memory: the screen, uncached ---
-    // Write 4 bytes of screen memory through a new MMIO mapping and read
-    // them back through the screen's own view: same physical bytes. In text
-    // mode that is the VGA buffer (the bottom-right two cells); in graphics
-    // mode the framebuffer's first page (VGA memory isn't plain memory then).
-    let (screen_phys, screen_view, offset, value): (u64, u64, usize, u32) =
-        match crate::display::mmio_test_target() {
-            Some((phys, view)) => (phys, view, 0xFFC, 0x00FF_00FF),
-            None => (0xB8000, 0xB8000, (24 * 80 + 78) * 2, 0x0F46_0F46),
+        // --- 1. map, translate, alias ---
+        let Some(test_frame) = pmm::alloc(Kind::Test, Owner::Kernel) else {
+            check(&mut ok, b"(no frame to test with)", false);
+            return false;
         };
-    let test_va = va + 0x2000;
-    let mmio_ok = ks.map(test_va, screen_phys, PageFlags::MMIO).is_ok() && {
-        let new_view = (test_va as *mut u8).add(offset) as *mut u32;
-        let old_view = (screen_view as *const u8).add(offset) as *const u32;
-        let saved = old_view.read_volatile();
-        new_view.write_volatile(value);
-        let seen = old_view.read_volatile();
-        new_view.write_volatile(saved);
-        let entry = ks.leaf_entry(test_va).unwrap_or(0);
-        let uncached = entry & CACHE_DISABLE != 0;
-        ks.unmap(test_va) == Ok(screen_phys) && seen == value && uncached
-    };
-    check(&mut ok, b"MMIO mapping of the screen's memory is uncached and aliases it", mmio_ok);
+        let frame = test_frame.phys();
+        let mapped = ks.map(va, frame, PageFlags::KERNEL_DATA).is_ok();
+        let translated = ks.translate(va) == Some(frame) && ks.translate(va + 0x123) == Some(frame + 0x123);
+        (va as *mut u64).write_volatile(0xF4E7_A0C0_DE00_0001);
+        let alias = (paging::phys_to_virt(frame) as *const u64).read_volatile() == 0xF4E7_A0C0_DE00_0001;
+        check(&mut ok, b"map + translate + write via new address, read via physical map", mapped && translated && alias);
 
-    // --- User address spaces ---
-    // Where user pages may go: only user space, only in a user address
-    // space; and nothing but user pages there.
-    let before = pmm::free_frames();
-    // The page is what a process's code page is: the space's own (Entry 29),
-    // so destroy() takes it back with the rest.
-    let regions_ok = match (AddressSpace::new_user(), pmm::alloc(Kind::ProcessCode, Owner::Unassigned)) {
-        (Ok(mut us), Some(code_page)) => {
-            let frame = code_page.phys();
-            let refused = ks.map(USER_BASE, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
-                && us.map(KERNEL_DYNAMIC_BASE, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
-                && us.map(0x10_0000, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
-                && us.map(USER_END, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
-                && us.map(USER_BASE, frame, PageFlags::KERNEL_DATA) == Err(MapError::WrongRegion)
-                && us.unmap(KERNEL_DYNAMIC_BASE) == Err(UnmapError::WrongRegion);
-            let accepted = us.map_frame(USER_BASE, code_page, PageFlags::USER_CODE).map_err(|(_, f)| f.free()).is_ok()
-                && us.user_page(USER_BASE, false) == Some(frame)
-                && us.user_page(USER_BASE, true).is_none(); // code is read-only
-            // The kernel half and the low 1 GiB are there, the low 1 GiB
-            // without U/S; destroy gives back the page, every table and the
-            // PML4.
-            let pdpt = *table(us.root) & ADDR_MASK;
-            let shared = us.translate(paging::PHYS_MAP_BASE + frame) == Some(frame)
-                && us.translate(0x10_0000) == Some(0x10_0000)
-                && *table(pdpt) & PRESENT != 0
-                && *table(pdpt) & USER == 0;
-            let spaces = user_spaces();
-            us.destroy();
-            refused && accepted && shared && spaces == 1
-        }
-        (Ok(us), None) => {
-            us.destroy();
-            false
-        }
-        (Err(_), frame) => {
-            if let Some(f) = frame {
-                f.free();
+        // --- 2. leaf permissions are what the preset says ---
+        let leaf = ks.leaf_entry(va).unwrap_or(0);
+        let nx_ok = !paging::nx_enabled() || leaf & NO_EXECUTE != 0;
+        check(&mut ok, b"KERNEL_DATA leaf is present, writable, no-execute", leaf & PRESENT != 0 && leaf & WRITABLE != 0 && nx_ok);
+
+        // --- 2b. ring 0 actually honours read-only pages ---
+        let cr0: u64;
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        check(&mut ok, b"CR0.WP is on (kernel writes to read-only pages fault)", cr0 & paging::CR0_WRITE_PROTECT != 0);
+
+        // --- 3. every refusal, by name ---
+        let map_result = |r: Result<(), MapError>| -> &'static [u8] {
+            match r {
+                Ok(()) => b"mapped",
+                Err(e) => e.name(),
             }
-            false
+        };
+        let refusals: [(&[u8], Result<(), MapError>, MapError); 4] = [
+            (b"second mapping at the same address -> ",
+             ks.map(va, frame, PageFlags::KERNEL_DATA), MapError::AlreadyMapped),
+            (b"unaligned address -> ",
+             ks.map(va + 8, frame, PageFlags::KERNEL_DATA), MapError::Misaligned),
+            (b"non-canonical 0x0000800000000000 -> ",
+             ks.map(0x0000_8000_0000_0000, frame, PageFlags::KERNEL_DATA), MapError::NonCanonical),
+            (b"4 KiB at 0x400000, inside a 2 MiB page -> ",
+             ks.map(0x0040_0000, frame, PageFlags::KERNEL_DATA), MapError::HugePageInTheWay),
+        ];
+        for (what, got, want) in refusals {
+            s(b"[vmm] self-test ");
+            s(what);
+            s(map_result(got));
+            ok &= crate::selftest::verdict(got == Err(want));
         }
-    };
-    check(&mut ok, b"user pages only in user space, only in a user address space; kernel pages never there", regions_ok);
-    check(
-        &mut ok,
-        b"user address space shares the kernel half, keeps the low 1 GiB kernel-only, gives every frame back",
-        regions_ok && pmm::free_frames() == before && user_spaces() == 0,
-    );
+        let got = ks.unmap(va + PAGE_SIZE);
+        s(b"[vmm] self-test unmap of a page never mapped -> ");
+        s(match got {
+            Ok(_) => b"unmapped",
+            Err(e) => e.name(),
+        });
+        ok &= crate::selftest::verdict(got == Err(UnmapError::NotMapped));
 
-    s(b"[vmm] dynamic region at ");
-    hex(KERNEL_DYNAMIC_BASE);
-    s(b" clean after tests\n");
-    ok
+        // --- 4. unmap hands back the frame and the address goes away ---
+        let returned = ks.unmap(va);
+        check(&mut ok, b"unmap returns the frame, translate then finds nothing",
+              returned == Ok(frame) && ks.translate(va).is_none());
+        test_frame.free();
+
+        // --- 5. a full cycle leaves nothing behind ---
+        // The first cycle created the PDPT for the dynamic region, which stays
+        // by design. From here on, map + unmap must return every page-table
+        // frame it took.
+        let before = pmm::free_frames();
+        let residue_ok = match pmm::alloc(Kind::Test, Owner::Kernel) {
+            Some(frame) => {
+                let f = frame.phys();
+                let far = va + 0x4000_0000; // different GiB: needs a new PD and PT
+                let cycle = ks.map(far, f, PageFlags::KERNEL_DATA).is_ok() && ks.unmap(far) == Ok(f);
+                frame.free();
+                cycle && pmm::free_frames() == before
+            }
+            None => false,
+        };
+        check(&mut ok, b"map + unmap in a fresh GiB returns every page-table frame", residue_ok);
+
+        // --- 6. executable mapping: run code through a KERNEL_CODE page ---
+        // Two views of one frame: write the bytes through the physical map
+        // (writable, no-execute), run them through a KERNEL_CODE mapping
+        // (read-only, executable). Neither view is both writable and executable.
+        let code_ok = match pmm::alloc(Kind::Test, Owner::Kernel) {
+            Some(frame) => {
+                let f = frame.phys();
+                let code: [u8; 6] = [0xB8, 42, 0, 0, 0, 0xC3]; // mov eax, 42 ; ret
+                for (i, byte) in code.iter().enumerate() {
+                    paging::phys_to_virt(f).add(i).write_volatile(*byte);
+                }
+                let code_va = va + 0x3000;
+                let mapped = ks.map(code_va, f, PageFlags::KERNEL_CODE).is_ok();
+                let entry = ks.leaf_entry(code_va).unwrap_or(0);
+                let shape_ok = entry & WRITABLE == 0 && entry & NO_EXECUTE == 0;
+                let result = if mapped && shape_ok {
+                    let func: extern "C" fn() -> u32 = core::mem::transmute(code_va);
+                    func()
+                } else {
+                    0
+                };
+                let unmapped = ks.unmap(code_va) == Ok(f);
+                frame.free();
+                mapped && shape_ok && result == 42 && unmapped
+            }
+            None => false,
+        };
+        check(&mut ok, b"KERNEL_CODE page is read-only and runs (mov eax, 42; ret -> 42)", code_ok);
+
+        // --- 7. device memory: the screen, uncached ---
+        // Write 4 bytes of screen memory through a new MMIO mapping and read
+        // them back through the screen's own view: same physical bytes. In text
+        // mode that is the VGA buffer (the bottom-right two cells); in graphics
+        // mode the framebuffer's first page (VGA memory isn't plain memory then).
+        let (screen_phys, screen_view, offset, value): (u64, u64, usize, u32) =
+            match crate::display::mmio_test_target() {
+                Some((phys, view)) => (phys, view, 0xFFC, 0x00FF_00FF),
+                None => (0xB8000, 0xB8000, (24 * 80 + 78) * 2, 0x0F46_0F46),
+            };
+        let test_va = va + 0x2000;
+        let mmio_ok = ks.map(test_va, screen_phys, PageFlags::MMIO).is_ok() && {
+            let new_view = (test_va as *mut u8).add(offset) as *mut u32;
+            let old_view = (screen_view as *const u8).add(offset) as *const u32;
+            let saved = old_view.read_volatile();
+            new_view.write_volatile(value);
+            let seen = old_view.read_volatile();
+            new_view.write_volatile(saved);
+            let entry = ks.leaf_entry(test_va).unwrap_or(0);
+            let uncached = entry & CACHE_DISABLE != 0;
+            ks.unmap(test_va) == Ok(screen_phys) && seen == value && uncached
+        };
+        check(&mut ok, b"MMIO mapping of the screen's memory is uncached and aliases it", mmio_ok);
+
+        // --- User address spaces ---
+        // Where user pages may go: only user space, only in a user address
+        // space; and nothing but user pages there.
+        let before = pmm::free_frames();
+        // The page is what a process's code page is: the space's own (Entry 29),
+        // so destroy() takes it back with the rest.
+        let regions_ok = match (AddressSpace::new_user(), pmm::alloc(Kind::ProcessCode, Owner::Unassigned)) {
+            (Ok(mut us), Some(code_page)) => {
+                let frame = code_page.phys();
+                let refused = ks.map(USER_BASE, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
+                    && us.map(KERNEL_DYNAMIC_BASE, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
+                    && us.map(0x10_0000, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
+                    && us.map(USER_END, frame, PageFlags::USER_DATA) == Err(MapError::WrongRegion)
+                    && us.map(USER_BASE, frame, PageFlags::KERNEL_DATA) == Err(MapError::WrongRegion)
+                    && us.unmap(KERNEL_DYNAMIC_BASE) == Err(UnmapError::WrongRegion);
+                let accepted = us.map_frame(USER_BASE, code_page, PageFlags::USER_CODE).map_err(|(_, f)| f.free()).is_ok()
+                    && us.user_page(USER_BASE, false) == Some(frame)
+                    && us.user_page(USER_BASE, true).is_none(); // code is read-only
+                // The kernel half and the low 1 GiB are there, the low 1 GiB
+                // without U/S; destroy gives back the page, every table and the
+                // PML4.
+                let pdpt = *table(us.root) & ADDR_MASK;
+                let shared = us.translate(paging::PHYS_MAP_BASE + frame) == Some(frame)
+                    && us.translate(0x10_0000) == Some(0x10_0000)
+                    && *table(pdpt) & PRESENT != 0
+                    && *table(pdpt) & USER == 0;
+                let spaces = user_spaces();
+                us.destroy();
+                refused && accepted && shared && spaces == 1
+            }
+            (Ok(us), None) => {
+                us.destroy();
+                false
+            }
+            (Err(_), frame) => {
+                if let Some(f) = frame {
+                    f.free();
+                }
+                false
+            }
+        };
+        check(&mut ok, b"user pages only in user space, only in a user address space; kernel pages never there", regions_ok);
+        check(
+            &mut ok,
+            b"user address space shares the kernel half, keeps the low 1 GiB kernel-only, gives every frame back",
+            regions_ok && pmm::free_frames() == before && user_spaces() == 0,
+        );
+
+        s(b"[vmm] dynamic region at ");
+        hex(KERNEL_DYNAMIC_BASE);
+        s(b" clean after tests\n");
+        ok
+    }
 }
 
 // ===========================================================================
@@ -940,23 +1027,38 @@ pub unsafe fn selftest() -> bool {
 /// Use after unmap: the page is used, unmapped, then used again. The CPU
 /// cached the translation during the first use; the second use faults
 /// (not present) only because unmap() flushed that TLB entry with invlpg.
+///
+/// # Safety
+/// Halts the kernel on purpose: for FREYA_DEMO builds only, once boot no
+/// longer needs the dynamic region's first page.
 pub unsafe fn demo_use_after_unmap() {
-    let mut ks = AddressSpace::kernel();
-    let va = KERNEL_DYNAMIC_BASE + 0x10_0000;
-    if let Some(f) = pmm::alloc(Kind::Test, Owner::Kernel) {
-        let _ = ks.map(va, f.into_phys(), PageFlags::KERNEL_DATA);
-        core::ptr::write_volatile(va as *mut u8, 1); // TLB now holds va
-        let _ = ks.unmap(va);
-        core::ptr::read_volatile(va as *const u8);
+    // SAFETY: [fault] maps a page nothing else uses, uses it, unmaps it, and reads
+    // it again: that read faults, and the kernel halts with the report.
+    unsafe {
+        let mut ks = AddressSpace::kernel();
+        let va = KERNEL_DYNAMIC_BASE + 0x10_0000;
+        if let Some(f) = pmm::alloc(Kind::Test, Owner::Kernel) {
+            let _ = ks.map(va, f.into_phys(), PageFlags::KERNEL_DATA);
+            core::ptr::write_volatile(va as *mut u8, 1); // TLB now holds va
+            let _ = ks.unmap(va);
+            core::ptr::read_volatile(va as *const u8);
+        }
     }
 }
 
 /// Write to a read-only mapping: protection-violation #PF on a write.
+///
+/// # Safety
+/// As demo_use_after_unmap.
 pub unsafe fn demo_write_read_only() {
-    let mut ks = AddressSpace::kernel();
-    let va = KERNEL_DYNAMIC_BASE + 0x10_0000;
-    if let Some(f) = pmm::alloc(Kind::Test, Owner::Kernel) {
-        let _ = ks.map(va, f.into_phys(), PageFlags::KERNEL_RODATA);
-        core::ptr::write_volatile(va as *mut u8, 1);
+    // SAFETY: [fault] a page nothing else uses, mapped read-only, then written:
+    // the write faults, and the kernel halts with the report.
+    unsafe {
+        let mut ks = AddressSpace::kernel();
+        let va = KERNEL_DYNAMIC_BASE + 0x10_0000;
+        if let Some(f) = pmm::alloc(Kind::Test, Owner::Kernel) {
+            let _ = ks.map(va, f.into_phys(), PageFlags::KERNEL_RODATA);
+            core::ptr::write_volatile(va as *mut u8, 1);
+        }
     }
 }
