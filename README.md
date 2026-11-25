@@ -30,14 +30,15 @@ been practical on ordinary hardware all along, is in the manifesto (see
 | Capabilities and IPC | 32 capability slots per process; synchronous call/reply IPC that can pass capabilities (with GRANT) and badges; signals, from the kernel or from a process holding a badged capability; memory lent through Memory capabilities; narrower copies (mint) and letting go (drop); every copy remembers its original, so whatever was lent can be taken back (revoke), from every process it reached; memory budgets that nest the same way |
 | Init | The only process the kernel starts: it holds the drivers' capabilities and a Factory capability, starts each driver and the shell with exactly what it needs, and starts one again if it ends |
 | Drivers | I/O-port, interrupt-line and memory capabilities, and interrupts delivered as signals; a console driver, a PS/2 driver (keyboard and controller) and a mouse driver, all in Rust, running as user processes, started by init |
-| Shell | A first shell in Rust: line editing with history, built-in commands (help, echo, ps with each task's memory, caps, uptime, mem by kind, restart, off), programs started and stopped (run, jobs, kill), and what it lent them taken back (revoke), holding nine capabilities and nothing else |
+| Shell | A first shell in Rust: line editing with history, built-in commands (help, echo, ps with each task's memory, caps, uptime, mem by kind, audit, restart, off), programs started and stopped (run, jobs, kill), and what it lent them taken back (revoke), holding nine capabilities and nothing else |
 | Power | Restart and switch-off through ACPI, behind a Power capability (Ctrl+Alt+Del, Ctrl+Alt+End, or the shell's restart and off) |
 | Trust | Every `unsafe` in the kernel carries the reason it is sound, and the kernel doesn't build without them; state shared between tasks and interrupt handlers is reached only through a lock, and taking one twice halts the kernel, naming the line; the compiler is pinned, and two builds of the same source give the same image, byte for byte |
+| Audit | A hash chain (BLAKE3) of what happened: processes starting (with a hash of the program) and ending, faults, every capability made, taken away and revoked, and each second's messages and task switches as counts and a hash; sealed in segments, verified by the kernel, by the shell (`audit`) and by a tool on the build machine. Kept in memory for one boot, not yet anchored in a TPM |
 | Not yet | UEFI boot, disk, network, file system, memory that grows as a program runs, multiple CPUs |
 
-Every boot runs **102 self-tests** and shows the result on screen. `make test`
-checks the disk image and every `unsafe`'s reason, and boots **41
-configurations** headless, checking each one (43 cases in all).
+Every boot runs **105 self-tests** and shows the result on screen. `make test`
+checks the disk image and every `unsafe`'s reason, and boots **44
+configurations** headless, checking each one (46 cases in all).
 
 ## Design in brief
 
@@ -101,6 +102,20 @@ configurations** headless, checking each one (43 cases in all).
   naming the lock and the line, where before the same mistake would have
   been two references to one piece of memory. Only tables the CPU reads
   itself (GDT, IDT, TSS, the boot page tables) are still `static mut`.
+- **What happened is a chain** (Entry 32; the manifesto's Section V). The
+  kernel records an entry for each process started (with BLAKE3 of the
+  program it runs) or ended, each fault, each capability put in a slot or
+  taken out of one, each revoke and kill, and once a second the messages
+  and task switches as counts and one hash. Each entry's hash covers the
+  one before, so changing, adding, removing or reordering any entry breaks
+  every link after it. Every 256 entries the segment is sealed: its hash
+  goes into the next segment's header and out to the serial log at once.
+  BLAKE3 is written here (`kernel/src/blake3.rs`, checked against the
+  official test vectors), and the same code verifies the chain in the
+  kernel, in the shell (`audit`) and on the build machine
+  (`make verify-audit LOG=...`). For now it lives in memory (the last 2048
+  entries) and the kernel that keeps it is the one it audits: the TPM is
+  the next step.
 - **Init decides, the kernel enforces.** At the end of boot the kernel starts
   one process, init, with every capability the drivers will need. Init mints
   narrower copies, starts the console, PS/2 and mouse drivers and the shell
@@ -177,9 +192,10 @@ is. Then, from `build/`:
 ```bash
 make            # builds out/freya-os.img (1 MiB disk image); "make build" too
 make run        # boots it in QEMU, serial output in the terminal
-make test       # every test case, headless; expect "43 passed, 0 failed"
+make test       # every test case, headless; expect "46 passed, 0 failed"
 make unsafe     # every unsafe in the kernel, with its category and reason
 make reproduce  # builds a second copy elsewhere; the two images must match
+make verify-audit LOG=serial.log  # check an audit chain the kernel printed (FREYA_DEMO=audit_dump)
 TEXT_MODE=1 make   # an image that stays in 80x25 text mode
 ```
 
@@ -233,6 +249,7 @@ command runs. **Backspace** deletes, **Esc** clears the line, **Up** and
 | `caps` | the shell's own capabilities: everything it may do, what it has lent and to whom, and how many copies are out |
 | `uptime` | time since the timer started, task switches, system calls |
 | `mem` | memory: free, and what the rest is doing (the kernel, programs, reserved) |
+| `audit` | the audit chain: how many entries, the head, every kept entry verified in the shell's own process, counts by kind, and the latest entries in words |
 | `run NAME` | start a program in the background: `hello`, `spin` (runs until stopped), `crash` (writes to the kernel's memory, and is stopped), `ticker` (a line a second while it holds the console), `relay` (lends the console on to a ticker of its own) or `hog` (takes memory until its 1 MiB budget says no, then reads it back every second) |
 | `jobs` | the programs started from the shell that are still running |
 | `kill ID`, `kill NAME` | stop one of them, or every one of that name |
@@ -316,6 +333,11 @@ headless and checks its serial log:
 - `mouse`: QEMU's mouse moved, clicked, wheeled and middle-dragged through
   the monitor; the console driver's notes must follow every step, the shell
   must still answer, and a screenshot must show the pointer where it says
+- `audit`, `audit-dump`, `audit_tamper` (Entry 32): the shell's `audit`
+  verifying the chain itself; the chain printed and verified by
+  `build/audit_verify.rs` against the seals printed while the boot ran; one
+  bit of a kept entry changed, which the kernel catches at the next header
+  and the tool here at the seal before it
 - `kill-console`, `kill-console-often`, `kill-init`: the console driver is
   killed, and init must start it again; killed four times, after which init
   must leave it stopped and let go of it; or killed after init itself: the
@@ -377,7 +399,8 @@ why. `TEXT_MODE=1 make usb DEV=/dev/sdX` writes a stick that always does.
 The manifesto's Phase A is done: every frame has an identity, frames are
 held as typed handles, every `unsafe` is listed with its reason, and builds
 repeat byte for byte with the pinned compiler. Entry 31 put the kernel's
-shared state behind a lock the compiler checks. Next is Phase B, the kernel's
-audit chain: a hash chain of capability changes, processes starting and
-ending, and faults, first in software, then anchored in a TPM (QEMU's
-emulated one first).
+shared state behind a lock the compiler checks. Phase B has begun: Entry 32
+built the audit chain in software. Next is its anchor: each segment's seal
+extended into a TPM's PCR and the segments numbered by its counter, in
+QEMU's emulated TPM first (Entry 33), then the T430's TPM 1.2, with extend
+and read only (Entry 34).

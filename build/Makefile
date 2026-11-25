@@ -29,7 +29,7 @@ STAGE2    := $(OUTDIR)/stage2.bin
 KERNELELF := $(OUTDIR)/kernel.elf
 KERNELBIN := $(OUTDIR)/kernel.bin
 
-.PHONY: all build clean run trace debug test rehearse usb usb-clear unsafe reproduce
+.PHONY: all build clean run trace debug test rehearse usb usb-clear unsafe reproduce audit-verify verify-audit
 
 all: $(IMG)
 
@@ -75,6 +75,24 @@ $(UNSAFE_LIST): $(UNSAFE_CHECK) $(shell find $(KERNDIR)/src -name '*.rs')
 	$(UNSAFE_CHECK) $(KERNDIR)/src $@
 
 # -------------------------
+# The audit chain, verified outside the machine (Entry 32)
+# -------------------------
+# audit_verify.rs reads a serial log and checks the chain the kernel dumped
+# in it (FREYA_DEMO=audit_dump) against the seals it printed as it ran. It
+# is built from the kernel's own blake3.rs and audit_chain.rs.
+AUDIT_VERIFY := $(OUTDIR)/audit_verify
+
+$(AUDIT_VERIFY): audit_verify.rs $(KERNDIR)/src/blake3.rs $(KERNDIR)/src/audit_chain.rs | $(OUTDIR)
+	rustc --edition 2021 -O audit_verify.rs -o $@
+
+audit-verify: $(AUDIT_VERIFY)
+
+# make verify-audit LOG=serial.log
+verify-audit: $(AUDIT_VERIFY)
+	@[ -n "$(LOG)" ] || { echo "usage: make verify-audit LOG=<serial log of a FREYA_DEMO=audit_dump boot>"; exit 2; }
+	$(AUDIT_VERIFY) $(LOG)
+
+# -------------------------
 # Kernel build
 # -------------------------
 
@@ -92,7 +110,11 @@ KERNEL_SRCS := $(shell find $(KERNDIR)/src -name '*.rs') \
 
 USERRS          := ../user/rust
 USER_RS_SRCS    := $(shell find $(USERRS)/src -name '*.rs') $(USERRS)/Cargo.toml \
-                   $(USERRS)/user.ld $(USERRS)/x86_64-freya-user.json
+                   $(USERRS)/user.ld $(USERRS)/x86_64-freya-user.json \
+                   $(KERNDIR)/src/blake3.rs $(KERNDIR)/src/audit_chain.rs
+# (The last two are the kernel's, built into the programs' library too:
+# Entry 32. Without them here, a change to either rebuilt the kernel but
+# not the shell, and make reproduce caught the stale shell.)
 USER_RS_PROGRAMS := console init captest ps2 mouse shell spin crash ticker relay hog
 USER_RS_STAMP   := $(OUTDIR)/user/.built
 

@@ -10,6 +10,17 @@
 use core::arch::asm;
 
 /// True if RFLAGS.IF is set (maskable interrupts enabled).
+/// The time-stamp counter: cycles since the CPU was reset, going up at a
+/// constant rate on the CPUs FreyaOS runs on (the T430's Ivy Bridge has an
+/// invariant TSC). The audit chain's clock (Entry 32).
+pub fn rdtsc() -> u64 {
+    let (lo, hi): (u32, u32);
+    // SAFETY: [cpu] rdtsc reads the counter into EDX:EAX and changes
+    // nothing else; ring 0 may always use it, whatever CR4.TSD says.
+    unsafe { asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags)) };
+    (hi as u64) << 32 | lo as u64
+}
+
 pub fn interrupts_enabled() -> bool {
     let rflags: u64;
     // SAFETY: [cpu] pushfq/pop only reads RFLAGS into a register, through

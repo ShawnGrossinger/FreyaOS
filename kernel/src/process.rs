@@ -208,10 +208,12 @@ pub fn spawn_signalling(
         unsafe { space.destroy() };
         return Err(SpawnError::OutOfMemory);
     }
+    // Measured before it starts: the audit chain records what it runs.
+    let measured = crate::audit::measure(program.name, program.image);
     // The task owns the address space from here; reap() destroys it.
     // SAFETY: [paging] on failure no task was given the space, so nothing
     // will use it: it is destroyed as above.
-    sched::spawn_in_signalling(program.name, start, arg, space.root(), caps, origins, exit_signal).inspect_err(|_| unsafe {
+    sched::spawn_in_signalling(program.name, start, arg, space.root(), caps, origins, exit_signal, Some(measured)).inspect_err(|_| unsafe {
         AddressSpace::from_root(space.root()).destroy();
     })
 }

@@ -73,6 +73,13 @@ CASES=(
   "use_after_unmap|use_after_unmap|128M|vector 14 #PF Page Fault;;cr2=0xffffc00000100000;;page not present, read"
   "write_read_only|write_read_only|128M|vector 14 #PF Page Fault;;protection violation, write"
   "heap_double_free|heap_double_free|128M|\[heap\] FATAL: double free"
+  # Entry 32: the audit chain. The shell reads it and verifies it in its own
+  # process; the kernel prints it, and build/audit_verify.rs verifies it here,
+  # against the seals printed as the boot went; and one bit of it changed,
+  # which the kernel's check and the one here must both catch.
+  "audit||128M|'shell'\\] audit chain: [0-9]+ entries since boot, BLAKE3, in segments of 256: [0-9]+ sealed$;;'shell'\\]   kept: entries 0 to [0-9]+$;;'shell'\\]   head:  [0-9a-f]{64}$;;'shell'\\]   verified here: entries 0 to [0-9]+ link from segment 0's header to the head: OK$;;'shell'\\]   since boot: [0-9]+ processes started, [0-9]+ ended, [0-9]+ faults, [0-9]+ capabilities made, [0-9]+ gone$;;'shell'\\]               [0-9]+ revokes, [0-9]+ kills, [0-9]+ programs measured, [1-9][0-9]* intervals$;;'shell'\\]   latest:$;;'shell'\\]     +[0-9]+  [a-z]+ [a-z0-9]+ ||h e l p ret pause a u d i t ret"
+  "audit-dump|audit_dump|128M|\\[audit\\] segment 1 sealed: entries 256 to 511, chain hash [0-9a-f]{64}$;;\\[audit\\] dump: entries 0 to [0-9]+, head [0-9a-f]{64}$;;\\[test.sh\\] audit_verify: entries 0 to [0-9]+ \\([0-9]+ in segments 0 to [0-9]+\\) link from the first's header to the head [0-9a-f]{16}\\.\\.\\.; [2-9] seals printed during the boot match the chain$"
+  "audit_tamper|audit_tamper|128M|\\[audit\\] demo: one bit of entry 17 changed in memory;;\\[audit\\] chain broken at entry 256: this header's record of the chain before it doesn't match the entries before it$;;\\[test.sh\\] audit_verify: BROKEN at entry 255: the chain's hash at the end of segment 0 isn't the seal printed when it was sealed$"
   # Entry 31: a lock taken while its holder still holds it
   "lock_twice|lock_twice|128M|\[lock\] FATAL: the lock at 0x[0-9a-f]+ was taken while already held: by this same code, or by a task that switched away holding it \(asked for at src/lock.rs:[0-9]+\)"
   # Entry 29: a frame dropped while held; the kernel image given back as heap
@@ -662,6 +669,9 @@ else
 fi
 echo "  tools: $(rustc --version 2>/dev/null || echo rustc not found), $pinned; $(nasm -v 2>/dev/null | head -1); $($QEMU --version 2>/dev/null | head -1)"
 
+# The host's audit chain verifier, for the audit-dump and audit_tamper cases.
+make -s audit-verify > /dev/null 2>&1 || echo "  (build/audit_verify.rs didn't build: the audit-dump and audit_tamper cases will fail)"
+
 for entry in "${CASES[@]}"; do
   IFS='|' read -r name demo mem patterns extra keys <<< "$entry"
   selected "$name" || continue
@@ -710,6 +720,10 @@ for entry in "${CASES[@]}"; do
   [ "$name" = programs ] && check_programs "$dir/serial.log"
   [ "$name" = revoke ] && check_revoke "$dir/serial.log"
   [ "$name" = heap ] && check_heap "$dir/serial.log"
+  # The chain the kernel printed, verified outside it (Entry 32).
+  case $name in audit-dump|audit_tamper)
+    echo "[test.sh] $(out/audit_verify "$dir/serial.log" 2>&1 | head -1)" >> "$dir/serial.log" ;;
+  esac
   # After the console driver is killed: init starts it again (kill-console),
   # or, with init gone too, nothing does (kill-init).
   after=$(sed -n '/console driver killed/,$ p' "$dir/serial.log" | grep '^\[console note\] ')

@@ -109,6 +109,9 @@ pub const SYS_COPY: u64 = 25;
 pub const SYS_REVOKE: u64 = 26;
 pub const SYS_SLEEP: u64 = 27;
 pub const SYS_HEAP: u64 = 28;
+/// audit(info, from, ptr, len): the audit chain's state and entries
+/// (Entry 32; audit.rs: read).
+pub const SYS_AUDIT: u64 = 29;
 
 /// Longest sleep: a day.
 const MAX_SLEEP_TICKS: u64 = 24 * 3600 * crate::apic::TIMER_HZ;
@@ -281,6 +284,7 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
             0
         }
         SYS_HEAP => crate::mem::heap(f.rdi, f.rsi),
+        SYS_AUDIT => crate::audit::read(f.rdi, f.rsi, f.rdx, f.r10),
         SYS_KILL => crate::factory::kill(f.rdi),
         SYS_STATUS => {
             let (how, value) = crate::factory::status(f.rdi);

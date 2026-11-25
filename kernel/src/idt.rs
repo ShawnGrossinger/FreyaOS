@@ -327,6 +327,8 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
         // this frame is) is freed when it is reaped.
         _ if from_user(frame) => {
             report_user_fault(frame, cr2);
+            let extra = if frame.vector == 14 { cr2 } else { frame.error_code };
+            crate::audit::fault(frame.vector, frame.rip, extra);
             crate::sched::exit_with(crate::sched::ExitStatus::Fault(frame.vector as u8));
         }
 

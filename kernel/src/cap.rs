@@ -302,7 +302,7 @@ pub fn put(task: TaskId, slot: usize, cap: Cap, from: Origin) -> bool {
     }
     let p = position(task, slot);
     crate::cpu::assert_interrupts_off(b"cap put");
-    {
+    let serial = {
         let mut d = derivation();
         // Is the capability `from` names still where it was?
         let parent = match from {
@@ -316,9 +316,12 @@ pub fn put(task: TaskId, slot: usize, cap: Cap, from: Origin) -> bool {
         d.parents[p] = parent;
         d.mappings[p] = 0;
         d.heaps[p] = 0;
-    }
+        serial
+    };
     crate::sched::task(task).caps[slot] = cap;
     retain(cap); // ipc's lock, and none of these
+    let parent = from.map_or(0, |origin| origin.1);
+    crate::audit::cap_made(serial, crate::sched::pid(task), slot, parent, &cap);
     true
 }
 
@@ -362,14 +365,17 @@ pub fn remove(task: TaskId, slot: usize, unmap: bool) -> Cap {
     if unmap {
         unmap_mapping(task, p, cap);
     }
-    {
+    let serial = {
         let mut d = derivation();
+        let serial = d.serials[p];
         d.serials[p] = 0;
         d.parents[p] = 0;
         d.mappings[p] = 0;
         d.heaps[p] = 0;
-    }
+        serial
+    };
     release(cap);
+    crate::audit::cap_gone(serial, crate::sched::pid(task), slot, &cap);
     cap
 }
 
@@ -525,14 +531,18 @@ pub fn revoke_in(task: TaskId, slot: usize) -> Result<usize, i64> {
     }
     let p = position(task, slot);
     let mut doomed = [0u64; POSITIONS / 64];
-    {
+    let serial = {
         let d = derivation();
         for q in 0..POSITIONS {
             if q != p && d.serials[q] != 0 && derived_from(&d, q, p) {
                 doomed[q / 64] |= 1 << (q % 64);
             }
         }
-    }
+        d.serials[p]
+    };
+    // In the chain before the copies it takes (Entry 32).
+    let copies = doomed.iter().map(|w| w.count_ones() as u64).sum();
+    crate::audit::revoked(serial, crate::sched::pid(task), slot, copies);
     let mut removed = 0;
     for q in 0..POSITIONS {
         if doomed[q / 64] & (1 << (q % 64)) != 0 {

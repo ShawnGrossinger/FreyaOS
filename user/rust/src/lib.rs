@@ -18,6 +18,13 @@ extern crate alloc;
 
 pub mod heap;
 
+// The kernel's own BLAKE3 and audit-chain format (Entry 32), built here
+// too, so a process can verify the chain the kernel keeps.
+#[path = "../../../kernel/src/blake3.rs"]
+pub mod blake3;
+#[path = "../../../kernel/src/audit_chain.rs"]
+pub mod audit_chain;
+
 use core::arch::asm;
 
 // ===========================================================================
@@ -107,6 +114,7 @@ pub const SYS_COPY: u64 = 25;
 pub const SYS_REVOKE: u64 = 26;
 pub const SYS_SLEEP: u64 = 27;
 pub const SYS_HEAP: u64 = 28;
+pub const SYS_AUDIT: u64 = 29;
 
 pub const ERR_BAD_SYSCALL: i64 = -1;
 pub const ERR_NO_CAPABILITY: i64 = -2;
@@ -708,6 +716,77 @@ pub fn info(slot: u64, buf: &mut [u8]) -> Result<SystemInfo, i64> {
         syscalls: u64_at(buf, 56),
         frames,
     })
+}
+
+/// The audit chain's state, as audit() read it (kernel/src/audit.rs: read).
+#[derive(Clone, Copy)]
+pub struct AuditState {
+    /// Entries recorded since boot.
+    pub recorded: u64,
+    /// The oldest entry the kernel still keeps.
+    pub first_kept: u64,
+    pub segment_entries: u64,
+    /// The first entry in this reply, and how many it holds.
+    pub first: u64,
+    pub count: u64,
+    pub algorithm: u64,
+    /// The chain's hash after entry recorded - 1.
+    pub head: [u8; 32],
+    /// How many of each kind since boot (audit_chain.rs numbers them).
+    pub counts: [u64; 16],
+}
+
+pub const AUDIT_HEADER: usize = 96 + 8 * 16;
+
+/// The audit chain (Entry 32): its state and the kept entries from number
+/// `from` on, as many as fit in `buf`, with the Info capability in `slot`.
+pub fn audit(slot: u64, from: u64, buf: &mut [u8]) -> Result<AuditState, i64> {
+    let n: i64;
+    // SAFETY: the kernel's system call ABI (syscall3); the kernel writes
+    // only into buf, which it checks is the caller's own memory.
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") SYS_AUDIT => n,
+            in("rdi") slot,
+            in("rsi") from,
+            in("rdx") buf.as_mut_ptr() as u64,
+            in("r10") buf.len() as u64,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    if n < 0 {
+        return Err(n);
+    }
+    if n < AUDIT_HEADER as i64 || &buf[..8] != b"FREYAAUD" || u32_at(buf, 8) != 1 || u32_at(buf, 12) as usize != audit_chain::ENTRY_BYTES {
+        return Err(ERR_BAD_ARGUMENT);
+    }
+    let mut head = [0u8; 32];
+    head.copy_from_slice(&buf[64..96]);
+    let mut counts = [0u64; 16];
+    for (k, c) in counts.iter_mut().enumerate() {
+        *c = u64_at(buf, 96 + 8 * k);
+    }
+    Ok(AuditState {
+        recorded: u64_at(buf, 16),
+        first_kept: u64_at(buf, 24),
+        segment_entries: u64_at(buf, 32),
+        first: u64_at(buf, 40),
+        count: u64_at(buf, 48),
+        algorithm: u64_at(buf, 56),
+        head,
+        counts,
+    })
+}
+
+/// Entry `i` of a reply audit() wrote into `buf`.
+pub fn audit_entry(buf: &[u8], i: usize) -> audit_chain::Entry {
+    let at = AUDIT_HEADER + i * audit_chain::ENTRY_BYTES;
+    let mut b = [0u8; audit_chain::ENTRY_BYTES];
+    b.copy_from_slice(&buf[at..at + audit_chain::ENTRY_BYTES]);
+    audit_chain::Entry::from_bytes(&b)
 }
 
 /// Raw info, for the self-tests that pass bad buffers.

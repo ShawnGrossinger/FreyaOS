@@ -114,6 +114,8 @@ struct Shell {
 static mut STATE: Shell = unsafe { core::mem::zeroed() };
 /// ps's snapshot: the header and every task there can be.
 static mut INFO_BUF: [u8; INFO_HEADER + 32 * INFO_RECORD] = [0; INFO_HEADER + 32 * INFO_RECORD];
+/// The audit command's replies: the header and 64 entries at a time.
+static mut AUDIT_BUF: [u8; AUDIT_HEADER + 64 * audit_chain::ENTRY_BYTES] = [0; AUDIT_HEADER + 64 * audit_chain::ENTRY_BYTES];
 
 fn main(_arg: u64) -> u64 {
     let sh = unsafe { &mut *(&raw mut STATE) };
@@ -272,6 +274,7 @@ const HELP: &[&[u8]] = &[
     b"  caps       the capabilities this shell holds: all it may do\n",
     b"  uptime     time since the timer started\n",
     b"  mem        memory: free, and what the rest is doing (the kernel, programs, reserved)\n",
+    b"  audit      the audit chain: what it holds, verified here, and its latest entries\n",
     b"  run NAME   start a program: hello, spin (runs until stopped), crash (writes to the kernel),\n",
     b"             ticker (a line a second while it holds the console), relay (lends it to a ticker),\n",
     b"             hog (takes memory until its budget, 1 MiB, says no)\n",
@@ -301,6 +304,7 @@ impl Shell {
             b"caps" => self.caps(),
             b"uptime" => uptime(),
             b"mem" => mem(),
+            b"audit" => audit_chain(),
             b"run" => self.start(rest),
             b"jobs" => self.list_jobs(),
             b"kill" => self.stop(rest),
@@ -801,6 +805,207 @@ fn mem() {
         say(l.as_bytes());
     }
 }
+
+/// audit (Entry 32): the chain's state; every entry the kernel keeps,
+/// verified here, in this process, against the head the kernel reports;
+/// and the latest few, in words.
+fn audit_chain() {
+    use audit_chain::{Broken, Entry, Verifier};
+    // SAFETY: the shell has one thread, and this is the buffer's only use.
+    let buf = unsafe { &mut *(&raw mut AUDIT_BUF) };
+    let state = match audit(INFO, 0, buf) {
+        Ok(s) => s,
+        Err(e) => return error(b"the audit chain can't be read", e),
+    };
+    let per = state.segment_entries.max(1);
+    let mut l = Line::<120>::new();
+    l.str(b"audit chain: ").dec(state.recorded).str(b" entries since boot, ");
+    l.str(if state.algorithm == audit_chain::HASH_BLAKE3 { b"BLAKE3" } else { b"an unknown hash" });
+    l.str(b", in segments of ").dec(per).str(b": ").dec(state.recorded / per).str(b" sealed\n");
+    say(l.as_bytes());
+    if state.recorded == 0 {
+        return;
+    }
+    let last = state.recorded - 1;
+    let mut l = Line::<120>::new();
+    l.str(b"  kept: entries ").dec(state.first_kept).str(b" to ").dec(last);
+    if state.first_kept > 0 {
+        l.str(b" (before them, only the segments' seals, in the boot log)");
+    }
+    l.str(b"\n");
+    say(l.as_bytes());
+    let mut l = Line::<120>::new();
+    l.str(b"  head:  ").str(&blake3::hex(&state.head)).str(b"\n");
+    say(l.as_bytes());
+
+    // Every kept entry, up to the head this first reply reported: later
+    // replies may hold more (recorded since), which aren't needed.
+    let mut v = Verifier::new();
+    let mut latest = [Entry::EMPTY; 6];
+    let mut n = state.first;
+    let mut reply = state;
+    let mut broken: Option<Broken> = None;
+    let mut moved_on = false;
+    'reading: while n <= last {
+        if reply.first != n {
+            moved_on = true; // overwritten while being read
+            break;
+        }
+        for i in 0..reply.count as usize {
+            if n > last {
+                break 'reading;
+            }
+            let e = audit_entry(buf, i);
+            if let Err(b) = v.feed(n, &e) {
+                broken = Some(b);
+                break 'reading;
+            }
+            latest.rotate_left(1);
+            latest[5] = e;
+            n += 1;
+        }
+        if n > last {
+            break;
+        }
+        reply = match audit(INFO, n, buf) {
+            Ok(s) => s,
+            Err(e) => return error(b"the audit chain can't be read", e),
+        };
+        if reply.count == 0 {
+            moved_on = true;
+            break;
+        }
+    }
+    if broken.is_none() && !moved_on {
+        broken = v.finish(&state.head).err();
+    }
+    let mut l = Line::<120>::new();
+    match (broken, moved_on) {
+        (None, false) => {
+            l.str(b"  verified here: entries ").dec(state.first).str(b" to ").dec(last);
+            l.str(b" link from segment ").dec(state.first / per).str(b"'s header to the head: OK\n");
+        }
+        (None, true) => {
+            l.str(b"  not verified: the oldest entries were overwritten while being read (try again)\n");
+        }
+        (Some(b), _) => {
+            l.str(b"  BROKEN at ");
+            match b.at() {
+                Some(at) => l.str(b"entry ").dec(at),
+                None => l.str(b"the head"),
+            };
+            l.str(b": ").str(b.what().as_bytes()).str(b"\n");
+        }
+    }
+    say(l.as_bytes());
+
+    let c = &state.counts;
+    let mut l = Line::<120>::new();
+    l.str(b"  since boot: ").dec(c[audit_chain::PROCESS_START as usize]).str(b" processes started, ");
+    l.str(b"").dec(c[audit_chain::PROCESS_END as usize]).str(b" ended, ").dec(c[audit_chain::FAULT as usize]).str(b" faults, ");
+    l.str(b"").dec(c[audit_chain::CAP_MADE as usize]).str(b" capabilities made, ").dec(c[audit_chain::CAP_GONE as usize]).str(b" gone\n");
+    say(l.as_bytes());
+    let mut l = Line::<120>::new();
+    l.str(b"              ").dec(c[audit_chain::REVOKE as usize]).str(b" revokes, ").dec(c[audit_chain::KILL as usize]).str(b" kills, ");
+    l.str(b"").dec(c[audit_chain::PROGRAM as usize]).str(b" programs measured, ").dec(c[audit_chain::INTERVAL as usize]).str(b" intervals\n");
+    say(l.as_bytes());
+
+    say(b"  latest:\n");
+    let shown = (n - state.first).min(latest.len() as u64) as usize;
+    for (k, e) in latest[latest.len() - shown..].iter().enumerate() {
+        let mut l = Line::<120>::new();
+        l.str(b"    ");
+        right(&mut l, n - shown as u64 + k as u64, 5);
+        l.str(b"  ");
+        describe(&mut l, e);
+        l.str(b"\n");
+        say(l.as_bytes());
+    }
+}
+
+/// One audit entry in words. Not inlined: audit_chain() would carry a copy.
+#[inline(never)]
+fn describe(l: &mut Line<120>, e: &audit_chain::Entry) {
+    use audit_chain::*;
+    let task = |l: &mut Line<120>, pid: u64| {
+        l.dec(pid & 0xFFFF_FFFF);
+    };
+    let short = |l: &mut Line<120>, h: &[u8; 32]| {
+        l.str(&blake3::hex(h)[..16]).str(b"...");
+    };
+    let name = |l: &mut Line<120>, words: [u64; 2]| {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&words[0].to_le_bytes());
+        b[8..].copy_from_slice(&words[1].to_le_bytes());
+        let len = b.iter().position(|&x| x == 0).unwrap_or(16);
+        l.str(&b[..len]);
+    };
+    match e.kind {
+        SEGMENT => {
+            l.str(b"segment ").dec(e.subject).str(b" begins; the chain before it: ");
+            short(l, &e.detail);
+        }
+        PROGRAM => {
+            l.str(b"program ");
+            name(l, [e.data[0], e.data[1]]);
+            l.str(b" measured: ").dec(e.subject).str(b" bytes, BLAKE3 ");
+            short(l, &e.detail);
+        }
+        PROCESS_START => {
+            l.str(b"process ");
+            task(l, e.subject);
+            l.str(b" started by ");
+            task(l, e.actor);
+            l.str(b", capabilities given: ").dec(e.data[1]).str(b"; program ");
+            short(l, &e.detail);
+        }
+        PROCESS_END => {
+            l.str(b"process ");
+            task(l, e.subject);
+            match e.data[0] {
+                END_EXIT => l.str(b" ended: exit code ").dec(e.data[1]),
+                END_FAULT => l.str(b" ended: exception ").dec(e.data[1]),
+                _ => l.str(b" ended: stopped (kill)"),
+            };
+        }
+        FAULT => {
+            l.str(b"process ");
+            task(l, e.subject);
+            l.str(b" stopped by exception ").dec(e.data[0]);
+        }
+        CAP_MADE | CAP_GONE => {
+            l.str(b"capability ").dec(e.subject);
+            l.str(if e.kind == CAP_MADE { b" made in slot " } else { b" gone from slot " }).dec(e.data[1]);
+            l.str(b" of process ");
+            task(l, e.data[0]);
+            l.str(b": ").str(CAP_KINDS.get(e.detail[0] as usize).copied().unwrap_or(b"?"));
+            if e.kind == CAP_MADE && e.data[2] != 0 {
+                l.str(b", copied from ").dec(e.data[2]);
+            }
+        }
+        REVOKE => {
+            l.str(b"revoke from capability ").dec(e.subject).str(b" by ");
+            task(l, e.actor);
+            l.str(b": copies taken: ").dec(e.data[2]);
+        }
+        KILL => {
+            l.str(b"process ");
+            task(l, e.subject);
+            l.str(b" asked to stop by ");
+            task(l, e.actor);
+        }
+        INTERVAL => {
+            l.str(b"until second ").dec(e.subject).str(b": messages ").dec(e.data[0]);
+            l.str(b", task switches ").dec(e.data[1]).str(b", system calls ").dec(e.data[2]);
+        }
+        _ => {
+            l.str(b"kind ").dec(e.kind);
+        }
+    }
+}
+
+/// cap_info's kinds, by number (info.rs), as the audit chain records them.
+const CAP_KINDS: [&[u8]; 11] = [b"none", b"Console", b"Endpoint", b"I/O ports", b"Irq", b"Power", b"Memory", b"Factory", b"Info", b"Process", b"Budget"];
 
 fn power_off_or_restart(action: u64, what: &[u8]) {
     say(what);

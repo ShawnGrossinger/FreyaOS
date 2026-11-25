@@ -253,6 +253,7 @@ fn deliver(to: TaskId, mut msg: Message) {
             }
         }
     }
+    crate::audit::note_message(sched::current(), to, msg.badge, &msg.words);
     let mut t = sched::task(to);
     t.msg = msg;
     t.result = 0;

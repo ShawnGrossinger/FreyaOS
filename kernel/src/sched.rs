@@ -293,7 +293,7 @@ pub fn spawn(name: &'static str, entry: fn(u64), arg: u64) -> Result<TaskId, Spa
 /// kernel's) with capabilities `caps`. The task takes over the address
 /// space: reap() destroys it when the task is gone. process.rs uses this.
 pub fn spawn_in(name: &'static str, entry: fn(u64), arg: u64, space: u64, caps: Caps) -> Result<TaskId, SpawnError> {
-    spawn_in_signalling(name, entry, arg, space, caps, &[None; cap::MAX_CAPS], None).map(|(id, _)| id)
+    spawn_in_signalling(name, entry, arg, space, caps, &[None; cap::MAX_CAPS], None, None).map(|(id, _)| id)
 }
 
 /// Per task slot (Entry 24): how many tasks it has held, the current one
@@ -308,6 +308,14 @@ fn generations() -> IrqGuard<'static, [u32; MAX_TASKS]> {
     GENERATIONS.lock()
 }
 
+/// Task `id` as the audit chain names it (Entry 32): its slot's
+/// generation << 32 | id, so a later task in the same slot is told apart.
+/// 0 is task 0, the kernel at boot. Not while holding GENERATIONS.
+pub fn pid(id: TaskId) -> u64 {
+    let generation = generations()[id % MAX_TASKS];
+    (generation as u64) << 32 | id as u64
+}
+
 #[track_caller]
 fn endings() -> IrqGuard<'static, [Option<ExitStatus>; MAX_TASKS]> {
     ENDINGS.lock()
@@ -318,7 +326,9 @@ fn endings() -> IrqGuard<'static, [Option<ExitStatus>; MAX_TASKS]> {
 /// generation (Entry 24). `origins[i]` says which capability `caps[i]` was
 /// copied from (None: the kernel made it), so revoking that one takes this
 /// one too (Entry 25); one revoked while the task was being made isn't
-/// given to it.
+/// given to it. `program`: for a process, BLAKE3 of the program it runs,
+/// recorded in the audit chain as it starts, before its capabilities
+/// (Entry 32).
 pub fn spawn_in_signalling(
     name: &'static str,
     entry: fn(u64),
@@ -327,6 +337,7 @@ pub fn spawn_in_signalling(
     caps: Caps,
     origins: &[cap::Origin; cap::MAX_CAPS],
     exit_signal: Option<u8>,
+    program: Option<[u8; 32]>,
 ) -> Result<(TaskId, u32), SpawnError> {
     let (id, generation) = without_interrupts(|| {
         let mut t = table();
@@ -410,6 +421,10 @@ pub fn spawn_in_signalling(
             exit_signal,
             ..EMPTY
         };
+        if let Some(hash) = program {
+            let given = caps.iter().filter(|&&c| c != Cap::None).count() as u64;
+            crate::audit::process_started((generation as u64) << 32 | id as u64, &hash, arg, given);
+        }
         for (slot, &c) in caps.iter().enumerate() {
             cap::put(id, slot, c, origins[slot]);
         }
@@ -479,6 +494,9 @@ pub fn exit_with(status: ExitStatus) -> ! {
         }
     }
     endings()[me] = Some(status);
+    if table()[me].space != 0 {
+        crate::audit::process_ended(pid(me), status);
+    }
     crate::ipc::on_exit(me);
     crate::console::on_exit(me);
     // Its capabilities go now, not when it's reaped (Entry 25): a process
@@ -608,6 +626,7 @@ unsafe fn schedule() {
     };
 
     SWITCHES.fetch_add(1, Ordering::Relaxed);
+    crate::audit::note_switch(cur, next);
     CURRENT.store(next, Ordering::Relaxed);
     // The two saved stack pointers are reached across the switch itself,
     // where no guard can be held (the next task would find the lock held),
@@ -717,6 +736,7 @@ pub fn kill(id: TaskId) -> bool {
             task.kill = true;
         }
         crate::ipc::interrupt_wait(id); // if it's blocked, wake it
+        crate::audit::kill_asked(pid(id));
         true
     })
 }

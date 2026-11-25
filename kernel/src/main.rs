@@ -8,6 +8,9 @@ use core::panic::PanicInfo;
 
 mod apic;
 mod acpi;
+mod audit;
+mod audit_chain;
+mod blake3;
 mod boot;
 mod cap;
 mod console;
@@ -540,6 +543,9 @@ pub extern "C" fn rust_start() -> ! {
     let heap_ok = heap::selftest();
     // The lock types every shared state now lives behind (Entry 31).
     let heap_ok = lock::selftest() & heap_ok;
+    // BLAKE3 and the audit chain's verifier (Entry 32), before anything is
+    // recorded that depends on them.
+    let audit_ok = audit::selftest_mechanics();
 
     // --- Smoke-test: allocate a frame and verify it is zeroed ---
     let sanitize_ok = match pmm::alloc(pmm::Kind::Test, pmm::Owner::Kernel) {
@@ -668,6 +674,8 @@ pub extern "C" fn rust_start() -> ! {
     sched::reap();
     let owners_ok = pmm::selftest_owners(|id, generation| sched::slot_holds(id as usize, generation));
     pmm::print_kinds();
+    // --- The audit chain the boot has recorded (Entry 32) ---
+    let audit_ok = audit::selftest_boot() & audit_ok;
 
     // --- VGA status display (screen was cleared at entry) ---
     // Steps with no result value either succeed or end in an exception
@@ -678,6 +686,9 @@ pub extern "C" fn rust_start() -> ! {
     vga_status(3, b"Page tables:     ", true);
     vga_status(4, b"Memory map:      ", true);
     vga_status(5, b"Frame allocator: ", pmm_ok && owners_ok);
+    // The panel's rows are all taken: the audit chain's self-tests count in
+    // the tally below, like every other.
+    let _ = audit_ok;
     // Anything the hardware sent that nobody asked for, over the whole boot.
     irq_ok &= idt::selftest_none_unexpected();
 
@@ -894,6 +905,9 @@ fn clock_task(row: u64) {
             .num(sched::switches())
             .put(b" task switches)");
         vga_print(row as usize, line.as_bytes(), 0x07);
+        // Each second's counts and hash of the messages and task switches
+        // in it go into the audit chain (Entry 32).
+        crate::audit::interval(ticks / apic::TIMER_HZ);
         // Wake at the start of the next second.
         sched::sleep_ticks(apic::TIMER_HZ - ticks % apic::TIMER_HZ);
     }
@@ -957,6 +971,17 @@ fn run_requested_demo() {
         "heap_double_free" => heap::demo_double_free(),
         // [lock] FATAL (Entry 31): a lock taken while it is already held
         "lock_twice" => lock::demo_lock_twice(),
+        // The audit chain (Entry 32), printed for build/audit_verify.rs to
+        // check outside the machine; and one bit of it changed first.
+        "audit_dump" => {
+            audit::dump();
+            return;
+        }
+        "audit_tamper" => {
+            audit::demo_tamper();
+            audit::dump();
+            return;
+        }
         // [pmm] FATAL (Entry 29): a frame dropped while held, and the
         // kernel image's first frame given back as if it were heap
         "lost_frame" => pmm::demo_lost_frame(),
@@ -994,7 +1019,7 @@ fn run_requested_demo() {
         }
         _ => {
             serial_write_str(b"[demo] unknown; known: ud2 page_fault stack_overflow \
-                               task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free lock_twice panic \
+                               task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free lock_twice panic audit_dump audit_tamper \
                                kill_console kill_init kill_console_often log_flood kill_shell\n");
             return;
         }
