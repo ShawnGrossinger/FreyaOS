@@ -33,7 +33,7 @@ been practical on ordinary hardware all along, is in the manifesto (see
 | Shell | A first shell in Rust: line editing with history, built-in commands (help, echo, ps with each task's memory, caps, uptime, mem by kind, audit, restart, off), programs started and stopped (run, jobs, kill), and what it lent them taken back (revoke), holding nine capabilities and nothing else |
 | Power | Restart and switch-off through ACPI, behind a Power capability (Ctrl+Alt+Del, Ctrl+Alt+End, or the shell's restart and off) |
 | Trust | Every `unsafe` in the kernel carries the reason it is sound, and the kernel doesn't build without them; state shared between tasks and interrupt handlers is reached only through a lock, and taking one twice halts the kernel, naming the line; the compiler is pinned, and two builds of the same source give the same image, byte for byte |
-| Audit | A hash chain (BLAKE3) of what happened: processes starting (with a hash of the program) and ending, faults, every capability made, taken away and revoked, and each second's messages and task switches as counts and a hash; sealed in segments, verified by the kernel, by the shell (`audit`) and by a tool on the build machine. Kept in memory for one boot; each segment's seal extended into a TPM 1.2's PCR 15: QEMU's emulated TPM (`make run-tpm`), and the T430's own, reading and extending PCR 15 and nothing else |
+| Audit | A hash chain (BLAKE3) of what happened: processes starting (with a hash of the program) and ending, faults, every capability made, taken away and revoked, and each second's messages and task switches as counts and a hash; sealed in segments, verified by the kernel, by the shell (`audit`) and by a tool on the build machine. Kept in memory for one boot; each segment's seal extended into a TPM 1.2's PCR 15: QEMU's emulated TPM (`make run-tpm`), and the T430's own, reading and extending PCR 15 and nothing else (run there in Entry 35) |
 | Not yet | UEFI boot, disk, network, file system, memory that grows as a program runs, multiple CPUs |
 
 Every boot runs **107 self-tests** and shows the result on screen. `make test`
@@ -128,8 +128,10 @@ one (51 cases in all).
   by a reset: nothing takes ownership or writes the TPM's memory. This
   build drives two TPMs, the ones it has been tried on: QEMU's emulated
   TPM 1.2 (swtpm) and, from Entry 34, the T430's own, an STMicroelectronics
-  TPM 1.2 (vendor 0x104a, device 0x0000). Any other is found, named and
-  left alone. The T430's may be sent TPM_PCRRead and TPM_Extend of PCR 15,
+  TPM 1.2 (vendor 0x104a, device 0x0000). On the T430 (Entry 35) both of
+  the boot's seals were extended and checked, with four commands sent in
+  all, and after a reboot Linux read PCR 15 as zeros again. Any other TPM
+  is found, named and left alone. The T430's may be sent TPM_PCRRead and TPM_Extend of PCR 15,
   nothing else, not even TPM_Startup; a self-test checks both rules on
   every boot. The first error, or answer that doesn't check out, stops
   the kernel sending the TPM anything more until the next boot. The
@@ -447,11 +449,18 @@ why. `TEXT_MODE=1 make usb DEV=/dev/sdX` writes a stick that always does.
 The manifesto's Phase A is done: every frame has an identity, frames are
 held as typed handles, every `unsafe` is listed with its reason, and builds
 repeat byte for byte with the pinned compiler. Entry 31 put the kernel's
-shared state behind a lock the compiler checks. Phase B has begun: Entry 32
-built the audit chain in software, and Entry 33 anchored it in QEMU's
-emulated TPM 1.2: each segment's seal extended into PCR 15. Entry 34
-drives the T430's own TPM 1.2 the same way, extend and read only; its
-first run on the T430 is the next entry's to record. Numbering segments by
-the TPM's monotonic counter waits for a TPM that can be owned (a spare
-machine): on a TPM 1.2, creating a counter needs ownership, and it stays
-in the chip.
+shared state behind a lock the compiler checks. Phase B is done: Entry 32
+built the audit chain in software, Entry 33 anchored it in QEMU's
+emulated TPM 1.2, each segment's seal extended into PCR 15, and Entry 34
+does the same with the T430's own TPM 1.2, extend and read only, confirmed
+on the T430 in Entry 35. Numbering segments by a counter that only goes up
+is left for later: on a TPM 1.2 creating a counter needs ownership, and
+the T430's TPM is owned already; clearing it would be a lasting change.
+
+FreyaOS is meant for anyone, on many kinds of machines: x86-64 and ARM64,
+BIOS and UEFI, old hardware as well as new, with the same rules and the
+same External Witness everywhere. Entry 35 proposes writing that into the
+manifesto, with a new Phase P (Portability) before the Witness: the
+kernel split into a portable core and a part per architecture, a UEFI
+loader, and ARM64 in QEMU. The proposals are tracked changes in
+`docs/Manifesto v2.docx`, to be accepted or rejected there.
