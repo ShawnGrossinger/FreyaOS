@@ -12,11 +12,18 @@
 //!     keeps, in hex, and the head: "[audit] dump: entries F to L, head H",
 //!     "[audit] #N <192 hex digits>", ..., "[audit] dump end".
 //!
+//!   - with a TPM (Entry 33), PCR 15's value at start and after each seal
+//!     is extended into it: "[tpm] PCR 15 at start: V", "[tpm] segment N's
+//!     seal extended into PCR 15: now V".
+//!
 //! It checks that the dumped entries form a chain (audit_chain.rs: the
 //! kernel's own definition of one, built here from the same file), that
 //! the chain ends at the head, and that at the end of each segment the
 //! chain's hash is the seal printed when the segment was sealed: so the
-//! entries kept now are the ones that were there then. Exit status 0 if
+//! entries kept now are the ones that were there then. With a TPM, it
+//! recomputes PCR 15 from its start and the printed seals, with its own
+//! SHA-1, and checks each printed value, and each anchor in the chain
+//! against the printed one. Exit status 0 if
 //! all of it holds, 1 if anything doesn't (saying where), 2 if the log
 //! has no dump.
 //!
@@ -30,6 +37,8 @@
 mod blake3;
 #[path = "../kernel/src/audit_chain.rs"]
 mod audit_chain;
+#[path = "../kernel/src/sha1.rs"]
+mod sha1;
 
 use audit_chain::{Entry, Verifier, ENTRY_BYTES, SEGMENT_ENTRIES};
 use std::collections::BTreeMap;
@@ -60,6 +69,8 @@ fn main() {
     };
 
     let mut seals: BTreeMap<u64, [u8; 32]> = BTreeMap::new();
+    let mut pcr_start: Option<[u8; 20]> = None;
+    let mut pcr_after: Vec<(u64, [u8; 20])> = Vec::new();
     let mut dump: Option<(u64, u64, [u8; 32])> = None;
     let mut entries: Vec<(u64, Entry)> = Vec::new();
     let mut bad_lines = 0;
@@ -73,6 +84,20 @@ fn main() {
                 (Some(n), Some(h)) if rest.contains(" sealed: ") => {
                     seals.insert(n, h);
                 }
+                _ => bad_lines += 1,
+            }
+        } else if let Some(rest) = line.strip_prefix("[tpm] PCR 15 at start: ") {
+            match unhex(rest.trim()).and_then(|b| <[u8; 20]>::try_from(b).ok()) {
+                Some(v) => pcr_start = Some(v),
+                None => bad_lines += 1,
+            }
+        } else if let Some(rest) = line.strip_prefix("[tpm] segment ") {
+            // "N's seal extended into PCR 15: now V"
+            let n = rest.split('\'').next().and_then(|n| n.parse::<u64>().ok());
+            let v = rest.split(": now ").nth(1).and_then(|v| unhex(v.split(' ').next()?)).and_then(|b| <[u8; 20]>::try_from(b).ok());
+            match (n, v) {
+                (Some(n), Some(v)) => pcr_after.push((n, v)),
+                _ if rest.contains("not extended") => {}
                 _ => bad_lines += 1,
             }
         } else if let Some(rest) = line.strip_prefix("[audit] dump: entries ") {
@@ -115,11 +140,35 @@ fn main() {
         fail(format!("in the log itself: the dump says entries {first} to {last}, but has {}", entries.len()));
     }
 
+    // The PCR as the TPM reported it, recomputed from the printed seals.
+    let mut pcr_checked = 0;
+    if let Some(mut pcr) = pcr_start {
+        for &(n, after) in &pcr_after {
+            let Some(seal) = seals.get(&n) else {
+                fail(format!("in the TPM's lines: segment {n}'s seal was extended, but no seal for it was printed"));
+            };
+            if sha1::extend(&pcr, &audit_chain::first_20(seal)) != after {
+                fail(format!("in the TPM's lines: PCR 15 after segment {n} isn't SHA-1 of the value before and the printed seal"));
+            }
+            pcr = after;
+            pcr_checked += 1;
+        }
+    }
+
     let mut v = Verifier::new();
     let mut seals_checked = 0;
     for &(n, ref e) in &entries {
         if let Err(b) = v.feed(n, e) {
             fail(format!("at entry {}: {}", b.at().unwrap_or(n), b.what()));
+        }
+        // An anchor in the chain against the PCR value printed as it was
+        // extended.
+        if e.kind == audit_chain::ANCHOR && e.data[1] == 0 {
+            if let Some(&(_, printed)) = pcr_after.iter().find(|p| p.0 == e.subject) {
+                if printed != audit_chain::first_20(&e.detail) {
+                    fail(format!("at entry {n}: this anchor's PCR value isn't the one printed when segment {}'s seal was extended", e.subject));
+                }
+            }
         }
         // The first kept header against the seal printed for the segment
         // before it: the oldest entries kept follow what was printed.
@@ -145,8 +194,13 @@ fn main() {
         fail(format!("at the head: {}", b.what()));
     }
     let segments = (first / SEGMENT_ENTRIES, last / SEGMENT_ENTRIES);
+    let tpm = if pcr_checked > 0 {
+        format!("; PCR 15 recomputed from its start and the printed seals: {pcr_checked} extends, each as printed, and the chain's {} anchors agree", v.anchors_checked())
+    } else {
+        String::new()
+    };
     println!(
-        "audit_verify: entries {first} to {last} ({} in segments {} to {}) link from the first's header to the head {}...; {seals_checked} seals printed during the boot match the chain",
+        "audit_verify: entries {first} to {last} ({} in segments {} to {}) link from the first's header to the head {}...; {seals_checked} seals printed during the boot match the chain{tpm}",
         entries.len(),
         segments.0,
         segments.1,

@@ -77,9 +77,16 @@ CASES=(
   # process; the kernel prints it, and build/audit_verify.rs verifies it here,
   # against the seals printed as the boot went; and one bit of it changed,
   # which the kernel's check and the one here must both catch.
-  "audit||128M|'shell'\\] audit chain: [0-9]+ entries since boot, BLAKE3, in segments of 256: [0-9]+ sealed$;;'shell'\\]   kept: entries 0 to [0-9]+$;;'shell'\\]   head:  [0-9a-f]{64}$;;'shell'\\]   verified here: entries 0 to [0-9]+ link from segment 0's header to the head: OK$;;'shell'\\]   since boot: [0-9]+ processes started, [0-9]+ ended, [0-9]+ faults, [0-9]+ capabilities made, [0-9]+ gone$;;'shell'\\]               [0-9]+ revokes, [0-9]+ kills, [0-9]+ programs measured, [1-9][0-9]* intervals$;;'shell'\\]   latest:$;;'shell'\\]     +[0-9]+  [a-z]+ [a-z0-9]+ ||h e l p ret pause a u d i t ret"
+  "audit||128M|'shell'\\] audit chain: [0-9]+ entries since boot, BLAKE3, in segments of 256: [0-9]+ sealed$;;'shell'\\]   kept: entries 0 to [0-9]+$;;'shell'\\]   head:  [0-9a-f]{64}$;;'shell'\\]   TPM:   none: the chain is not anchored$;;'shell'\\]   verified here: entries 0 to [0-9]+ link from segment 0's header to the head: OK$;;'shell'\\]   since boot: [0-9]+ processes started, [0-9]+ ended, [0-9]+ faults, [0-9]+ capabilities made, [0-9]+ gone$;;'shell'\\]               [0-9]+ revokes, [0-9]+ kills, [0-9]+ programs measured, [1-9][0-9]* intervals$;;'shell'\\]   latest:$;;'shell'\\]     +[0-9]+  [a-z]+ [a-z0-9]+ ||h e l p ret pause a u d i t ret"
   "audit-dump|audit_dump|128M|\\[audit\\] segment 1 sealed: entries 256 to 511, chain hash [0-9a-f]{64}$;;\\[audit\\] dump: entries 0 to [0-9]+, head [0-9a-f]{64}$;;\\[test.sh\\] audit_verify: entries 0 to [0-9]+ \\([0-9]+ in segments 0 to [0-9]+\\) link from the first's header to the head [0-9a-f]{16}\\.\\.\\.; [2-9] seals printed during the boot match the chain$"
   "audit_tamper|audit_tamper|128M|\\[audit\\] demo: one bit of entry 17 changed in memory;;\\[audit\\] chain broken at entry 256: this header's record of the chain before it doesn't match the entries before it$;;\\[test.sh\\] audit_verify: BROKEN at entry 255: the chain's hash at the end of segment 0 isn't the seal printed when it was sealed$"
+  # Entry 33: the chain anchored in a TPM 1.2 (swtpm): its seals extended
+  # into PCR 15 and checked here; the shell's audit reading the PCR afresh;
+  # and the whole chain rewritten to hide a change, which verifies on its
+  # own and which only the TPM's PCR (and the seals printed here) show.
+  "tpm|audit_dump|128M|\\[tpm\\] found: vendor 0x1014 \\(IBM: QEMU's emulated TPM\\), device 0x0001, revision 1, a TPM 1\\.2 interface$;;\\[tpm\\] PCR 15 at start: 0{40}$;;\\[tpm\\] segment 1's seal extended into PCR 15: now [0-9a-f]{40}$;;\\[tpm\\] self-test PCR 15: the seals of all 2 sealed segments extended \\(2\\), each new value the TPM gave SHA-1 of the one before and the seal \\(0 not\\); read back, it is the last of them; any TPM but QEMU's would be left alone: PASS$;;\\[audit\\] self-test the boot's own chain: .* 2 anchors in the TPM check out; .*: PASS$;;\\[test.sh\\] audit_verify: entries 0 to [0-9]+ .*; [2-9] seals printed during the boot match the chain; PCR 15 recomputed from its start and the printed seals: [2-9] extends, each as printed, and the chain's [2-9] anchors agree$|TPM"
+  "tpm-audit||128M|'shell'\\]   TPM:   PCR 15 holds the seals of [2-9] segments$;;'shell'\\]   verified here: entries 0 to [0-9]+ link from segment 0's header to the head: OK$;;'shell'\\]   anchors: [2-9] checked: each PCR value SHA-1 of the one before and its seal; the TPM's PCR now is the last of them: OK$|TPM|h e l p ret pause a u d i t ret"
+  "tpm_rewrite|audit_rewrite|128M|\\[audit\\] demo: entry 17 changed, and every link, header, seal and anchor after it rewritten to match$;;\\[audit\\] demo: the rewritten chain verifies on its own: [0-9]+ entries, [2-9] anchors$;;\\[audit\\] demo: caught by the TPM: PCR 15 is [0-9a-f]{40}, the chain's last anchor says [0-9a-f]{40}$;;\\[test.sh\\] audit_verify: BROKEN at entry 255: the chain's hash at the end of segment 0 isn't the seal printed when it was sealed$;;'shell'\\]   BROKEN at the TPM: PCR 15 is [0-9a-f]{16}\\.\\.\\., not the chain's last anchor: the chain was rewritten$|TPM|h e l p ret pause a u d i t ret"
   # Entry 31: a lock taken while its holder still holds it
   "lock_twice|lock_twice|128M|\[lock\] FATAL: the lock at 0x[0-9a-f]+ was taken while already held: by this same code, or by a task that switched away holding it \(asked for at src/lock.rs:[0-9]+\)"
   # Entry 29: a frame dropped while held; the kernel image given back as heap
@@ -710,9 +717,26 @@ for entry in "${CASES[@]}"; do
     continue
   fi
 
+  # A case whose extra arguments say TPM gets a TPM 1.2 of its own (Entry
+  # 33): swtpm, with a fresh state each time, behind QEMU's TIS device.
+  tpmpid=
+  if [[ " $extra " == *" TPM "* ]]; then
+    if ! command -v swtpm > /dev/null; then
+      printf '\r  FAIL  %-19s %s\n' "$name" "swtpm isn't installed (sudo apt install swtpm swtpm-tools)"
+      fail=$((fail + 1)); continue
+    fi
+    rm -rf "$dir/tpm"; mkdir -p "$dir/tpm"
+    swtpm socket --tpmstate dir="$dir/tpm" --ctrl type=unixio,path="$dir/tpm/sock" \
+          --log level=1,file="$dir/tpm/swtpm.log" --terminate > /dev/null 2>&1 &
+    tpmpid=$!
+    for _ in $(seq 50); do [ -S "$dir/tpm/sock" ] && break; sleep 0.1; done
+    extra=${extra/TPM/-chardev socket,id=chrtpm,path=$dir/tpm/sock -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis,tpmdev=tpm0}
+  fi
+
   printf '\r  %-19s booting... ' "$name"
   # shellcheck disable=SC2086  # extra is a list of separate arguments
   boot "$dir/freya-os.img" "$mem" "$dir/serial.log" "$keys" $extra
+  if [ -n "$tpmpid" ]; then kill "$tpmpid" 2> /dev/null; wait "$tpmpid" 2> /dev/null; fi
   [ "$name" = scroll ] && check_scroll "$dir/serial.log"
   [ "$name" = log-flood ] && check_flood "$dir/serial.log"
   [ "$name" = mouse ] && check_mouse "$dir/serial.log"
@@ -721,7 +745,7 @@ for entry in "${CASES[@]}"; do
   [ "$name" = revoke ] && check_revoke "$dir/serial.log"
   [ "$name" = heap ] && check_heap "$dir/serial.log"
   # The chain the kernel printed, verified outside it (Entry 32).
-  case $name in audit-dump|audit_tamper)
+  case $name in audit-dump|audit_tamper|tpm|tpm_rewrite)
     echo "[test.sh] $(out/audit_verify "$dir/serial.log" 2>&1 | head -1)" >> "$dir/serial.log" ;;
   esac
   # After the console driver is killed: init starts it again (kill-console),

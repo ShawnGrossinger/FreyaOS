@@ -837,6 +837,24 @@ fn audit_chain() {
     let mut l = Line::<120>::new();
     l.str(b"  head:  ").str(&blake3::hex(&state.head)).str(b"\n");
     say(l.as_bytes());
+    let mut l = Line::<120>::new();
+    l.str(b"  TPM:   ");
+    match state.tpm {
+        0 => {
+            l.str(b"none: the chain is not anchored");
+        }
+        1 => {
+            l.str(b"found (").hex16((state.tpm_id >> 16) as u16).str(b"), not used by this build");
+        }
+        _ => {
+            l.str(b"PCR ").dec(state.pcr_index as u64).str(b" holds the seals of ").dec(state.anchored).str(b" segments");
+            if state.tpm == 3 {
+                l.str(b" (then an error: no more)");
+            }
+        }
+    }
+    l.str(b"\n");
+    say(l.as_bytes());
 
     // Every kept entry, up to the head this first reply reported: later
     // replies may hold more (recorded since), which aren't needed.
@@ -884,6 +902,26 @@ fn audit_chain() {
         (None, false) => {
             l.str(b"  verified here: entries ").dec(state.first).str(b" to ").dec(last);
             l.str(b" link from segment ").dec(state.first / per).str(b"'s header to the head: OK\n");
+            if v.anchors_checked() > 0 || state.pcr_now.is_some() {
+                say(l.as_bytes());
+                l = Line::<120>::new();
+                l.str(b"  anchors: ").dec(v.anchors_checked()).str(b" checked: each PCR value SHA-1 of the one before and its seal");
+                match (state.pcr_now, v.pcr()) {
+                    (Some(now), Some(last_anchor)) if now == last_anchor => {
+                        l.str(b"; the TPM's PCR now is the last of them: OK\n");
+                    }
+                    (Some(now), Some(_)) => {
+                        l.str(b"\n");
+                        say(l.as_bytes());
+                        l = Line::<120>::new();
+                        l.str(b"  BROKEN at the TPM: PCR ").dec(state.pcr_index as u64).str(b" is ");
+                        l.str(&sha1_hex(&now)[..16]).str(b"..., not the chain's last anchor: the chain was rewritten\n");
+                    }
+                    _ => {
+                        l.str(b"\n");
+                    }
+                }
+            }
         }
         (None, true) => {
             l.str(b"  not verified: the oldest entries were overwritten while being read (try again)\n");
@@ -921,6 +959,15 @@ fn audit_chain() {
         l.str(b"\n");
         say(l.as_bytes());
     }
+}
+
+fn sha1_hex(v: &[u8; 20]) -> [u8; 40] {
+    let mut s = [0u8; 40];
+    for (i, b) in v.iter().enumerate() {
+        s[2 * i] = b"0123456789abcdef"[(b >> 4) as usize];
+        s[2 * i + 1] = b"0123456789abcdef"[(b & 15) as usize];
+    }
+    s
 }
 
 /// One audit entry in words. Not inlined: audit_chain() would carry a copy.
@@ -997,6 +1044,23 @@ fn describe(l: &mut Line<120>, e: &audit_chain::Entry) {
         INTERVAL => {
             l.str(b"until second ").dec(e.subject).str(b": messages ").dec(e.data[0]);
             l.str(b", task switches ").dec(e.data[1]).str(b", system calls ").dec(e.data[2]);
+        }
+        TPM => {
+            l.str(b"TPM found: vendor ").hex16((e.data[0] >> 16) as u16);
+            if e.data[2] == 1 {
+                l.str(b"; PCR ").dec(e.subject).str(b" at start ");
+                l.str(&sha1_hex(&first_20(&e.detail))[..16]).str(b"...");
+            } else {
+                l.str(b", not used");
+            }
+        }
+        ANCHOR => {
+            l.str(b"segment ").dec(e.subject).str(b"'s seal extended into PCR ").dec(e.data[0]);
+            if e.data[1] == 0 {
+                l.str(b": now ").str(&sha1_hex(&first_20(&e.detail))[..16]).str(b"...");
+            } else {
+                l.str(b": the TPM refused (").dec(e.data[1]).str(b")");
+            }
         }
         _ => {
             l.str(b"kind ").dec(e.kind);

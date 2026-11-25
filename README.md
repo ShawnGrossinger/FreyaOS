@@ -33,12 +33,13 @@ been practical on ordinary hardware all along, is in the manifesto (see
 | Shell | A first shell in Rust: line editing with history, built-in commands (help, echo, ps with each task's memory, caps, uptime, mem by kind, audit, restart, off), programs started and stopped (run, jobs, kill), and what it lent them taken back (revoke), holding nine capabilities and nothing else |
 | Power | Restart and switch-off through ACPI, behind a Power capability (Ctrl+Alt+Del, Ctrl+Alt+End, or the shell's restart and off) |
 | Trust | Every `unsafe` in the kernel carries the reason it is sound, and the kernel doesn't build without them; state shared between tasks and interrupt handlers is reached only through a lock, and taking one twice halts the kernel, naming the line; the compiler is pinned, and two builds of the same source give the same image, byte for byte |
-| Audit | A hash chain (BLAKE3) of what happened: processes starting (with a hash of the program) and ending, faults, every capability made, taken away and revoked, and each second's messages and task switches as counts and a hash; sealed in segments, verified by the kernel, by the shell (`audit`) and by a tool on the build machine. Kept in memory for one boot, not yet anchored in a TPM |
+| Audit | A hash chain (BLAKE3) of what happened: processes starting (with a hash of the program) and ending, faults, every capability made, taken away and revoked, and each second's messages and task switches as counts and a hash; sealed in segments, verified by the kernel, by the shell (`audit`) and by a tool on the build machine. Kept in memory for one boot; each segment's seal extended into a TPM 1.2's PCR 15, in QEMU's emulated TPM (`make run-tpm`); the T430's own TPM not used yet |
 | Not yet | UEFI boot, disk, network, file system, memory that grows as a program runs, multiple CPUs |
 
-Every boot runs **105 self-tests** and shows the result on screen. `make test`
-checks the disk image and every `unsafe`'s reason, and boots **44
-configurations** headless, checking each one (46 cases in all).
+Every boot runs **107 self-tests** and shows the result on screen. `make test`
+checks the disk image and every `unsafe`'s reason, and boots **47
+configurations** headless, three of them with an emulated TPM, checking each
+one (49 cases in all).
 
 ## Design in brief
 
@@ -114,8 +115,21 @@ configurations** headless, checking each one (46 cases in all).
   official test vectors), and the same code verifies the chain in the
   kernel, in the shell (`audit`) and on the build machine
   (`make verify-audit LOG=...`). For now it lives in memory (the last 2048
-  entries) and the kernel that keeps it is the one it audits: the TPM is
-  the next step.
+  entries) and the kernel that keeps it is the one it audits.
+- **The chain is anchored in a TPM** (Entry 33). Each segment's seal is
+  extended into PCR 15 of a TPM 1.2, through its TIS registers
+  (`kernel/src/tpm.rs`), and the PCR's new value is recorded in the chain.
+  A PCR can only be extended, and goes back to zeros only when the machine
+  resets: so a kernel that rewrote its whole chain to hide a change (every
+  later hash, header, seal and anchor made to match, which the chain alone
+  can't tell from the real one) still can't make PCR 15 agree with it, and
+  the shell's `audit` says so. Only extend and read are used, both undone
+  by a reset: nothing takes ownership or writes the TPM's memory. This
+  build drives only QEMU's emulated TPM (swtpm, as a TPM 1.2 like the
+  T430's); a real TPM is found, named and left alone, a rule a self-test
+  checks on every boot. A PCR read through the kernel can still be
+  misreported by it: proving the PCR to someone else needs a quote, which
+  needs an owned TPM, or Phase C's External Witness.
 - **Init decides, the kernel enforces.** At the end of boot the kernel starts
   one process, init, with every capability the drivers will need. Init mints
   narrower copies, starts the console, PS/2 and mouse drivers and the shell
@@ -192,10 +206,11 @@ is. Then, from `build/`:
 ```bash
 make            # builds out/freya-os.img (1 MiB disk image); "make build" too
 make run        # boots it in QEMU, serial output in the terminal
-make test       # every test case, headless; expect "46 passed, 0 failed"
+make test       # every test case, headless; expect "49 passed, 0 failed"
 make unsafe     # every unsafe in the kernel, with its category and reason
 make reproduce  # builds a second copy elsewhere; the two images must match
 make verify-audit LOG=serial.log  # check an audit chain the kernel printed (FREYA_DEMO=audit_dump)
+make run-tpm    # as make run, with an emulated TPM 1.2 (sudo apt install swtpm swtpm-tools)
 TEXT_MODE=1 make   # an image that stays in 80x25 text mode
 ```
 
@@ -338,6 +353,11 @@ headless and checks its serial log:
   `build/audit_verify.rs` against the seals printed while the boot ran; one
   bit of a kept entry changed, which the kernel catches at the next header
   and the tool here at the seal before it
+- `tpm`, `tpm-audit`, `tpm_rewrite` (Entry 33), each with its own swtpm: the
+  seals extended into PCR 15 and recomputed here with SHA-1; the shell's
+  `audit` checking the anchors and the PCR read afresh; the whole chain
+  rewritten to hide a change, which verifies on its own and which the TPM,
+  the shell and the tool here each catch
 - `kill-console`, `kill-console-often`, `kill-init`: the console driver is
   killed, and init must start it again; killed four times, after which init
   must leave it stopped and let go of it; or killed after init itself: the
@@ -400,7 +420,9 @@ The manifesto's Phase A is done: every frame has an identity, frames are
 held as typed handles, every `unsafe` is listed with its reason, and builds
 repeat byte for byte with the pinned compiler. Entry 31 put the kernel's
 shared state behind a lock the compiler checks. Phase B has begun: Entry 32
-built the audit chain in software. Next is its anchor: each segment's seal
-extended into a TPM's PCR and the segments numbered by its counter, in
-QEMU's emulated TPM first (Entry 33), then the T430's TPM 1.2, with extend
-and read only (Entry 34).
+built the audit chain in software, and Entry 33 anchored it in QEMU's
+emulated TPM 1.2: each segment's seal extended into PCR 15. Next, Entry 34:
+the T430's own TPM 1.2, with extend and read only. Numbering segments by
+the TPM's monotonic counter waits for a TPM that can be owned (a spare
+machine): on a TPM 1.2, creating a counter needs ownership, and it stays
+in the chip.

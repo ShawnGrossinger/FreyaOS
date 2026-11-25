@@ -24,11 +24,19 @@
 //! except the kernel itself, and a change shows: the next header, or the
 //! head, no longer matches (audit_chain.rs: Verifier).
 //!
-//! What it isn't yet: witnessed. The chain is kept by the kernel it audits,
-//! so a kernel that lies could keep a different chain consistently. The
-//! seals printed to the log are a first copy outside it; the TPM (Entry 33)
-//! and the External Witness (Phase C) are where the manifesto puts the
-//! rest (5.2: "meaningful only when verification occurs outside the system
+//! Anchored (Entry 33): each sealed segment's seal is extended into a TPM
+//! 1.2's PCR 15 (tpm.rs), from task context (the boot thread after the
+//! self-tests, then the clock task once a second), and the PCR's new
+//! value, as the TPM reported it, is recorded in the chain (ANCHOR).
+//! A PCR can only be extended, never set, and goes back to zeros only
+//! when the machine resets, so the TPM holds a summary of every seal of
+//! this boot, in order, that the kernel can't take back.
+//!
+//! What it isn't yet: witnessed from outside. The PCR is read through this
+//! kernel, so a kernel that lies could misreport it; what proves a PCR to
+//! someone else is a TPM quote (signed by a key that needs the TPM to be
+//! owned: not on the T430) or the External Witness (Phase C) (5.2: the
+//! chain is "meaningful only when verification occurs outside the system
 //! being audited"). The CPU's time-stamp counter is the only clock until
 //! then (5.3: software-only mode); witness_time is 0.
 
@@ -327,11 +335,139 @@ pub fn interval(number: u64) {
     record(chain::INTERVAL, number, [messages, switches, calls], hash);
 }
 
+// --- Anchoring it in the TPM (Entry 33).
+
+struct Anchoring {
+    /// Segments whose seals have been extended (or passed over).
+    anchored: u64,
+    /// PCR 15 as the TPM last reported it.
+    pcr: [u8; 20],
+    /// Extends whose result wasn't SHA-1(the PCR before || the seal).
+    mismatches: u64,
+    /// Seals extended.
+    extended: u64,
+    /// The TPM failed a command; no more are tried.
+    failed: bool,
+}
+
+static ANCHORING: IrqLock<Anchoring> = IrqLock::new(Anchoring { anchored: 0, pcr: [0; 20], mismatches: 0, extended: 0, failed: false });
+/// One anchor() at a time: the boot thread and the clock task both call it.
+static ANCHOR_ONE: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+
+/// What tpm::init found, into the chain (TPM), and PCR 15's value then.
+pub fn tpm_found(found: Option<crate::tpm::Found>, pcr: Option<[u8; 20]>) {
+    let Some(f) = found else { return };
+    let mut detail = [0u8; 32];
+    if let Some(v) = pcr {
+        detail[..20].copy_from_slice(&v);
+        ANCHORING.lock().pcr = v;
+    }
+    let used = (f.used && pcr.is_some()) as u64;
+    record(chain::TPM, crate::tpm::PCR as u64, [(f.vendor as u64) << 16 | f.device as u64, f.revision as u64, used], detail);
+}
+
+/// Extend PCR 15 with every seal not yet extended, in order, and record
+/// each in the chain. Task context, interrupts on (tpm.rs).
+pub fn anchor() {
+    if !crate::tpm::in_use() {
+        return;
+    }
+    let _one = ANCHOR_ONE.lock();
+    loop {
+        let (segment, before, failed) = {
+            let a = ANCHORING.lock();
+            (a.anchored, a.pcr, a.failed)
+        };
+        let (sealed, seal) = {
+            let s = STORE.lock();
+            let sealed = s.next / SEGMENT_ENTRIES;
+            (sealed, s.seals[(segment % SEALS) as usize])
+        };
+        if failed || segment >= sealed {
+            return;
+        }
+        if segment + SEALS < sealed {
+            // Sealed so long ago its seal isn't kept: can't be extended.
+            ANCHORING.lock().anchored = sealed - SEALS;
+            continue;
+        }
+        let digest = chain::first_20(&seal);
+        match crate::tpm::extend(crate::tpm::PCR, &digest) {
+            Ok(after) => {
+                let right = crate::sha1::extend(&before, &digest) == after;
+                {
+                    let mut a = ANCHORING.lock();
+                    a.anchored = segment + 1;
+                    a.pcr = after;
+                    a.extended += 1;
+                    a.mismatches += (!right) as u64;
+                }
+                let mut detail = [0u8; 32];
+                detail[..20].copy_from_slice(&after);
+                record(chain::ANCHOR, segment, [crate::tpm::PCR as u64, 0, 0], detail);
+                let mut l = Out::new();
+                l.str(b"[tpm] segment ").dec(segment).str(b"'s seal extended into PCR 15: now ").str(&crate::tpm::hex20(&after));
+                if !right {
+                    l.str(b" (NOT SHA-1 of the value before and the seal)");
+                }
+                l.print();
+            }
+            Err(e) => {
+                {
+                    let mut a = ANCHORING.lock();
+                    a.failed = true;
+                }
+                record(chain::ANCHOR, segment, [crate::tpm::PCR as u64, e.code(), 0], [0; 32]);
+                crate::serial_write_str(b"[tpm] segment's seal not extended (");
+                crate::tpm::say_error(e);
+                crate::serial_write_str(b"): no more anchors this boot\n");
+                return;
+            }
+        }
+    }
+}
+
+/// The TPM self-test, after the self-tests' seals have been anchored.
+/// Every boot, TPM or not, it checks first the rule that keeps this build
+/// off real TPMs: QEMU's is driven, through TPM 1.2 only, and Infineon's,
+/// STMicroelectronics', Nuvoton's, Atmel's, Broadcom's, Intel's and an
+/// unknown vendor's are left alone (tpm.rs: drives).
+pub fn selftest_tpm() -> bool {
+    use crate::tpm::drives;
+    let gate = drives(crate::tpm::QEMU_VENDOR, 0)
+        && drives(crate::tpm::QEMU_VENDOR, 2)
+        && !drives(crate::tpm::QEMU_VENDOR, 3)
+        && [0x15D1u16, 0x104A, 0x1050, 0x1114, 0x14E4, 0x8086, 0x1234].iter().all(|&v| !drives(v, 0) && !drives(v, 2) && !drives(v, 3));
+    let Some(f) = crate::tpm::found() else {
+        return crate::selftest::check(b"tpm", b"no TPM here: nothing anchored, and nothing claimed to be; this build would drive QEMU's TPM 1.2 and leave any other alone", gate);
+    };
+    if !f.used {
+        crate::serial_write_str(b"[tpm] self-test a TPM found (vendor ");
+        crate::serial_write_str(&crate::tpm::hex16(f.vendor));
+        crate::serial_write_str(b") and left alone by this build: nothing sent to it but the reads that named it; QEMU's TPM 1.2 would be driven, any other left alone");
+        return crate::selftest::verdict(gate);
+    }
+    let (anchored, pcr, mismatches, extended, failed) = {
+        let a = ANCHORING.lock();
+        (a.anchored, a.pcr, a.mismatches, a.extended, a.failed)
+    };
+    let sealed = STORE.lock().next / SEGMENT_ENTRIES;
+    let read = crate::tpm::pcr_read(crate::tpm::PCR);
+    crate::serial_write_str(b"[tpm] self-test PCR 15: the seals of all ");
+    crate::serial_write_u64(sealed);
+    crate::serial_write_str(b" sealed segments extended (");
+    crate::serial_write_u64(extended);
+    crate::serial_write_str(b"), each new value the TPM gave SHA-1 of the one before and the seal (");
+    crate::serial_write_u64(mismatches);
+    crate::serial_write_str(b" not); read back, it is the last of them; any TPM but QEMU's would be left alone");
+    crate::selftest::verdict(gate && !failed && anchored == sealed && extended == sealed && mismatches == 0 && read == Ok(pcr) && sealed > 0)
+}
+
 // --- Reading it: the audit system call, and the kernel's own checks.
 
 /// The reply's header: see read().
-pub const HEADER_BYTES: usize = 96 + 8 * KINDS;
-const READ_VERSION: u32 = 1;
+pub const HEADER_BYTES: usize = 96 + 8 * KINDS + 72;
+const READ_VERSION: u32 = 2;
 
 /// audit(info, from, ptr, len): with an Info capability, the chain's state
 /// and as many kept entries as fit, from entry number `from` (or the
@@ -344,6 +480,14 @@ const READ_VERSION: u32 = 1;
 ///           24  the oldest kept        64  the head: the chain's hash
 ///                                          after the last entry (32 bytes)
 ///           96  how many of each kind since boot (16 counts of 8 bytes)
+///          224  the TPM (version 2, Entry 33): 0 none, 1 found and not
+///               used, 2 anchoring, 3 anchoring stopped by an error (4)
+///          228  its vendor << 16 | device (4); 232 segments anchored (8)
+///          240  the PCR the chain is anchored in (4), 244 its value as
+///               the TPM last reported it (20)
+///          264  1 if what follows was read from the TPM for this reply (a
+///               reply starting at the oldest entry kept), 265 PCR 15 so
+///               read (20); 285 to 296 zeros
 ///
 /// then the entries, 96 bytes each (audit_chain.rs). The header is read
 /// once, at the start: the entries go up to its count and no further, so
@@ -357,6 +501,11 @@ pub fn read(slot: u64, from: u64, ptr: u64, len: u64) -> i64 {
     if len < HEADER_BYTES as u64 {
         return ERR_BAD_ARGUMENT;
     }
+    // PCR 15 read from the TPM now (Entry 33), when the reply starts at
+    // the oldest entry kept: with anchor() held off, so the chain's last
+    // anchor and the PCR are of the same moment.
+    let _no_anchoring = ANCHOR_ONE.lock();
+    let fresh = if crate::tpm::in_use() && from <= first_kept(STORE.lock().next) { crate::tpm::pcr_read(crate::tpm::PCR).ok() } else { None };
     let (next, head, counts) = {
         let s = STORE.lock();
         (s.next, s.head, s.counts)
@@ -390,6 +539,24 @@ pub fn read(slot: u64, from: u64, ptr: u64, len: u64) -> i64 {
     for (k, c) in counts.iter().enumerate() {
         h[96 + 8 * k..104 + 8 * k].copy_from_slice(&c.to_le_bytes());
     }
+    let (anchored, pcr, failed) = {
+        let a = ANCHORING.lock();
+        (a.anchored, a.pcr, a.failed)
+    };
+    let (state, id) = match crate::tpm::found() {
+        None => (0u32, 0u32),
+        Some(f) if !f.used => (1, (f.vendor as u32) << 16 | f.device as u32),
+        Some(f) => (if failed { 3 } else { 2 }, (f.vendor as u32) << 16 | f.device as u32),
+    };
+    h[224..228].copy_from_slice(&state.to_le_bytes());
+    h[228..232].copy_from_slice(&id.to_le_bytes());
+    h[232..240].copy_from_slice(&anchored.to_le_bytes());
+    h[240..244].copy_from_slice(&crate::tpm::PCR.to_le_bytes());
+    h[244..264].copy_from_slice(&pcr);
+    if let Some(v) = fresh {
+        h[264] = 1;
+        h[265..285].copy_from_slice(&v);
+    }
     if let Err(err) = copy_to_user(ptr, &h) {
         return err;
     }
@@ -404,6 +571,10 @@ pub struct Checked {
     /// seal kept for the segment before (all but the oldest kept header).
     pub seals_matching: u64,
     pub seals_wrong: u64,
+    /// Anchors whose PCR value checked out (audit_chain.rs: Verifier).
+    pub anchors: u64,
+    /// The PCR value the chain's last anchor records.
+    pub pcr: Option<[u8; 20]>,
 }
 
 /// Verify every kept entry, from the oldest kept segment's header to the
@@ -430,7 +601,7 @@ pub fn verify_kept() -> Result<Checked, Broken> {
         }
     }
     v.finish(&head)?;
-    Ok(Checked { first, entries: next - first, seals_matching, seals_wrong })
+    Ok(Checked { first, entries: next - first, seals_matching, seals_wrong, anchors: v.anchors_checked(), pcr: v.pcr() })
 }
 
 /// How many of each kind since boot.
@@ -542,7 +713,9 @@ pub fn selftest_boot() -> bool {
             crate::serial_write_u64(c.first + c.entries - 1);
             crate::serial_write_str(b") verify from the first's header to the head; ");
             crate::serial_write_u64(c.seals_matching);
-            crate::serial_write_str(b" headers match the seal of the segment before");
+            crate::serial_write_str(b" headers match the seal of the segment before; ");
+            crate::serial_write_u64(c.anchors);
+            crate::serial_write_str(b" anchors in the TPM check out");
             c.seals_wrong == 0
         }
         Err(b) => {
@@ -592,6 +765,92 @@ pub fn dump() {
         l.print();
     }
     crate::serial_write_str(b"[audit] dump end\n");
+}
+
+/// FREYA_DEMO=audit_rewrite (Entry 33): what a careful attacker with the
+/// kernel's memory would do. Change one bit of a kept entry, then make the
+/// chain whole again: every later link, header, seal and head recomputed,
+/// and every anchor's recorded PCR value recomputed from the new seals, so
+/// that the chain verifies on its own. What can't be rewritten is the
+/// TPM's PCR 15: it holds the seals that were really extended.
+pub fn demo_rewrite() {
+    let _no_anchoring = ANCHOR_ONE.lock();
+    let target = {
+        let mut s = STORE.lock();
+        let mut a = ANCHORING.lock();
+        let first = first_kept(s.next);
+        let target = (first + 17).min(s.next.saturating_sub(1));
+        s.entries[(target % KEPT) as usize].data[0] ^= 1;
+        // Relink everything kept, from the oldest header's record of what
+        // came before it.
+        let mut h = s.entries[(first % KEPT) as usize].detail;
+        let mut pcr: Option<[u8; 20]> = None;
+        for n in first..s.next {
+            let i = (n % KEPT) as usize;
+            let mut e = s.entries[i];
+            if e.kind == chain::SEGMENT && n > first {
+                e.detail = h;
+                let segment = e.subject - 1;
+                s.seals[(segment % SEALS) as usize] = h;
+            }
+            if e.kind == chain::TPM && e.data[2] == 1 {
+                pcr = Some(chain::first_20(&e.detail));
+            }
+            if e.kind == chain::ANCHOR && e.data[1] == 0 {
+                if let Some(before) = pcr {
+                    let seal = s.seals[(e.subject % SEALS) as usize];
+                    let after = crate::sha1::extend(&before, &chain::first_20(&seal));
+                    e.detail[..20].copy_from_slice(&after);
+                    pcr = Some(after);
+                    a.pcr = after;
+                }
+            }
+            s.entries[i] = e;
+            h = chain::link(&h, &e);
+        }
+        if s.next % SEGMENT_ENTRIES == 0 && s.next > first {
+            // The last segment sealed, its next header not yet written.
+            let segment = s.next / SEGMENT_ENTRIES - 1;
+            s.seals[(segment % SEALS) as usize] = h;
+        }
+        s.head = h;
+        target
+    };
+    crate::serial_write_str(b"[audit] demo: entry ");
+    crate::serial_write_u64(target);
+    crate::serial_write_str(b" changed, and every link, header, seal and anchor after it rewritten to match
+");
+    match verify_kept() {
+        Ok(c) => {
+            crate::serial_write_str(b"[audit] demo: the rewritten chain verifies on its own: ");
+            crate::serial_write_u64(c.entries);
+            crate::serial_write_str(b" entries, ");
+            crate::serial_write_u64(c.anchors);
+            crate::serial_write_str(b" anchors
+");
+            let read = crate::tpm::pcr_read(crate::tpm::PCR);
+            match (read, c.pcr) {
+                (Ok(tpm), Some(claimed)) if tpm != claimed => {
+                    crate::serial_write_str(b"[audit] demo: caught by the TPM: PCR 15 is ");
+                    crate::serial_write_str(&crate::tpm::hex20(&tpm));
+                    crate::serial_write_str(b", the chain's last anchor says ");
+                    crate::serial_write_str(&crate::tpm::hex20(&claimed));
+                    crate::serial_write_str(b"
+");
+                }
+                (Ok(_), Some(_)) => crate::serial_write_str(b"[audit] demo: the TPM's PCR 15 matches the rewritten chain: NOT caught
+"),
+                _ => crate::serial_write_str(b"[audit] demo: no TPM in use, nothing to compare with: NOT caught
+"),
+            }
+        }
+        Err(b) => {
+            crate::serial_write_str(b"[audit] demo: the rewrite didn't hold together: ");
+            crate::serial_write_str(b.what().as_bytes());
+            crate::serial_write_str(b"
+");
+        }
+    }
 }
 
 /// FREYA_DEMO=audit_tamper: change one bit of a kept entry, as something

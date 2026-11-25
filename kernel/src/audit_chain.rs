@@ -37,6 +37,7 @@
 #![allow(dead_code)]
 
 use crate::blake3;
+use crate::sha1;
 
 pub const ENTRY_BYTES: usize = 96;
 /// Entries in a segment, its header included.
@@ -81,6 +82,15 @@ pub const KILL: u64 = 9;
 /// detail BLAKE3 over each message (sender, receiver, badge, words) and
 /// each switch (from, to), in order.
 pub const INTERVAL: u64 = 10;
+/// A TPM found at boot (Entry 33): subject the PCR the chain is anchored
+/// in, data [vendor << 16 | device, revision, 1 if this kernel uses it],
+/// detail that PCR's value then (20 bytes; zeros if not used).
+pub const TPM: u64 = 11;
+/// A sealed segment's seal extended into the TPM (Entry 33): subject the
+/// segment, data [the PCR, 0 or the TPM's error, 0], detail the PCR's
+/// value after it, as the TPM reported it (20 bytes). The PCR is a TPM
+/// 1.2's: SHA-1(its value before || the first 20 bytes of the seal).
+pub const ANCHOR: u64 = 12;
 
 // PROCESS_END's how.
 pub const END_EXIT: u64 = 0;
@@ -99,6 +109,8 @@ pub fn kind_name(kind: u64) -> &'static str {
         REVOKE => "revoke",
         KILL => "kill",
         INTERVAL => "interval",
+        TPM => "tpm",
+        ANCHOR => "anchor",
         _ => "unknown",
     }
 }
@@ -166,6 +178,10 @@ pub enum Broken {
     Format(u64),
     /// A CPU time earlier than the entry before it.
     TimeBackwards(u64),
+    /// An anchor whose PCR value isn't SHA-1 of the one before it and its
+    /// segment's seal: the TPM, or the record of it, says something else
+    /// happened.
+    Anchor(u64),
     /// Every link held, but the last hash isn't the head the chain's
     /// keeper reports: an entry since the last header was changed (or the
     /// head is someone else's).
@@ -176,7 +192,7 @@ impl Broken {
     /// The entry it was found at (None for Head: at the end).
     pub fn at(&self) -> Option<u64> {
         match *self {
-            Broken::NoHeader(n) | Broken::Misplaced(n) | Broken::Link(n) | Broken::SegmentNumber(n) | Broken::Format(n) | Broken::TimeBackwards(n) => Some(n),
+            Broken::NoHeader(n) | Broken::Misplaced(n) | Broken::Link(n) | Broken::SegmentNumber(n) | Broken::Format(n) | Broken::TimeBackwards(n) | Broken::Anchor(n) => Some(n),
             Broken::Head => None,
         }
     }
@@ -189,6 +205,7 @@ impl Broken {
             Broken::SegmentNumber(_) => "a segment numbered out of turn",
             Broken::Format(_) => "a header in a format or with a hash not known here",
             Broken::TimeBackwards(_) => "a CPU time earlier than the entry before",
+            Broken::Anchor(_) => "the PCR this anchor records isn't SHA-1 of the one before and its segment's seal",
             Broken::Head => "the entries since the last header don't hash to the head reported",
         }
     }
@@ -197,18 +214,27 @@ impl Broken {
 /// Verifies a chain fed to it entry by entry, from a segment's header.
 /// The first header is taken at its word for what came before it (that
 /// can only be checked against a seal kept somewhere else: the boot log,
-/// later the TPM); everything after it must follow.
+/// the TPM); everything after it must follow.
+///
+/// Anchors (Entry 33): from a TPM entry, or else from the first anchor,
+/// the PCR is followed: each anchor's value must be SHA-1 of the one
+/// before and its segment's seal, which the next segment's header holds.
 pub struct Verifier {
     hash: [u8; 32],
     next: u64,
     segment: u64,
     time: u64,
     started: bool,
+    /// The PCR as the chain last recorded it.
+    pcr: Option<[u8; 20]>,
+    /// The seals of the last segments seen end: (segment, seal).
+    seals: [(u64, [u8; 32]); 8],
+    anchors_checked: u64,
 }
 
 impl Verifier {
     pub const fn new() -> Self {
-        Verifier { hash: [0; 32], next: 0, segment: 0, time: 0, started: false }
+        Verifier { hash: [0; 32], next: 0, segment: 0, time: 0, started: false, pcr: None, seals: [(u64::MAX, [0; 32]); 8], anchors_checked: 0 }
     }
 
     /// Entry number `n` (counted from the first ever recorded). Numbers
@@ -242,6 +268,24 @@ impl Verifier {
         if is_header && (e.data[0] != FORMAT || e.data[1] != HASH_BLAKE3 || e.data[2] != SEGMENT_ENTRIES || e.subject != n / SEGMENT_ENTRIES) {
             return Err(Broken::Format(n));
         }
+        if is_header && e.subject > 0 {
+            // The seal of the segment before: its header records it.
+            self.seals[(e.subject % 8) as usize] = (e.subject - 1, e.detail);
+        }
+        if e.kind == TPM && e.data[2] == 1 {
+            self.pcr = Some(first_20(&e.detail));
+        }
+        if e.kind == ANCHOR && e.data[1] == 0 {
+            let recorded = first_20(&e.detail);
+            let seal = self.seals.iter().find(|s| s.0 == e.subject).map(|s| s.1);
+            if let (Some(before), Some(seal)) = (self.pcr, seal) {
+                if sha1::extend(&before, &first_20(&seal)) != recorded {
+                    return Err(Broken::Anchor(n));
+                }
+                self.anchors_checked += 1;
+            }
+            self.pcr = Some(recorded);
+        }
         self.time = e.cpu_time;
         self.hash = link(&self.hash, e);
         self.next = n + 1;
@@ -262,6 +306,26 @@ impl Verifier {
     pub fn next(&self) -> u64 {
         self.next
     }
+
+    /// Anchors whose PCR value was checked against the one before and the
+    /// seal (an anchor whose seal or predecessor isn't kept is taken at
+    /// its word, and the next is checked against it).
+    pub fn anchors_checked(&self) -> u64 {
+        self.anchors_checked
+    }
+
+    /// The PCR's value as the chain last recorded it.
+    pub fn pcr(&self) -> Option<[u8; 20]> {
+        self.pcr
+    }
+}
+
+/// A seal's first 20 bytes: what goes into a TPM 1.2's PCR (a PCR takes a
+/// 20-byte digest; BLAKE3 cut to 160 bits is still a sound one).
+pub fn first_20(b: &[u8; 32]) -> [u8; 20] {
+    let mut d = [0u8; 20];
+    d.copy_from_slice(&b[..20]);
+    d
 }
 
 impl Default for Verifier {

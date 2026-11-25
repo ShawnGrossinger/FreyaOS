@@ -29,7 +29,7 @@ STAGE2    := $(OUTDIR)/stage2.bin
 KERNELELF := $(OUTDIR)/kernel.elf
 KERNELBIN := $(OUTDIR)/kernel.bin
 
-.PHONY: all build clean run trace debug test rehearse usb usb-clear unsafe reproduce audit-verify verify-audit
+.PHONY: all build clean run run-tpm trace debug test rehearse usb usb-clear unsafe reproduce audit-verify verify-audit
 
 all: $(IMG)
 
@@ -82,7 +82,7 @@ $(UNSAFE_LIST): $(UNSAFE_CHECK) $(shell find $(KERNDIR)/src -name '*.rs')
 # is built from the kernel's own blake3.rs and audit_chain.rs.
 AUDIT_VERIFY := $(OUTDIR)/audit_verify
 
-$(AUDIT_VERIFY): audit_verify.rs $(KERNDIR)/src/blake3.rs $(KERNDIR)/src/audit_chain.rs | $(OUTDIR)
+$(AUDIT_VERIFY): audit_verify.rs $(KERNDIR)/src/blake3.rs $(KERNDIR)/src/audit_chain.rs $(KERNDIR)/src/sha1.rs | $(OUTDIR)
 	rustc --edition 2021 -O audit_verify.rs -o $@
 
 audit-verify: $(AUDIT_VERIFY)
@@ -111,8 +111,8 @@ KERNEL_SRCS := $(shell find $(KERNDIR)/src -name '*.rs') \
 USERRS          := ../user/rust
 USER_RS_SRCS    := $(shell find $(USERRS)/src -name '*.rs') $(USERRS)/Cargo.toml \
                    $(USERRS)/user.ld $(USERRS)/x86_64-freya-user.json \
-                   $(KERNDIR)/src/blake3.rs $(KERNDIR)/src/audit_chain.rs
-# (The last two are the kernel's, built into the programs' library too:
+                   $(KERNDIR)/src/blake3.rs $(KERNDIR)/src/audit_chain.rs $(KERNDIR)/src/sha1.rs
+# (The last three are the kernel's, built into the programs' library too:
 # Entry 32. Without them here, a change to either rebuilt the kernel but
 # not the shell, and make reproduce caught the stale shell.)
 USER_RS_PROGRAMS := console init captest ps2 mouse shell spin crash ticker relay hog
@@ -259,6 +259,21 @@ run: $(IMG)
 	  -no-reboot \
 	  -no-shutdown \
 	  -d cpu_reset,guest_errors -D /tmp/qemu-int.log
+
+# Same as run, with a TPM 1.2 (Entry 33): swtpm, a fresh one each time, in a
+# directory of its own that goes when QEMU stops. The audit chain's seals
+# are extended into its PCR 15. (sudo apt install swtpm swtpm-tools)
+run-tpm: $(IMG)
+	@command -v swtpm > /dev/null || { echo "swtpm isn't installed: sudo apt install swtpm swtpm-tools"; exit 1; }
+	@d=$$(mktemp -d /tmp/freya-tpm.XXXXXX); \
+	swtpm socket --tpmstate dir=$$d --ctrl type=unixio,path=$$d/sock --terminate & \
+	for i in $$(seq 50); do [ -S $$d/sock ] && break; sleep 0.1; done; \
+	qemu-system-x86_64 \
+	  -drive format=raw,file=$(IMG),if=ide,media=disk,index=0 \
+	  -serial stdio -m 128M -no-reboot -no-shutdown \
+	  -chardev socket,id=chrtpm,path=$$d/sock -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis,tpmdev=tpm0 \
+	  -d cpu_reset,guest_errors -D /tmp/qemu-int.log; \
+	rm -rf $$d
 
 # Same as run, logging every interrupt and exception. For faults before the
 # kernel's IDT exists (stage2, early _start). Grows quickly once the timer

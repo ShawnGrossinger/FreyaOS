@@ -11,6 +11,8 @@ mod acpi;
 mod audit;
 mod audit_chain;
 mod blake3;
+mod sha1;
+mod tpm;
 mod boot;
 mod cap;
 mod console;
@@ -546,6 +548,13 @@ pub extern "C" fn rust_start() -> ! {
     // BLAKE3 and the audit chain's verifier (Entry 32), before anything is
     // recorded that depends on them.
     let audit_ok = audit::selftest_mechanics();
+    // SHA-1, for checking a TPM 1.2's PCRs (Entry 33).
+    let sha1_passed = sha1::test_vectors_passed();
+    serial_write_str(b"[sha1] self-test FIPS 180's examples (the empty string, \"abc\", the 448-bit message, a million 'a's): ");
+    serial_write_u64(sha1_passed as u64);
+    serial_write_str(b" of ");
+    serial_write_u64(sha1::TEST_VECTORS as u64);
+    let audit_ok = selftest::verdict(sha1_passed == sha1::TEST_VECTORS) & audit_ok;
 
     // --- Smoke-test: allocate a frame and verify it is zeroed ---
     let sanitize_ok = match pmm::alloc(pmm::Kind::Test, pmm::Owner::Kernel) {
@@ -632,6 +641,14 @@ pub extern "C" fn rust_start() -> ! {
         sched::selftest()
     };
 
+    // --- The TPM (Entry 33): found and named; QEMU's is used to anchor the
+    // audit chain. Its waits are counted in timer ticks, so after the
+    // scheduler. ---
+    if sched::is_enabled() {
+        let (found, pcr) = tpm::init();
+        audit::tpm_found(found, pcr);
+    }
+
     // --- User mode: system calls on, then processes ---
     let mut user_mode_on = false;
     let user_ok = if !sched::is_enabled() {
@@ -674,7 +691,12 @@ pub extern "C" fn rust_start() -> ! {
     sched::reap();
     let owners_ok = pmm::selftest_owners(|id, generation| sched::slot_holds(id as usize, generation));
     pmm::print_kinds();
-    // --- The audit chain the boot has recorded (Entry 32) ---
+    // --- The audit chain the boot has recorded (Entry 32), its seals
+    // extended into the TPM first (Entry 33) ---
+    if sched::is_enabled() {
+        audit::anchor();
+    }
+    let audit_ok = audit::selftest_tpm() & audit_ok;
     let audit_ok = audit::selftest_boot() & audit_ok;
 
     // --- VGA status display (screen was cleared at entry) ---
@@ -908,6 +930,8 @@ fn clock_task(row: u64) {
         // Each second's counts and hash of the messages and task switches
         // in it go into the audit chain (Entry 32).
         crate::audit::interval(ticks / apic::TIMER_HZ);
+        // And any segment sealed since, into the TPM (Entry 33).
+        crate::audit::anchor();
         // Wake at the start of the next second.
         sched::sleep_ticks(apic::TIMER_HZ - ticks % apic::TIMER_HZ);
     }
@@ -982,6 +1006,13 @@ fn run_requested_demo() {
             audit::dump();
             return;
         }
+        // The whole chain rewritten to hide a change, which only the TPM's
+        // PCR can show (Entry 33).
+        "audit_rewrite" => {
+            audit::demo_rewrite();
+            audit::dump();
+            return;
+        }
         // [pmm] FATAL (Entry 29): a frame dropped while held, and the
         // kernel image's first frame given back as if it were heap
         "lost_frame" => pmm::demo_lost_frame(),
@@ -1019,7 +1050,7 @@ fn run_requested_demo() {
         }
         _ => {
             serial_write_str(b"[demo] unknown; known: ud2 page_fault stack_overflow \
-                               task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free lock_twice panic audit_dump audit_tamper \
+                               task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free lock_twice panic audit_dump audit_tamper audit_rewrite \
                                kill_console kill_init kill_console_often log_flood kill_shell\n");
             return;
         }

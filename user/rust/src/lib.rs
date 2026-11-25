@@ -24,6 +24,8 @@ pub mod heap;
 pub mod blake3;
 #[path = "../../../kernel/src/audit_chain.rs"]
 pub mod audit_chain;
+#[path = "../../../kernel/src/sha1.rs"]
+pub mod sha1;
 
 use core::arch::asm;
 
@@ -734,9 +736,22 @@ pub struct AuditState {
     pub head: [u8; 32],
     /// How many of each kind since boot (audit_chain.rs numbers them).
     pub counts: [u64; 16],
+    /// The TPM (Entry 33): 0 none, 1 found and not used, 2 anchoring the
+    /// chain, 3 anchoring stopped by an error.
+    pub tpm: u32,
+    /// Its vendor << 16 | device.
+    pub tpm_id: u32,
+    /// Segments whose seals have been extended into it.
+    pub anchored: u64,
+    /// The PCR it anchors the chain in, and its value as last reported.
+    pub pcr_index: u32,
+    pub pcr: [u8; 20],
+    /// The PCR read from the TPM for this reply (a reply that starts at
+    /// the oldest entry kept, with a TPM in use).
+    pub pcr_now: Option<[u8; 20]>,
 }
 
-pub const AUDIT_HEADER: usize = 96 + 8 * 16;
+pub const AUDIT_HEADER: usize = 96 + 8 * 16 + 72;
 
 /// The audit chain (Entry 32): its state and the kept entries from number
 /// `from` on, as many as fit in `buf`, with the Info capability in `slot`.
@@ -760,7 +775,7 @@ pub fn audit(slot: u64, from: u64, buf: &mut [u8]) -> Result<AuditState, i64> {
     if n < 0 {
         return Err(n);
     }
-    if n < AUDIT_HEADER as i64 || &buf[..8] != b"FREYAAUD" || u32_at(buf, 8) != 1 || u32_at(buf, 12) as usize != audit_chain::ENTRY_BYTES {
+    if n < AUDIT_HEADER as i64 || &buf[..8] != b"FREYAAUD" || u32_at(buf, 8) != 2 || u32_at(buf, 12) as usize != audit_chain::ENTRY_BYTES {
         return Err(ERR_BAD_ARGUMENT);
     }
     let mut head = [0u8; 32];
@@ -769,7 +784,20 @@ pub fn audit(slot: u64, from: u64, buf: &mut [u8]) -> Result<AuditState, i64> {
     for (k, c) in counts.iter_mut().enumerate() {
         *c = u64_at(buf, 96 + 8 * k);
     }
+    let mut pcr = [0u8; 20];
+    pcr.copy_from_slice(&buf[244..264]);
+    let pcr_now = (buf[264] == 1).then(|| {
+        let mut v = [0u8; 20];
+        v.copy_from_slice(&buf[265..285]);
+        v
+    });
     Ok(AuditState {
+        tpm: u32_at(buf, 224),
+        tpm_id: u32_at(buf, 228),
+        anchored: u64_at(buf, 232),
+        pcr_index: u32_at(buf, 240),
+        pcr,
+        pcr_now,
         recorded: u64_at(buf, 16),
         first_kept: u64_at(buf, 24),
         segment_entries: u64_at(buf, 32),
@@ -834,6 +862,12 @@ impl<const N: usize> Line<N> {
         }
         self
     }
+    /// A 16-bit number as 0x and four hex digits (a TPM's vendor id).
+    pub fn hex16(&mut self, v: u16) -> &mut Self {
+        let d = b"0123456789abcdef";
+        self.str(&[b'0', b'x', d[(v >> 12) as usize & 15], d[(v >> 8) as usize & 15], d[(v >> 4) as usize & 15], d[v as usize & 15]])
+    }
+
     pub fn dec(&mut self, mut v: u64) -> &mut Self {
         let mut digits = [0u8; 20];
         let mut n = 0;
