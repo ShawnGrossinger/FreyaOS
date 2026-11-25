@@ -12,6 +12,7 @@ mod audit;
 mod audit_chain;
 mod blake3;
 mod sha1;
+mod tis;
 mod tpm;
 mod boot;
 mod cap;
@@ -641,9 +642,9 @@ pub extern "C" fn rust_start() -> ! {
         sched::selftest()
     };
 
-    // --- The TPM (Entry 33): found and named; QEMU's is used to anchor the
-    // audit chain. Its waits are counted in timer ticks, so after the
-    // scheduler. ---
+    // --- The TPM (Entries 33 and 34): found and named; QEMU's and the
+    // T430's are used to anchor the audit chain. Its waits are counted in
+    // timer ticks, so after the scheduler. ---
     if sched::is_enabled() {
         let (found, pcr) = tpm::init();
         audit::tpm_found(found, pcr);
@@ -1013,6 +1014,14 @@ fn run_requested_demo() {
             audit::dump();
             return;
         }
+        // The TPM stops answering (Entry 34): the command that finds out
+        // stops it, nothing more is sent, and the chain records it.
+        "tpm_lost" => {
+            tpm::demo_lost();
+            audit::anchor();
+            audit::dump();
+            return;
+        }
         // [pmm] FATAL (Entry 29): a frame dropped while held, and the
         // kernel image's first frame given back as if it were heap
         "lost_frame" => pmm::demo_lost_frame(),
@@ -1050,7 +1059,7 @@ fn run_requested_demo() {
         }
         _ => {
             serial_write_str(b"[demo] unknown; known: ud2 page_fault stack_overflow \
-                               task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free lock_twice panic audit_dump audit_tamper audit_rewrite \
+                               task_stack_overflow smap smep nx use_after_unmap write_read_only heap_double_free lock_twice panic audit_dump audit_tamper audit_rewrite tpm_lost \
                                kill_console kill_init kill_console_often log_flood kill_shell\n");
             return;
         }

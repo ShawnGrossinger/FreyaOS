@@ -47,6 +47,7 @@ ROOT=out/test
 CASES=(
   "image||||"   # not booted: checks the disk image's layout (see check_image)
   "unsafe||||"  # not booted: every unsafe in the kernel has its reason (check_unsafe)
+  "tis||||"     # not booted: the kernel's TIS protocol against strict model TPMs (build/tis_check.rs)
   "boot-128M||128M|init complete - boot thread done; scheduler and timer running;;\\[user 3 'init'\\] started the console driver \\(process 4\\), the PS/2 driver \\(process 5\\), the mouse driver \\(process 6\\) and the shell \\(process 7\\);;\\[user 7 'shell'\\] shell ready: type help;;\\[console\\] process [0-9]+ \\('console'\\) draws the screen from here on;;\\[display\\] VESA graphics [0-9]+x[0-9]+, 32-bit;;reads back pixel for pixel \\(128 pixels, [0-9]+ lit, 0 wrong\\); framebuffer mapped write-combining \\(PAT entry 4\\): PASS;;self-test [0-9]+ ticks in 100 ms;;sleep 5 ticks woke after;;\\[user [0-9]+ 'hello'\\] Hello from ring 3!;;'probe' killed by vector 14 #PF;;\\[user [0-9]+ 'ipc'\\] printed for me by the log server;;driver handled 10"
   "bios-if-on|bios-if-on|128M|BIOS had left them ON after its disk calls; stage 2 turned them off\\): PASS;;self-tests: [0-9]+ passed, 0 failed"
   "dirty-ram||128M-dirty|self-tests: [0-9]+ passed, 0 failed;;init complete"
@@ -84,9 +85,13 @@ CASES=(
   # into PCR 15 and checked here; the shell's audit reading the PCR afresh;
   # and the whole chain rewritten to hide a change, which verifies on its
   # own and which only the TPM's PCR (and the seals printed here) show.
-  "tpm|audit_dump|128M|\\[tpm\\] found: vendor 0x1014 \\(IBM: QEMU's emulated TPM\\), device 0x0001, revision 1, a TPM 1\\.2 interface$;;\\[tpm\\] PCR 15 at start: 0{40}$;;\\[tpm\\] segment 1's seal extended into PCR 15: now [0-9a-f]{40}$;;\\[tpm\\] self-test PCR 15: the seals of all 2 sealed segments extended \\(2\\), each new value the TPM gave SHA-1 of the one before and the seal \\(0 not\\); read back, it is the last of them; any TPM but QEMU's would be left alone: PASS$;;\\[audit\\] self-test the boot's own chain: .* 2 anchors in the TPM check out; .*: PASS$;;\\[test.sh\\] audit_verify: entries 0 to [0-9]+ .*; [2-9] seals printed during the boot match the chain; PCR 15 recomputed from its start and the printed seals: [2-9] extends, each as printed, and the chain's [2-9] anchors agree$|TPM"
+  "tpm|audit_dump|128M|\\[tpm\\] found: vendor 0x1014 \\(IBM: QEMU's emulated TPM\\), device 0x0001, revision 1, a TPM 1\\.2 interface, its interrupts off$;;\\[tpm\\] driven as QEMU's emulated TPM 1\\.2: PCR 15 read and extended, and nothing else sent but TPM_Startup if the firmware didn't$;;\\[tpm\\] PCR 15 at start: 0{40}$;;\\[tpm\\] segment 1's seal extended into PCR 15: now [0-9a-f]{40}$;;\\[tpm\\] self-test QEMU's emulated TPM 1\\.2, PCR 15: the seals of all 2 sealed segments extended \\(2\\), each new value the TPM gave SHA-1 of the one before and the seal \\(0 not\\); read back, it is the last of them; [4-9] commands sent; this build drives QEMU's TPM 1\\.2 and the T430's, no other, and sends the T430's only PCRRead and Extend: PASS$;;\\[audit\\] self-test the boot's own chain: .* 2 anchors in the TPM check out; .*: PASS$;;\\[test.sh\\] audit_verify: entries 0 to [0-9]+ .*; [2-9] seals printed during the boot match the chain; PCR 15 recomputed from its start and the printed seals: [2-9] extends, each as printed, and the chain's [2-9] anchors agree$|TPM"
   "tpm-audit||128M|'shell'\\]   TPM:   PCR 15 holds the seals of [2-9] segments$;;'shell'\\]   verified here: entries 0 to [0-9]+ link from segment 0's header to the head: OK$;;'shell'\\]   anchors: [2-9] checked: each PCR value SHA-1 of the one before and its seal; the TPM's PCR now is the last of them: OK$|TPM|h e l p ret pause a u d i t ret"
   "tpm_rewrite|audit_rewrite|128M|\\[audit\\] demo: entry 17 changed, and every link, header, seal and anchor after it rewritten to match$;;\\[audit\\] demo: the rewritten chain verifies on its own: [0-9]+ entries, [2-9] anchors$;;\\[audit\\] demo: caught by the TPM: PCR 15 is [0-9a-f]{40}, the chain's last anchor says [0-9a-f]{40}$;;\\[test.sh\\] audit_verify: BROKEN at entry 255: the chain's hash at the end of segment 0 isn't the seal printed when it was sealed$;;'shell'\\]   BROKEN at the TPM: PCR 15 is [0-9a-f]{16}\\.\\.\\., not the chain's last anchor: the chain was rewritten$|TPM|h e l p ret pause a u d i t ret"
+  # Entry 34: the TPM stops answering (every register 0xff, writes lost):
+  # the command that finds out stops it, nothing more is sent, and the
+  # chain, the shell and the tool here all show it.
+  "tpm_lost|tpm_lost|128M|\\[tpm\\] demo: from here every TPM register reads 0xff and writes go nowhere, as with a chip gone from the bus$;;\\[tpm\\] reading a PCR: the TPM still expected more after the command's last byte; nothing more is sent to the TPM this boot$;;\\[tpm\\] demo: PCR 15 read: the TPM still expected more after the command's last byte; stopped$;;\\[tpm\\] demo: asked twice more \\(a read, an extend\\): both refused, with 0 commands sent and 0 registers touched$;;\\[audit\\] anchoring ends: segment 2's seal and later ones won't be extended, and the chain says why \\(an ANCHOR entry, code 65540\\)$;;\\[test.sh\\] audit_verify: entries 0 to [0-9]+ .*; [2-9] seals printed during the boot match the chain; PCR 15 recomputed from its start and the printed seals: 2 extends, each as printed, and the chain's 2 anchors agree$;;'shell'\\]   TPM:   PCR 15 holds the seals of 2 segments$;;'shell'\\]          then STOPPED: it took or gave the wrong number of bytes; nothing more is sent to it this boot$;;'shell'\\]   verified here: entries 0 to [0-9]+ link from segment 0's header to the head: OK$|TPM|h e l p ret pause a u d i t ret"
   # Entry 31: a lock taken while its holder still holds it
   "lock_twice|lock_twice|128M|\[lock\] FATAL: the lock at 0x[0-9a-f]+ was taken while already held: by this same code, or by a task that switched away holding it \(asked for at src/lock.rs:[0-9]+\)"
   # Entry 29: a frame dropped while held; the kernel image given back as heap
@@ -685,6 +690,17 @@ for entry in "${CASES[@]}"; do
   dir="$ROOT/$name"; mkdir -p "$dir"
   printf '  %-19s building...' "$name"
 
+  # "tis" isn't booted (Entry 34): the kernel's own tis.rs, compiled on
+  # the build machine, against model TPMs stricter than QEMU's.
+  if [ "$name" = tis ]; then
+    if make -s OUTDIR="$dir" "$dir/tis_check" > "$dir/build.log" 2>&1 && "$dir/tis_check" > "$dir/tis.log" 2>&1; then
+      printf '\r  PASS  %-19s %s\n' "$name" "$(head -1 "$dir/tis.log" | sed 's/^tis_check: OK: //')"; pass=$((pass + 1))
+    else
+      printf '\r  FAIL  %-19s %s\n' "$name" "$(head -1 "$dir/tis.log" 2>/dev/null; tail -3 "$dir/build.log")"; fail=$((fail + 1))
+    fi
+    continue
+  fi
+
   # "bios-if-on" isn't a kernel demo: it builds stage2 to leave interrupts
   # on after its BIOS calls, as the T430's BIOS does (Entry 16).
   build=(FREYA_DEMO="$demo")
@@ -745,7 +761,7 @@ for entry in "${CASES[@]}"; do
   [ "$name" = revoke ] && check_revoke "$dir/serial.log"
   [ "$name" = heap ] && check_heap "$dir/serial.log"
   # The chain the kernel printed, verified outside it (Entry 32).
-  case $name in audit-dump|audit_tamper|tpm|tpm_rewrite)
+  case $name in audit-dump|audit_tamper|tpm|tpm_rewrite|tpm_lost)
     echo "[test.sh] $(out/audit_verify "$dir/serial.log" 2>&1 | head -1)" >> "$dir/serial.log" ;;
   esac
   # After the console driver is killed: init starts it again (kill-console),

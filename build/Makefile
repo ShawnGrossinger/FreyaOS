@@ -29,7 +29,7 @@ STAGE2    := $(OUTDIR)/stage2.bin
 KERNELELF := $(OUTDIR)/kernel.elf
 KERNELBIN := $(OUTDIR)/kernel.bin
 
-.PHONY: all build clean run run-tpm trace debug test rehearse usb usb-clear unsafe reproduce audit-verify verify-audit
+.PHONY: all build clean run run-tpm trace debug test rehearse usb usb-clear unsafe reproduce audit-verify verify-audit tis-check
 
 all: $(IMG)
 
@@ -91,6 +91,20 @@ audit-verify: $(AUDIT_VERIFY)
 verify-audit: $(AUDIT_VERIFY)
 	@[ -n "$(LOG)" ] || { echo "usage: make verify-audit LOG=<serial log of a FREYA_DEMO=audit_dump boot>"; exit 2; }
 	$(AUDIT_VERIFY) $(LOG)
+
+# -------------------------
+# The TPM protocol against strict model TPMs (Entry 34)
+# -------------------------
+# tis_check.rs compiles the kernel's own tis.rs and runs it against models
+# of TPM 1.2 chips stricter than QEMU's (bursts of a byte, status bits set
+# late, "busy" at first, ...) and against broken ones. make tis-check
+TIS_CHECK := $(OUTDIR)/tis_check
+
+$(TIS_CHECK): tis_check.rs $(KERNDIR)/src/tis.rs $(KERNDIR)/src/sha1.rs | $(OUTDIR)
+	rustc --edition 2021 -O tis_check.rs -o $@
+
+tis-check: $(TIS_CHECK)
+	@$(TIS_CHECK)
 
 # -------------------------
 # Kernel build

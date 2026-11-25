@@ -736,9 +736,12 @@ pub struct AuditState {
     pub head: [u8; 32],
     /// How many of each kind since boot (audit_chain.rs numbers them).
     pub counts: [u64; 16],
-    /// The TPM (Entry 33): 0 none, 1 found and not used, 2 anchoring the
-    /// chain, 3 anchoring stopped by an error.
+    /// The TPM (Entry 33): 0 none, 1 found and left alone, 2 anchoring
+    /// the chain, 3 stopped by an error (nothing more sent to it).
     pub tpm: u32,
+    /// What stopped it, as the chain records it (Entry 34): a TPM return
+    /// code, or 0x1_0001 and up for the kernel's own (tis.rs: Error::code).
+    pub tpm_error: u64,
     /// Its vendor << 16 | device.
     pub tpm_id: u32,
     /// Segments whose seals have been extended into it.
@@ -794,6 +797,7 @@ pub fn audit(slot: u64, from: u64, buf: &mut [u8]) -> Result<AuditState, i64> {
     Ok(AuditState {
         tpm: u32_at(buf, 224),
         tpm_id: u32_at(buf, 228),
+        tpm_error: u64_at(buf, 288),
         anchored: u64_at(buf, 232),
         pcr_index: u32_at(buf, 240),
         pcr,

@@ -844,12 +844,17 @@ fn audit_chain() {
             l.str(b"none: the chain is not anchored");
         }
         1 => {
-            l.str(b"found (").hex16((state.tpm_id >> 16) as u16).str(b"), not used by this build");
+            l.str(b"found (").hex16((state.tpm_id >> 16) as u16).str(b"), left alone by this build");
         }
         _ => {
             l.str(b"PCR ").dec(state.pcr_index as u64).str(b" holds the seals of ").dec(state.anchored).str(b" segments");
             if state.tpm == 3 {
-                l.str(b" (then an error: no more)");
+                l.str(b"\n");
+                say(l.as_bytes());
+                l = Line::<120>::new();
+                l.str(b"         then STOPPED: ");
+                tpm_error(&mut l, state.tpm_error);
+                l.str(b"; nothing more is sent to it this boot");
             }
         }
     }
@@ -961,6 +966,24 @@ fn audit_chain() {
     }
 }
 
+/// What stopped the TPM (Entry 34), from the code the chain records for
+/// it (the kernel's tis.rs: Error::code).
+fn tpm_error(l: &mut Line<120>, code: u64) {
+    match code {
+        0x1_0003 => l.str(b"it timed out"),
+        0x1_0004 => l.str(b"it took or gave the wrong number of bytes"),
+        0x1_0005 => l.str(b"not a TPM 1.2 response"),
+        0x1_0008 => l.str(b"an answer that didn't check out"),
+        0x1_0000..=0x1_FFFF => l.str(b"the kernel's code ").dec(code),
+        0x06 => l.str(b"TPM_DEACTIVATED"),
+        0x07 => l.str(b"TPM_DISABLED"),
+        0x26 => l.str(b"TPM_INVALID_POSTINIT"),
+        0x801 => l.str(b"TPM_NEEDS_SELFTEST"),
+        0x802 => l.str(b"TPM_DOING_SELFTEST"),
+        rc => l.str(b"TPM return code ").hex16(rc as u16),
+    };
+}
+
 fn sha1_hex(v: &[u8; 20]) -> [u8; 40] {
     let mut s = [0u8; 40];
     for (i, b) in v.iter().enumerate() {
@@ -1055,11 +1078,14 @@ fn describe(l: &mut Line<120>, e: &audit_chain::Entry) {
             }
         }
         ANCHOR => {
-            l.str(b"segment ").dec(e.subject).str(b"'s seal extended into PCR ").dec(e.data[0]);
+            l.str(b"segment ").dec(e.subject);
             if e.data[1] == 0 {
+                l.str(b"'s seal extended into PCR ").dec(e.data[0]);
                 l.str(b": now ").str(&sha1_hex(&first_20(&e.detail))[..16]).str(b"...");
             } else {
-                l.str(b": the TPM refused (").dec(e.data[1]).str(b")");
+                l.str(b"'s seal not extended: the TPM was stopped (");
+                tpm_error(l, e.data[1]);
+                l.str(b")");
             }
         }
         _ => {
